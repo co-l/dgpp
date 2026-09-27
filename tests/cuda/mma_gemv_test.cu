@@ -180,6 +180,46 @@ DGPP_TEST(mma_gemv_bf16_matches_oracle_and_is_m_invariant) {
   std::printf("[ OK ] mma_gemv bf16: bitwise m-invariant\n");
 }
 
+// The small-n bf16 shapes the session-core heads run at one row: k under one
+// 256-k window (a single window's worth of k), the grid's last block at a
+// non-16-aligned n, the wide and the narrow decode widths. Against the
+// double oracle (a kernel index error shows up as a huge relative error on
+// the affected columns, not a small one).
+DGPP_TEST(mma_gemv_bf16_small_n_single_window_matches_oracle) {
+  for (const auto [n2, k2] : {std::pair{512, 256}, std::pair{256, 256}, std::pair{480, 256},
+                              std::pair{520, 256}, std::pair{1024, 128}, std::pair{512, 128}}) {
+    for (int m2 : {1, 2, 16, 30}) {
+      const Problem p = make(m2, n2, k2, 7, 7, 0xB165F00D5EEDull + m2 + n2 * 7919u + k2);
+      Dev d(p);
+      dgpp::launch_mma_gemv_bf16_f32(d.act, p.k, d.w16, d.outf, p.m, p.n, p.k, 0, nullptr);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      const std::vector<float> got = fetch_f(d.outf, size_t(p.m) * p.n);
+      const double err = max_rel_err(p, got, [&](int r, int c) {
+        return dgpp::bf16_bits_to_float(p.w16[size_t(r) * p.k + c]);
+      });
+      // Report the worst column so a kernel index bug localizes to a column.
+      int worst_col = -1, worst_row = -1; double worst = 0;
+      for (int i = 0; i < p.m; ++i)
+        for (int j = 0; j < p.n; ++j) {
+          double ref = 0, mag = 0;
+          for (int c = 0; c < p.k; ++c) {
+            const double a = dgpp::bf16_bits_to_float(p.act[size_t(i) * p.k + c]);
+            const double w = dgpp::bf16_bits_to_float(p.w16[size_t(j) * p.k + c]);
+            ref += a * w; mag += std::fabs(a * w);
+          }
+          const double e = std::fabs(got[size_t(i) * p.n + j] - ref) / (mag + 1e-6);
+          if (e > worst) { worst = e; worst_col = j; worst_row = i; }
+        }
+      std::printf("[ .. ] mma_gemv bf16 m=%d n=%d k=%d: max rel err %.3e (worst row %d col %d)\n",
+                  p.m, p.n, p.k, err, worst_row, worst_col);
+      require(err < 2e-3, "bf16 small-n: n=" + std::to_string(n2) + " k=" + std::to_string(k2) +
+                             " m=" + std::to_string(m2) + " max rel err " + std::to_string(err) +
+                             " at row " + std::to_string(worst_row) + " col " + std::to_string(worst_col));
+    }
+  }
+  std::printf("[ OK ] mma_gemv bf16 small-n single-window shapes match the oracle\n");
+}
+
 DGPP_TEST(mma_gemv_cold_timing_beside_the_gemv_cores) {
   // Informational: the dense projection shape [5120 x 5120] fp8 (32 x 32
   // scales) and the head shape [32320 x 5120] bf16, cold (weights cycled
