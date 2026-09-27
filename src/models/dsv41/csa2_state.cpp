@@ -13,8 +13,14 @@ void check_shape(const Csa2PoolShape& s) {
       s.token_slots % s.block_tokens != 0 || s.ring_slots <= 0 || s.tail_ordinals < 0)
     throw std::invalid_argument("csa2 state pool: invalid shape");
   for (const int r : s.cache_ratio)
-    if ((r != 1 && r != 2) || s.block_tokens % r != 0)
-      throw std::invalid_argument("csa2 state pool: a cache ratio must be 1 or 2 and divide the block");
+    if ((r != 1 && r != 2 && r != 4 && r != 128) || s.block_tokens % r != 0)
+      throw std::invalid_argument("csa2 state pool: a cache ratio must be 1, 2, 4 or 128 and divide the block");
+  if (s.tail_floats.size() != static_cast<size_t>(s.tail_ordinals) ||
+      s.tail_inf.size() != static_cast<size_t>(s.tail_ordinals))
+    throw std::invalid_argument("csa2 state pool: a tail size per tail ordinal");
+  for (size_t t = 0; t < s.tail_inf.size(); ++t)
+    if (s.tail_inf[t] < 0 || s.tail_inf[t] > s.tail_floats[t])
+      throw std::invalid_argument("csa2 state pool: the -inf count must fit the tail");
   if (s.token_slots / s.block_tokens * s.block_tokens >= (int64_t(1) << 21))
     throw std::invalid_argument("csa2 state pool: entry id space exceeds 2^21 (the select keys)");
 }
@@ -38,19 +44,23 @@ void Csa2StatePool::init(const Csa2PoolShape& shape) {
   main_.assign(static_cast<size_t>(n), nullptr);
   index_k_.assign(static_cast<size_t>(n), nullptr);
   index_scale_.assign(static_cast<size_t>(n), nullptr);
+  const size_t index_row = shape_.index_bf16 ? 2 * kCsa2IndexDim : kCsa2IndexDim;
   for (int o = 0; o < n; ++o) {
     const size_t slots = static_cast<size_t>(entry_slots(o));
     DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&main_[static_cast<size_t>(o)]), slots * main_row_bytes()));
-    DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&index_k_[static_cast<size_t>(o)]), slots * kCsa2IndexDim));
-    DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&index_scale_[static_cast<size_t>(o)]), slots * sizeof(float)));
+    DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&index_k_[static_cast<size_t>(o)]), slots * index_row));
+    if (!shape_.index_bf16)
+      DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&index_scale_[static_cast<size_t>(o)]),
+                              slots * sizeof(float)));
   }
   DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&ring_base_),
                           static_cast<size_t>(shape.layers) * shape.max_requests * ring_bytes_per_request()));
   DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&ring_table_), static_cast<size_t>(shape.max_requests) * 4));
   csa2_ring_table(ring_table_, shape.max_requests, nullptr);
+  size_t tail_bytes = 0;
+  for (const int f : shape.tail_floats) tail_bytes += static_cast<size_t>(f) * sizeof(float);
   DGPP_CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&tail_base_),
-                          std::max<size_t>(16, static_cast<size_t>(shape.tail_ordinals) * shape.max_requests *
-                                                   tail_bytes_per_request())));
+                          std::max<size_t>(16, tail_bytes * shape.max_requests)));
   initialized_ = true;
   reset_all(nullptr);
   DGPP_CUDA_OK(cudaDeviceSynchronize());
@@ -62,13 +72,16 @@ size_t Csa2StatePool::cache_bytes(const Csa2PoolShape& s) {
   size_t total = 0;
   for (const int r : s.cache_ratio) {
     const size_t slots = static_cast<size_t>(blocks) * static_cast<size_t>(s.block_tokens / r);
-    total += padded(slots * latent_row_bytes(kMainFormat, kCsa2Latent));
-    total += padded(slots * kCsa2IndexDim);
-    total += padded(slots * sizeof(float));
+    total += padded(slots * latent_row_bytes(s.main_format, kCsa2Latent));
+    total += padded(slots * (s.index_bf16 ? 2 * kCsa2IndexDim : kCsa2IndexDim));
+    if (!s.index_bf16) total += padded(slots * sizeof(float));
   }
-  total += padded(static_cast<size_t>(s.layers) * s.max_requests * s.ring_slots * latent_row_bytes(kRingFormat, kCsa2Latent));
+  total += padded(static_cast<size_t>(s.layers) * s.max_requests * s.ring_slots *
+                  latent_row_bytes(s.ring_format, kCsa2Latent));
   total += padded(static_cast<size_t>(s.max_requests) * 4);
-  total += padded(static_cast<size_t>(s.tail_ordinals) * s.max_requests * 2 * kCsa2Latent * sizeof(float));
+  size_t tail_bytes = 0;
+  for (const int f : s.tail_floats) tail_bytes += static_cast<size_t>(f) * sizeof(float);
+  total += padded(tail_bytes * s.max_requests);
   total += padded(PagedBlockTable::table_bytes(s.max_requests, blocks));
   return total;
 }
@@ -98,7 +111,9 @@ uint8_t* Csa2StatePool::ring(int layer) const {
 float* Csa2StatePool::tails(int tail_ord) const {
   if (!initialized_ || tail_ord < 0 || tail_ord >= shape_.tail_ordinals)
     throw std::out_of_range("csa2 state pool: tail ordinal " + std::to_string(tail_ord));
-  return tail_base_ + static_cast<size_t>(tail_ord) * shape_.max_requests * 2 * kCsa2Latent;
+  size_t stride = 0;
+  for (int o = 0; o < tail_ord; ++o) stride += shape_.tail_floats[static_cast<size_t>(o)];
+  return tail_base_ + stride * shape_.max_requests;
 }
 
 void Csa2StatePool::reset_request(int req, cudaStream_t stream) {
@@ -107,9 +122,15 @@ void Csa2StatePool::reset_request(int req, cudaStream_t stream) {
   for (int l = 0; l < shape_.layers; ++l)
     DGPP_CUDA_OK(cudaMemsetAsync(ring(l) + static_cast<size_t>(req) * ring_bytes_per_request(), 0,
                                  ring_bytes_per_request(), stream));
-  for (int t = 0; t < shape_.tail_ordinals; ++t)
-    DGPP_CUDA_OK(cudaMemsetAsync(tails(t) + static_cast<size_t>(req) * 2 * kCsa2Latent, 0, tail_bytes_per_request(),
-                                 stream));
+  for (int t = 0; t < shape_.tail_ordinals; ++t) {
+    const int tf = shape_.tail_floats[static_cast<size_t>(t)];
+    DGPP_CUDA_OK(cudaMemsetAsync(tails(t) + static_cast<size_t>(req) * tf, 0, static_cast<size_t>(tf) * 4, stream));
+    const int inf = shape_.tail_inf[static_cast<size_t>(t)];
+    if (inf > 0)
+      csa2_fill_inf(tails(t) + static_cast<size_t>(req) * shape_.tail_floats[static_cast<size_t>(t)] +
+                        static_cast<size_t>(shape_.tail_floats[static_cast<size_t>(t)] - inf),
+                    inf, stream);
+  }
   table_.release_request_blocks(req, stream);
 }
 
@@ -118,15 +139,23 @@ void Csa2StatePool::reset_all(cudaStream_t stream) {
   for (int o = 0; o < caches(); ++o) {
     const size_t slots = static_cast<size_t>(entry_slots(o));
     DGPP_CUDA_OK(cudaMemsetAsync(main_[static_cast<size_t>(o)], 0, slots * main_row_bytes(), stream));
-    DGPP_CUDA_OK(cudaMemsetAsync(index_k_[static_cast<size_t>(o)], 0, slots * kCsa2IndexDim, stream));
-    DGPP_CUDA_OK(cudaMemsetAsync(index_scale_[static_cast<size_t>(o)], 0, slots * sizeof(float), stream));
+    DGPP_CUDA_OK(cudaMemsetAsync(index_k_[static_cast<size_t>(o)], 0, slots * index_row_bytes(), stream));
+    if (!shape_.index_bf16)
+      DGPP_CUDA_OK(cudaMemsetAsync(index_scale_[static_cast<size_t>(o)], 0, slots * sizeof(float), stream));
   }
   DGPP_CUDA_OK(cudaMemsetAsync(ring_base_, 0,
                                static_cast<size_t>(shape_.layers) * shape_.max_requests * ring_bytes_per_request(), stream));
-  if (shape_.tail_ordinals > 0)
-    DGPP_CUDA_OK(cudaMemsetAsync(tail_base_, 0,
-                                 static_cast<size_t>(shape_.tail_ordinals) * shape_.max_requests * tail_bytes_per_request(),
-                                 stream));
+  if (shape_.tail_ordinals > 0) {
+    size_t tail_bytes = 0;
+    for (const int f : shape_.tail_floats) tail_bytes += static_cast<size_t>(f) * sizeof(float);
+    DGPP_CUDA_OK(cudaMemsetAsync(tail_base_, 0, tail_bytes * shape_.max_requests, stream));
+    for (int t = 0; t < shape_.tail_ordinals; ++t) {
+      const int tf = shape_.tail_floats[static_cast<size_t>(t)], inf = shape_.tail_inf[static_cast<size_t>(t)];
+      if (inf <= 0) continue;
+      float* p = tails(t) + static_cast<size_t>(tf - inf);
+      for (int r = 0; r < shape_.max_requests; ++r) csa2_fill_inf(p + static_cast<size_t>(r) * tf, inf, stream);
+    }
+  }
   table_.reset_all(stream);
 }
 
@@ -140,13 +169,14 @@ void Csa2StatePool::copy_block_contents(int32_t src, int32_t dst, cudaStream_t s
     DGPP_CUDA_OK(cudaMemcpyAsync(main_[static_cast<size_t>(o)] + static_cast<size_t>(dst) * mb,
                                  main_[static_cast<size_t>(o)] + static_cast<size_t>(src) * mb, mb,
                                  cudaMemcpyDeviceToDevice, stream));
-    const size_t kb = epb * kCsa2IndexDim;
+    const size_t kb = epb * index_row_bytes();
     DGPP_CUDA_OK(cudaMemcpyAsync(index_k_[static_cast<size_t>(o)] + static_cast<size_t>(dst) * kb,
                                  index_k_[static_cast<size_t>(o)] + static_cast<size_t>(src) * kb, kb,
                                  cudaMemcpyDeviceToDevice, stream));
-    DGPP_CUDA_OK(cudaMemcpyAsync(index_scale_[static_cast<size_t>(o)] + static_cast<size_t>(dst) * epb,
-                                 index_scale_[static_cast<size_t>(o)] + static_cast<size_t>(src) * epb,
-                                 epb * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    if (!shape_.index_bf16)
+      DGPP_CUDA_OK(cudaMemcpyAsync(index_scale_[static_cast<size_t>(o)] + static_cast<size_t>(dst) * epb,
+                                   index_scale_[static_cast<size_t>(o)] + static_cast<size_t>(src) * epb,
+                                   epb * sizeof(float), cudaMemcpyDeviceToDevice, stream));
   }
 }
 

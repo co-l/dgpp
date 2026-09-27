@@ -55,9 +55,21 @@ struct Csa2Config {
   int window = 128;
   int ring_slots = 160;
   int block_tokens = 128;
+  int fp8_block = 32;  // the dense fp8 scale grid (32: V4.1, 128: 0731)
   float eps = 1e-20f;
   int tp = 1;
+  // The 0731 release's cache forms (v4.1 defaults): the dequantized bf16
+  // window / main rows and the dequantized bf16 index rows.
+  LatentFormat ring_format = LatentFormat::kFp8Block;
+  LatentFormat main_format = LatentFormat::kFp4Block;
+  bool index_bf16 = false;
+  // The 0731 per-head q renormalization (before the rotation).
+  bool q_renorm = false;
+  // The weights' softmax-scale fold (v4.1: 2^-6; 0731: 8192^-0.5).
+  float fold_scale = 0.015625f;
   int local_heads() const { return num_heads / tp; }
+  // log2 of the fp8 scale block (5: 32, 7: 128) — the scale gemm's rs / cs.
+  int scale_shift() const { return fp8_block == 128 ? 7 : 5; }
   int local_groups() const { return o_groups / tp; }
   int heads_per_group() const { return num_heads / o_groups; }
   static void validate(const Csa2Config& c);
@@ -72,13 +84,19 @@ struct Csa2LayerWeights {
   const uint16_t* idx_wp = nullptr;
   const uint16_t* idx_wk = nullptr;    // kv sources
   const uint16_t* idx_k_norm = nullptr;
-  const uint16_t* comp_wkv = nullptr;  // kv sources (bf16 [512, hidden])
-  const uint16_t* comp_wgate = nullptr;  // ratio 2
+  const uint16_t* comp_wkv = nullptr;  // kv sources (bf16 [width, hidden])
+  const uint16_t* comp_wgate = nullptr;  // ratio 2 (v4.1), ratio 4 (0731)
   const uint16_t* comp_norm = nullptr;
+  const float* comp_ape = nullptr;     // 0731: the compressor's APE [ratio, 2*width]
+  const uint16_t* idx_comp_wkv = nullptr;  // 0731: the indexer's compressor [256, hidden]
+  const uint16_t* idx_comp_wgate = nullptr;
+  const float* idx_comp_ape = nullptr;
+  const uint16_t* idx_comp_norm = nullptr;
   const float* inv_freq = nullptr;     // device [32]: the layer's rotary table
-  int ratio = 0;                       // 0: window only
+  int ratio = 0;                       // 0: window only (1 / 2: v4.1; 4 / 128: 0731)
   int cache_ord = -1;                  // the main / index cache read (ratio > 0)
-  int tail_ord = -1;                   // the compressor tail (a ratio-2 kv source)
+  int tail_ord = -1;                   // the compressor tail (ratio 2; 0731: main + indexer)
+  int idx_tail_ord = -1;               // 0731: the indexer compressor's tail
   bool kv_source = false;
   bool index_source = false;
   bool candidate_source = false;
@@ -97,7 +115,6 @@ class Csa2Layer {
   void rebind(const Csa2LayerWeights& w, int layer);
   // GEMM plans for `tokens` rows and the shared-memory opt-ins; outside capture.
   bool prepare(int tokens);
-
   // One request's chunk [pos0, pos0 + tokens) (pos0 a multiple of the block
   // size when the layer publishes; the request's blocks must already cover
   // pos0 + tokens). `floor`: the earliest position the window attends (the
@@ -148,6 +165,9 @@ class Csa2Layer {
   unsigned index_violations() const;
   // Probes (valid until the next enqueue on the shared scratch).
   const int32_t* debug_topk() const { return topk_; }
+  // The topk rows' column count (the indexer's topk, widened for the C128A
+  // sequential selection's full visible lists).
+  int topk_stride() const { return sel_col_; }
   const int32_t* debug_counts() const { return counts_; }
   const int32_t* debug_cand() const { return cand_; }
   const int32_t* debug_cand_counts() const { return cand_counts_; }
@@ -181,12 +201,14 @@ class Csa2Layer {
  private:
   struct Layout {
     size_t total = 0;
-    size_t qr, kv, q, o, oa, idx_q, q_fp8, q_scale, w, w_folded, comp_kv, comp_score, latent, ik;
+    size_t qr, kv, q, o, oa, idx_q, q_fp8, q_scale, w, w_folded, comp_kv, comp_score, idx_comp_kv,
+         idx_comp_score, latent, ik;
     size_t pos, req_ids, req_zero, slots, pos_sel, entries, ent_pos, scratch_pos, iota, one_block;
     size_t wlist, wcounts, wscratch, dlist, dcounts, topk, counts, cand, cand_counts;
     size_t m_main, l_main, c_main, m_win, l_win, c_win;
     size_t gather_k, gather_scale, dot, logits, select_ws, counter, violations;
     int tile_cap = 0;
+    int sel_col = 0;
     int64_t max_entries = 0;
     int ws_slots = 0;
     int ws_win_rows = 0;
@@ -235,6 +257,7 @@ class Csa2Layer {
   int max_decode_rows_ = 16;
   int decode_n_split_ = 32;
   int tile_cap_ = 0;
+  int sel_col_ = 0;
   int64_t max_entries_ = 0;
   int64_t gather_zeroed_ = 0;
   int ws_slots_ = 0;
@@ -263,8 +286,10 @@ class Csa2Layer {
   float* q_scale_ = nullptr;      // [T * 32]
   uint16_t* iw_ = nullptr;        // [T, 32] the indexer weights
   float* w_folded_ = nullptr;     // [T * 32]
-  float* comp_kv_ = nullptr;      // [T, 512]
-  float* comp_score_ = nullptr;   // [T, 512]
+  float* comp_kv_ = nullptr;      // [T, 1024] (the 0731 compressor's 2*width rows)
+  float* comp_score_ = nullptr;   // [T, 1024]
+  float* idx_comp_kv_ = nullptr;  // [T, 256] (the 0731 indexer's compressor)
+  float* idx_comp_score_ = nullptr;  // [T, 256]
   uint16_t* latent_ = nullptr;    // [T, 512]
   uint16_t* ik_ = nullptr;        // [T, 128]
   int64_t* pos_ = nullptr;        // [T] (prefill staging)
