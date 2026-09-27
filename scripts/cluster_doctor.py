@@ -61,10 +61,14 @@ def checkpoint_size(snapshot):
     for name in ("config.json", "tokenizer.json"):
         if not isinstance(json.loads((snapshot / name).read_text()), dict):
             raise ValueError(f"{name} must contain a JSON object")
-    # The prompt format: a Jinja template, or DeepSeek-V4.1's own encoder
-    # (`encoding/encoding.py`; the checkpoint ships no template).
-    if not (snapshot / "chat_template.jinja").is_file() and not (snapshot / "encoding" / "encoding.py").is_file():
-        raise ValueError(f"missing chat_template.jinja (or encoding/encoding.py) in {snapshot}")
+    # The prompt format: a Jinja template, or a DeepSeek-V4's own encoder
+    # (`encoding/encoding*.py`; these checkpoints ship no template — 0731's
+    # encoder is `encoding/encoding_dsv4.py`).
+    has_template = (snapshot / "chat_template.jinja").is_file()
+    enc_dir = snapshot / "encoding"
+    has_encoder = enc_dir.is_dir() and any(enc_dir.glob("encoding*.py"))
+    if not has_template and not has_encoder:
+        raise ValueError(f"missing chat_template.jinja (or encoding/encoding*.py) in {snapshot}")
     index = snapshot / "model.safetensors.index.json"
     if index.is_file():
         metadata = json.loads(index.read_text())
