@@ -205,6 +205,28 @@ DGPP_TEST(dsv41_architecture_registry_dispatches) {
   require(refused, "DeepSeek-V3 is not this family");
 }
 
+DGPP_TEST(dsv41_config_csa2_tail_floats) {
+  // The per-ordinal compressor tail sizes a checkpoint implies: a ratio-2
+  // source owns one [2,512] tail, a ratio-4 the main [16,2,512] and the
+  // indexer [16,2,128], a ratio-128 the full [256,512]. The decode snapshot
+  // buffer (spec_tails) strides by these counts per row, so the 0731's
+  // ratio-128 tails are 128x the V4.1 default.
+  dgpp::Dsv41TextConfig c;
+  c.variant = dgpp::Dsv41Variant::V4;
+  c.num_hidden_layers = 10;
+  c.num_nextn_predict_layers = 1;
+  c.compress_ratios = {0, 0, 4, 128, 4, 128, 0, 0, 0, 0, 0};
+  c.kv_source_layer_ids = {2, 3, 4, 5};
+  const auto tf = c.compressor_tail_floats();
+  require(tf.size() == 6, "two ratio-4 sources (2 tails each) + two ratio-128 (1 each)");
+  require(tf[0] == 16 * 2 * 512, "the ratio-4 main tail");
+  require(tf[1] == 16 * 2 * 128, "the ratio-4 indexer tail");
+  require(tf[2] == 256 * 512, "the ratio-128 tail");
+  require(tf[3] == 16 * 2 * 512, "the second ratio-4 main tail");
+  require(tf[4] == 16 * 2 * 128, "the second ratio-4 indexer tail");
+  require(tf[5] == 256 * 512, "the second ratio-128 tail");
+}
+
 DGPP_TEST(dsv41_config_reads_the_landed_checkpoint) {
   namespace fs = std::filesystem;
   const char* home = std::getenv("HOME");

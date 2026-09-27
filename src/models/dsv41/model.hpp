@@ -264,8 +264,15 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   const Dsv41DraftResident& draft_stage(int stage);
   int target_ordinal(int layer) const;
   int32_t* ctx(int req) const { return d_ctx_ + static_cast<size_t>(req) * 4; }
+  // The compressor tail's fp32 count, per ordinal: the snapshot strides by
+  // the live tail's size (ratio 4 and 128 tails are wider than the V4.1
+  // [2, 512] default).
+  size_t tail_stride(int tail_ord) const {
+    return static_cast<size_t>(pool_.shape().tail_floats[static_cast<size_t>(tail_ord)]);
+  }
   float* spec_tails(int tail_ord, int row) const {
-    return spec_tails_ + (static_cast<size_t>(tail_ord) * max_decode_rows_ + row) * 2 * kCsa2Latent;
+    const size_t o = static_cast<size_t>(tail_ord);
+    return spec_tails_ + spec_tail_offsets_[o] + static_cast<size_t>(row) * tail_stride(static_cast<int>(o));
   }
 
   Dsv41TextConfig cfg_;
@@ -320,7 +327,8 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   uint16_t* engram_kv_ = nullptr;   // [M, 5H] the fold's fallback
   int32_t* d_ctx_ = nullptr;        // [R, 4] the Engram contexts
   int32_t* spec_ctx_ = nullptr;     // [max(M, rows), 4] per-row contexts
-  float* spec_tails_ = nullptr;     // [tails][rows][2][512]
+  float* spec_tails_ = nullptr;     // [tails][rows][tail_stride] (variable per ordinal)
+  std::vector<size_t> spec_tail_offsets_;  // each ordinal's start in spec_tails_ (floats)
   // DSpark (mtp).
   static inline bool s_default_prefill_bounded = false;
   bool prefill_bounded_ = s_default_prefill_bounded;

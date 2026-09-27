@@ -564,4 +564,21 @@ int Dsv41TextConfig::compressor_tail_count() const {
   return n;
 }
 
+std::vector<int> Dsv41TextConfig::compressor_tail_floats() const {
+  // The CSA2 latent (kCsa2Latent) and index (kCsa2IndexDim) widths are the
+  // config's head_dim and index_head_dim (512 and 128).
+  std::vector<int> floats;
+  for (const int l : kv_source_layer_ids) {
+    const int r = compress_ratio(l);
+    if (r == 2)
+      floats.push_back(2 * head_dim);
+    else if (r == 4) {
+      floats.push_back(16 * 2 * head_dim);
+      floats.push_back(16 * 2 * index_head_dim);
+    } else if (r == 128)
+      floats.push_back(256 * head_dim);
+  }
+  return floats;
+}
+
 }  // namespace dgpp

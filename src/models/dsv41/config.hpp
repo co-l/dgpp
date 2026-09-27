@@ -192,6 +192,11 @@ struct Dsv41TextConfig {
   // The compressor tails' count, per kv source: ratio 2 one, ratio 4 two
   // (the main and the indexer), ratio 128 one.
   int compressor_tail_count() const;
+  // The fp32 count of each compressor tail, per kv source, in the order the
+  // pool and the decode snapshot allocate them: ratio 2 the [2, 512] pair;
+  // ratio 4 the main [16, 2, 512] then the indexer [16, 2, 128]; ratio 128
+  // the full [256, 512].
+  std::vector<int> compressor_tail_floats() const;
   bool has_engram(int l) const;
   int engram_index(int l) const;  // ordinal among the Engram layers, -1 otherwise
   int engram_rows_per_layer() const { return (engram_max_ngram_size - 1) * engram_n_heads; }

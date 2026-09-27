@@ -279,7 +279,19 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
     std::vector<int32_t> pad(R * 4, sidecar_.pad_class);
     DGPP_CUDA_OK(cudaMemcpy(d_ctx_, pad.data(), pad.size() * 4, cudaMemcpyHostToDevice));
   }
-  if (tails_ > 0) spec_tails_ = dev_alloc<float>(static_cast<size_t>(tails_) * static_cast<size_t>(max_decode_rows_) * 2 * kCsa2Latent);
+  {
+    // The decode snapshots stride by each tail's live size (ratio 4 and 128
+    // are wider than the V4.1 [2, 512] default), so the buffer is
+    // variable-stride per ordinal.
+    const std::vector<int>& tf = pool_.shape().tail_floats;
+    spec_tail_offsets_.assign(tf.size(), 0);
+    size_t total = 0;
+    for (size_t o = 0; o < tf.size(); ++o) {
+      spec_tail_offsets_[o] = total;
+      total += static_cast<size_t>(tf[o]) * static_cast<size_t>(max_decode_rows_);
+    }
+    if (total > 0) spec_tails_ = dev_alloc<float>(total);
+  }
   {
     // The bounded prefill's tail and segment coefficients (window rows).
     const size_t win = static_cast<size_t>(cfg_.sliding_window);
@@ -420,7 +432,11 @@ Dsv41Model::MemoryPlan Dsv41Model::plan_memory(const Dsv41TextConfig& cfg, int m
              R * static_cast<size_t>(cfg.dspark_block_size) * 4 + M * 12;
     }
     if (!cfg.engram_layer_ids.empty()) act += M * 5 * H * 2 + R * 16 + std::max(M, static_cast<size_t>(rows)) * 16;
-    act += static_cast<size_t>(shape.tail_ordinals) * static_cast<size_t>(rows) * 2 * kCsa2Latent * 4;
+    {
+      size_t tail_floats = 0;
+      for (const int f : shape.tail_floats) tail_floats += static_cast<size_t>(f);
+      act += tail_floats * static_cast<size_t>(rows) * 4;
+    }
     // The bounded prefill's tail streams and the tail/segment coefficients.
     act += static_cast<size_t>(cfg.sliding_window) * 4 * H * 2 + 2 * static_cast<size_t>(cfg.sliding_window) * 4 * 4;
     plan.add("activations (session core, the four residual streams, block io, mHC coefficients, route staging)", act,
@@ -455,10 +471,9 @@ Dsv41Model::MemoryPlan Dsv41Model::plan_memory(const Dsv41TextConfig& cfg, int m
 size_t Dsv41Model::session_snapshot_bytes(const Dsv41TextConfig& cfg, int, bool) {
   const size_t ring = static_cast<size_t>(std::max(kRingSlots, cfg.sliding_window + 32)) *
                       latent_row_bytes(Csa2StatePool::kRingFormat, kCsa2Latent);
-  size_t tails = 0;
-  for (const int l : cfg.kv_source_layer_ids)
-    if (cfg.compress_ratio(l) == 2) ++tails;
-  return static_cast<size_t>(cfg.max_layer()) * ring + tails * 2 * kCsa2Latent * sizeof(float) + 16;
+  size_t tail_floats = 0;
+  for (const int f : cfg.compressor_tail_floats()) tail_floats += static_cast<size_t>(f);
+  return static_cast<size_t>(cfg.max_layer()) * ring + tail_floats * sizeof(float) + 16;
 }
 
 size_t Dsv41Model::snapshot_state_bytes() const { return session_snapshot_bytes(cfg_, world_, false); }
@@ -582,9 +597,11 @@ GlmSpecSegments Dsv41Model::spec_segments(int req, int snapshot_row0) const {
     if (segs.count >= kSpecMaxSegments) throw std::logic_error("spec_segments: too many state families");
     segs.seg[segs.count++] = GlmSpecSegment{dst, snapshots, row_stride, bytes};
   };
-  const size_t tail_bytes = 2 * kCsa2Latent * sizeof(float);
-  for (int t = 0; t < tails_; ++t)
-    add(pool_.tails(t) + static_cast<size_t>(req) * 2 * kCsa2Latent, spec_tails(t, snapshot_row0), tail_bytes, tail_bytes);
+  for (int t = 0; t < tails_; ++t) {
+    const size_t floats = tail_stride(t);
+    add(pool_.tails(t) + static_cast<size_t>(req) * floats, spec_tails(t, snapshot_row0), floats * sizeof(float),
+        floats * sizeof(float));
+  }
   if (engram_) add(ctx(req), spec_ctx_ + static_cast<size_t>(snapshot_row0) * 4, 16, 16);
   return segs;
 }
@@ -599,10 +616,12 @@ void Dsv41Model::write_state_snapshot(int req, uint8_t* d, int spec_row) {
     DGPP_CUDA_OK(cudaMemcpyAsync(d, pool_.ring(l) + static_cast<size_t>(req) * rb, rb, cudaMemcpyDeviceToDevice, stream_));
     d += rb;
   }
-  const size_t tail_bytes = 2 * kCsa2Latent * sizeof(float);
   for (int t = 0; t < tails_; ++t) {
-    DGPP_CUDA_OK(cudaMemcpyAsync(d, live ? pool_.tails(t) + static_cast<size_t>(req) * 2 * kCsa2Latent : spec_tails(t, static_cast<int>(row)),
-                                 tail_bytes, cudaMemcpyDeviceToDevice, stream_));
+    const size_t floats = tail_stride(t);
+    const size_t tail_bytes = floats * sizeof(float);
+    DGPP_CUDA_OK(cudaMemcpyAsync(
+        d, live ? pool_.tails(t) + static_cast<size_t>(req) * floats : spec_tails(t, static_cast<int>(row)), tail_bytes,
+        cudaMemcpyDeviceToDevice, stream_));
     d += tail_bytes;
   }
   if (engram_) DGPP_CUDA_OK(cudaMemcpyAsync(d, live ? ctx(req) : spec_ctx_ + row * 4, 16, cudaMemcpyDeviceToDevice, stream_));
@@ -615,9 +634,10 @@ void Dsv41Model::read_state_snapshot(int req, const uint8_t* s) {
     DGPP_CUDA_OK(cudaMemcpyAsync(pool_.ring(l) + static_cast<size_t>(req) * rb, s, rb, cudaMemcpyDeviceToDevice, stream_));
     s += rb;
   }
-  const size_t tail_bytes = 2 * kCsa2Latent * sizeof(float);
   for (int t = 0; t < tails_; ++t) {
-    DGPP_CUDA_OK(cudaMemcpyAsync(pool_.tails(t) + static_cast<size_t>(req) * 2 * kCsa2Latent, s, tail_bytes,
+    const size_t floats = tail_stride(t);
+    const size_t tail_bytes = floats * sizeof(float);
+    DGPP_CUDA_OK(cudaMemcpyAsync(pool_.tails(t) + static_cast<size_t>(req) * floats, s, tail_bytes,
                                  cudaMemcpyDeviceToDevice, stream_));
     s += tail_bytes;
   }
