@@ -546,4 +546,22 @@ GlmMoeConfig Dsv41TextConfig::moe_config(int local_inter, bool draft, int layer)
   return m;
 }
 
+// The compressor tails, per kv source (the reference's kv_state and
+// score_state, 2*ratio slots of coff*head_dim each): ratio 2 the pair's
+// (kv, score) [2, 512]; ratio 4 the overlap window's 16 slots x 1024 (main)
+// and 16 x 256 (the indexer compressor); ratio 128 the full window's 256
+// slots x 512.
+int Dsv41TextConfig::compressor_tail_count() const {
+  int n = 0;
+  for (const int l : kv_source_layer_ids) {
+    const int r = compress_ratio(l);
+    if (r == 2)
+      ++n;
+    else if (r == 4)
+      n += 2;
+    else if (r == 128) ++n;
+  }
+  return n;
+}
+
 }  // namespace dgpp

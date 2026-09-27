@@ -32,7 +32,9 @@ struct GlmSpecSegment {
   size_t request_stride_bytes = 0;  // mapped commits: distance between physical destinations
 };
 
-constexpr int kSpecMaxSegments = 32;  // KDA rec + KDA conv + DSA layers
+// KDA rec + KDA conv + DSA layers (the GLM family); the dsv41 0731 release
+// snapshots every kv source's compressor tails, 62 families.
+constexpr int kSpecMaxSegments = 128;
 
 struct GlmSpecSegments {
   int count = 0;

@@ -58,11 +58,6 @@ Csa2PoolShape Dsv41Model::pool_shape(const Dsv41TextConfig& cfg, int max_request
     s.ring_format = LatentFormat::kBf16;
     s.index_bf16 = true;
   }
-  // The compressor tails, per kv source (fp32 counts; the reference's
-  // kv_state and score_state, 2*ratio slots of coff*head_dim each): ratio 2
-  // the pair's (kv, score) [2, 512]; ratio 4 the overlap window's 16 slots x
-  // 1024 (main) and 16 x 256 (the indexer compressor); ratio 128 the full
-  // window's 256 slots x 512.
   for (const int l : cfg.kv_source_layer_ids) {
     const int r = cfg.compress_ratio(l);
     s.cache_ratio.push_back(r);
@@ -81,7 +76,7 @@ Csa2PoolShape Dsv41Model::pool_shape(const Dsv41TextConfig& cfg, int max_request
       s.tail_inf.push_back(0);
     }
   }
-  s.tail_ordinals = static_cast<int>(s.tail_floats.size());
+  s.tail_ordinals = cfg.compressor_tail_count();
   s.max_requests = max_requests;
   s.token_slots = cache_tokens;
   s.block_tokens = kBlockTokens;

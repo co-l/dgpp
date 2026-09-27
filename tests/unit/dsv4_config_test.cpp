@@ -10,6 +10,7 @@
 
 #include "common/test.hpp"
 #include "dsv4_config_json.hpp"
+#include "kernels/glm_spec.hpp"
 #include "loaders/architecture.hpp"
 #include "loaders/minijson.hpp"
 #include "models/dsv41/config.hpp"
@@ -107,6 +108,12 @@ DGPP_TEST(dsv4_config_parses_the_release) {
   const dgpp::GlmMoeConfig d = c.moe_config(512, true);
   require(d.n_experts == 256 && d.top_k == 6, "draft moe_config");
   require(!m.hash_route && !d.hash_route, "moe_config hash_route off elsewhere");
+}
+
+DGPP_TEST(dsv4_config_spec_segments_fit) {
+  const dgpp::Dsv41TextConfig c = parse(config_json());
+  require(c.compressor_tail_count() == 62, "each 0731 kv source keeps its own compressor tails");
+  require(c.compressor_tail_count() < dgpp::kSpecMaxSegments, "the compressor tails fit the spec commit's segment table");
 }
 
 DGPP_TEST(dsv4_config_scale_shift) {

@@ -189,6 +189,9 @@ struct Dsv41TextConfig {
   // release, 128 x 128 for the 0731 release.
   int scale_shift() const { return fp8_block_size == 128 ? 7 : 5; }
   int num_index_sources() const { return static_cast<int>(index_source_layer_ids.size()); }
+  // The compressor tails' count, per kv source: ratio 2 one, ratio 4 two
+  // (the main and the indexer), ratio 128 one.
+  int compressor_tail_count() const;
   bool has_engram(int l) const;
   int engram_index(int l) const;  // ordinal among the Engram layers, -1 otherwise
   int engram_rows_per_layer() const { return (engram_max_ngram_size - 1) * engram_n_heads; }
