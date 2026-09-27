@@ -148,12 +148,14 @@ QWEN_CASES = [c for c in CASES if USER not in c and ASSIST not in c] + [
 ]
 
 
-# The DeepSeek-V4.1 corpus (2026-09-13): its three-stage pre-tokenizer —
-# number runs cut in threes (every \p{N} script), CJK runs isolated (the
-# three literal ranges; Korean and halfwidth kana are letters), the
-# punctuation+ASCII-letters alternative (".foo", "'t"), the \p{P}/\p{S}
-# run class (format and control characters fall between matches), and its
-# own added tokens (the DSML markers, the role tokens, the placeholders).
+# The DeepSeek-V4 corpus (first 2026-09-13 for DeepSeek-V4.1-Flash,
+# 2026-09-27 for the DeepSeek-V4-Flash-0731 snapshot): its three-stage
+# pre-tokenizer — number runs cut in threes (every \p{N} script), CJK runs
+# isolated (the three literal ranges; Korean and halfwidth kana are
+# letters), the punctuation+ASCII-letters alternative (".foo", "'t"), the
+# \p{P}/\p{S} run class (format and control characters fall between
+# matches), and its own added tokens (the DSML markers, the role tokens,
+# the placeholders).
 DS_BOS = "<｜begin▁of▁sentence｜>"
 DS_EOS = "<｜end▁of▁sentence｜>"
 DS_USER = "<｜User｜>"
@@ -163,14 +165,18 @@ DS_DSML = "｜DSML｜"
 DSV41_CASES = [c for c in CASES if USER not in c and ASSIST not in c and EOS not in c] + [
     DS_BOS, DS_EOS, DS_USER, DS_ASSIST, DS_SYSTEM, DS_DSML, "<｜latest_reminder｜>", "<｜tool▁calls▁begin｜>",
     "<｜place▁holder▁no▁7｜>", "<｜deepseek_image｜>",
-    DS_BOS + DS_SYSTEM + "You are a helpful assistant." + DS_USER + "Hello" + DS_ASSIST + THINK_CLOSE + "Hi!" + DS_EOS,
-    DS_BOS + DS_SYSTEM + "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+    # The 0731 template shape: no system marker, the effort prefix at the
+    # start, the DSML block in its no-space form.
+    DS_BOS + "You are a helpful assistant." + DS_USER + "Hello" + DS_ASSIST + THINK_CLOSE + "Hi!" + DS_EOS,
+    DS_BOS + "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+    + "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
+    + "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
     + "You are a helpful assistant." + DS_USER + "What is 2+2?" + DS_ASSIST + THINK_OPEN,
     "Simple arithmetic." + THINK_CLOSE + "2 + 2 = 4." + DS_EOS,
-    "\n\n<" + DS_DSML + " calls>\n<" + DS_DSML + ' invoke name="get_weather">\n<' + DS_DSML
-    + ' parameter name="city" string="true">Paris</' + DS_DSML + " parameter>\n<" + DS_DSML
-    + ' parameter name="days" string="false">3</' + DS_DSML + " parameter>\n</" + DS_DSML + " invoke>\n</" + DS_DSML
-    + " calls>" + DS_EOS,
+    "\n\n<" + DS_DSML + "tool_calls>\n<" + DS_DSML + 'invoke name="get_weather">\n<' + DS_DSML
+    + 'parameter name="city" string="true">Paris</' + DS_DSML + "parameter>\n<" + DS_DSML
+    + 'parameter name="days" string="false">3</' + DS_DSML + "parameter>\n</" + DS_DSML + "invoke>\n</" + DS_DSML
+    + "tool_calls>" + DS_EOS,
     DS_USER + "<tool_result>{\"temp\": 21}</tool_result>" + DS_ASSIST + THINK_OPEN,
     "x" + DS_DSML + "y", "before " + DS_USER + " after",
     # CJK isolation and the scripts around it.

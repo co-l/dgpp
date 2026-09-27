@@ -1132,9 +1132,10 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
         }
         for (const std::string& w : warnings) log_tool_schema_note(true, i, w);
         for (const std::string& n : notes) log_tool_schema_note(false, i, n);
-        // The DSML invoke names the tool as the schema lists it —
-        // "namespace::name" under a namespace — and the grammar's targets
-        // must spell the same (the parser strips the namespace again).
+        // The DSML invoke names the tool as the schema lists it — the
+        // function's name, verbatim (the 0731 reference ignores namespaces) —
+        // and the grammar's targets must spell the same (the parser strips a
+        // "ns::name" back to "name" if one is written).
         if (markers_.tool_format() == dgpp::text::ToolFormat::kDsml) {
           try {
             g.tools.back().name = dgpp::text::Dsv41Prompt::qualified_tool_name(t);
@@ -1582,7 +1583,8 @@ bool GenerationService::parse_chat(const dgpp::minijson::Value& body,
   globals.push_back(Member{"messages", Value::make_array(std::move(msgs))});
   if (have_tools && choice != Choice::kNone) {
     // Keep function fields in their original wrapped or flat shape, plus
-    // DeepSeek namespaces so rendered names agree with the tool grammar.
+    // DeepSeek namespaces (the 0731 encoder ignores them — the schema lists
+    // the function object verbatim and the grammar constrains its bare name).
     // Omit unrelated metadata, such as BFCL's function-level response schemas.
     // DGPP_TOOLS_RAW=1 renders the tools verbatim.
     static const bool raw = std::getenv("DGPP_TOOLS_RAW") != nullptr;

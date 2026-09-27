@@ -402,16 +402,16 @@ bool ends_with(const std::string& s, const std::string& suffix) {
 // The DSML literals with the tag as the sentinel byte (the parser's
 // kDsmlCallsOpen and friends with "｜DSML｜" replaced).
 const std::string kDTag(1, GrammarState::kDsmlSentinel);
-const std::string kDCallsTail = " calls>\n";
-const std::string kDInvokeOpen = "<" + kDTag + " invoke name=\"";
+const std::string kDCallsTail = "tool_calls>\n";
+const std::string kDInvokeOpen = "<" + kDTag + "invoke name=\"";
 const std::string kDInvokeHeadEnd = "\">\n";
-const std::string kDParamOpen = "<" + kDTag + " parameter name=\"";
+const std::string kDParamOpen = "<" + kDTag + "parameter name=\"";
 const std::string kDParamFlag = "\" string=\"";
 const std::string kDFlagTrue = "true\">";
 const std::string kDFlagFalse = "false\">";
-const std::string kDParamClose = "</" + kDTag + " parameter>\n";
-const std::string kDInvokeClose = "</" + kDTag + " invoke>\n";
-const std::string kDCallsClose = "</" + kDTag + " calls>";
+const std::string kDParamClose = "</" + kDTag + "parameter>\n";
+const std::string kDInvokeClose = "</" + kDTag + "invoke>\n";
+const std::string kDCallsClose = "</" + kDTag + "tool_calls>";
 }  // namespace
 
 const char* GrammarState::xml_function_open() const {

@@ -1860,8 +1860,10 @@ DGPP_TEST(serve_tools_dsmlNamespacesMatchRenderedAndConstrainedNames) {
   const std::string fields =
       R"("name":"lookup","description":"Lookup","parameters":{"type":"object","properties":{}},"response":{"response_schema_marker":true})";
   size_t expected_grammars = 0;
-  // The renderer accepts namespaces on the wrapper, the function or a flat
-  // definition. All three must retain their descriptions and qualified names.
+  // The 0731 contract: namespaces are accepted on the wrapper, the function
+  // or a flat definition, but the encoder ignores them — the schema lists
+  // the function object verbatim, the grammar constrains the bare name, and
+  // the namespace description is not merged into the function's.
   for (const std::string& tool :
        {"{\"type\":\"function\"," + ns + ",\"function\":{" + fields + "}}",
         "{\"type\":\"function\",\"function\":{" + ns + "," + fields + "}}",
@@ -1882,15 +1884,14 @@ DGPP_TEST(serve_tools_dsmlNamespacesMatchRenderedAndConstrainedNames) {
       const auto grammars = rig.engine.grammars();
       require(grammars.size() == ++expected_grammars, "each request installs a constraint");
       const auto& grammar = grammars.back();
-      require(grammar.tools.size() == 1 && grammar.tools[0].name == "search::lookup",
-              "the grammar retains the qualified tool name");
-      require(prompt.find("\"name\": \"" + grammar.tools[0].name + "\"") != std::string::npos,
+      require(grammar.tools.size() == 1 && grammar.tools[0].name == "lookup",
+              "the grammar constrains the bare tool name (the 0731 encoder ignores namespaces)");
+      require(prompt.find("\"name\": \"lookup\"") != std::string::npos,
               "rendered tool name must agree with the decoding constraint: " + prompt);
       if (grammar.mode == dgpp::text::GrammarSpec::Mode::kNamed)
-        require(grammar.named == grammar.tools[0].name,
-                "named choice uses the same qualified name");
-      require(prompt.find("Search tools\\nLookup") != std::string::npos,
-              "the namespace description reaches the model: " + prompt);
+        require(grammar.named == "lookup", "named choice uses the same bare name");
+      require(prompt.find("Search tools\\nLookup") == std::string::npos,
+              "the namespace description is not merged into the function's: " + prompt);
       require(globals.find("response_schema_marker") == std::string::npos,
               "DeepSeek still drops unrelated tool fields: " + globals);
     }

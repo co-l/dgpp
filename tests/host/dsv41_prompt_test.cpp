@@ -80,13 +80,28 @@ DGPP_TEST(dsv41_prompt_differential_goldens) {
   const dgpp::text::Tokenizer tok =
       dgpp::text::Tokenizer::load((std::filesystem::path(snap) / "tokenizer.json").string());
   const dgpp::serve::Dsv41Frontend frontend(&tok);
-  for (const auto& [effort, budget] : std::vector<std::pair<std::string,int>>{
-      {"minimal",25},{"low",50},{"medium",62},{"high",75},{"xhigh",100},{"max",100}}) {
+  const std::string kHighPrefix =
+      "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+      "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
+      "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
+  const std::string kMaxPrefix =
+      "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
+      "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+      "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
+  for (const auto& [effort, expect] : std::vector<std::pair<std::string, std::string>>{
+      {"minimal", ""}, {"low", ""}, {"medium", kHighPrefix}, {"high", kHighPrefix},
+      {"xhigh", kMaxPrefix}, {"max", kMaxPrefix}}) {
     const auto settings = frontend.reasoning_settings(effort);
     const std::string payload = R"({"messages":[{"role":"user","content":"Hi"}],"reasoning_effort":")" + *settings.effort + "\"}";
     const auto globals = dgpp::minijson::parse(payload);
-    require(frontend.render_chat(globals.root).find("Reasoning Effort: " + std::to_string(budget) + " ") != std::string::npos,
-            "API effort maps to native DeepSeek budget: " + effort);
+    const std::string rendered = frontend.render_chat(globals.root);
+    const std::string_view bos = dgpp::text::Dsv41Prompt::kBos;
+    if (expect.empty())
+      require(rendered.find("Reasoning Effort:") == std::string::npos,
+              "API low effort adds no prefix: " + effort);
+    else
+      require(rendered.compare(bos.size(), expect.size(), expect) == 0,
+              "API effort maps to the native DeepSeek prefix: " + effort);
   }
   require(frontend.reasoning_settings("none").enable_thinking == false && !frontend.reasoning_settings("none").effort,
           "DeepSeek none uses native chat mode");

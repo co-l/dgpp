@@ -104,6 +104,16 @@ class Dsv41Frontend : public ModelFrontend {
     return tok_->decode(ids, /*skip_special_tokens=*/true);
   }
   bool template_reads(std::string_view name) const override { return dgpp::text::Dsv41Prompt::reads(name); }
+  ReasoningSettings reasoning_settings(std::string_view effort) const override {
+    auto out = ModelFrontend::reasoning_settings(effort);
+    if (!out.effort) return out;
+    // DeepSeek-V4's encoder accepts exactly low / high / max; fold the
+    // API's coarser scale onto them (minimal -> low, medium -> high,
+    // xhigh -> max).
+    out.effort = (effort == "minimal" || effort == "low") ? "low" :
+                 (effort == "medium" || effort == "high") ? "high" : "max";
+    return out;
+  }
   std::string render_chat(const minijson::Value& globals) const override {
     return dgpp::text::Dsv41Prompt::render(globals);
   }

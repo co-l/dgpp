@@ -492,11 +492,11 @@ DGPP_TEST(tool_grammar_open_schema_closes_the_parameter_names) {
           "an explicit additionalProperties:true keeps the keys free, noted");
 }
 
-// ---- the DeepSeek-V4.1 DSML format --------------------------------
+// ---- the DeepSeek-V4 DSML format ---------------------------------
 // One marker id (the tag token, empty text like every special token) inside
-// text tags: "<" TAG " calls>\n", "<" TAG " invoke name=\"NAME\">\n", the
-// parameters "<" TAG " parameter name=\"K\" string=\"true|false\">" V "</" TAG
-// " parameter>\n", "</" TAG " invoke>\n", "</" TAG " calls>" then EOS.
+// text tags: "<" TAG "tool_calls>\n", "<" TAG "invoke name=\"NAME\">\n", the
+// parameters "<" TAG "parameter name=\"K\" string=\"true|false\">" V "</" TAG
+// "parameter>\n", "</" TAG "invoke>\n", "</" TAG "tool_calls>" then EOS.
 constexpr int64_t kDsmlTag = 308;
 constexpr int64_t kQuotedLt = 265;
 GrammarVocab dsml_vocab() {
@@ -538,16 +538,16 @@ DGPP_TEST(tool_grammar_dsml_required_call_walks_the_tagged_shape) {
   feed(g, bytes_of(" <"));
   g.advance(kDsmlTag);
   require(std::string(g.state_name()) == "d-calls", std::string("after the tag: ") + g.state_name());
-  require(same(allowed_ids(g), {' '}), "the block opens with ' calls>': " + show(allowed_ids(g)));
-  feed(g, bytes_of(" calls>\n"));
+  require(same(allowed_ids(g), {'t'}), "the block opens with 'tool_calls>': " + show(allowed_ids(g)));
+  feed(g, bytes_of("tool_calls>\n"));
   require(std::string(g.state_name()) == "d-invoke", "then an invoke");
-  // "<" TAG " invoke name=\"" NAME "\">\n": the '<', the tag alone, the literal, the names.
+  // "<" TAG "invoke name=\"" NAME "\">\n": the '<', the tag alone, the literal, the names.
   require(same(allowed_ids(g), {'<'}), "an invoke opens with '<'");
   g.advance('<');
   require(same(allowed_ids(g), {kDsmlTag}), "the tag alone after the '<' in the block: " + show(allowed_ids(g)));
   g.advance(kDsmlTag);
-  require(!g.allows(kDsmlTag) && g.allows(' '), "no token runs across the tag");
-  feed(g, bytes_of(" invoke name=\""));
+  require(!g.allows(kDsmlTag) && g.allows('i'), "no token runs across the tag");
+  feed(g, bytes_of("invoke name=\""));
   require(g.allows(kGet) && g.allows(kGetWeather) && g.allows('p') && g.allows(kGetT) && !g.allows('x'),
           "names over token texts");
   feed(g, {kGet, kWeather});
@@ -558,7 +558,7 @@ DGPP_TEST(tool_grammar_dsml_required_call_walks_the_tagged_shape) {
   g.advance('<');
   require(g.allows(kDsmlTag) && g.allows('/') && !g.allows('x'), "the tag (a parameter) or '/' (the close)");
   g.advance(kDsmlTag);
-  feed(g, bytes_of(" parameter name=\""));
+  feed(g, bytes_of("parameter name=\""));
   require(g.allows('c') && g.allows('d') && !g.allows('x'), "closed keys city/days");
   feed(g, bytes_of("city\" string=\""));
   require(std::string(g.state_name()) == "d-flag", "the string flag follows a key");
@@ -578,19 +578,19 @@ DGPP_TEST(tool_grammar_dsml_required_call_walks_the_tagged_shape) {
   g.advance('/');
   require(g.allows(kDsmlTag) && g.allows('x'), "after \"</\" the tag opens the closer (or the text goes on)");
   g.advance(kDsmlTag);
-  require(same(allowed_ids(g), {' '}), "after the closer's tag: its literal only: " + show(allowed_ids(g)));
-  feed(g, bytes_of(" parameter>\n"));
+  require(same(allowed_ids(g), {'p'}), "after the closer's tag: its literal only: " + show(allowed_ids(g)));
+  feed(g, bytes_of("parameter>\n"));
   require(std::string(g.state_name()) == "d-param-or-close", "the closer ends the value");
   // days is JSON-typed: the flag is forced false; the value a JSON integer.
   GrammarSpec typed = spec_of(GrammarSpec::Mode::kRequired);
   (void)typed;
   feed(g, bytes_of("<"));
   g.advance(kDsmlTag);
-  feed(g, bytes_of(" parameter name=\""));
+  feed(g, bytes_of("parameter name=\""));
   require(g.allows('d') && !g.allows('c'), "a closed key is offered once");
   feed(g, bytes_of("days\" string=\"false\">3</"));
   g.advance(kDsmlTag);
-  feed(g, bytes_of(" parameter>\n"));
+  feed(g, bytes_of("parameter>\n"));
   // Every key used: only the invoke's close remains.
   require(same(allowed_ids(g), {'<'}), "only the close remains");
   g.advance('<');
@@ -598,14 +598,14 @@ DGPP_TEST(tool_grammar_dsml_required_call_walks_the_tagged_shape) {
   g.advance('/');
   require(same(allowed_ids(g), {kDsmlTag}), "the close's tag");
   g.advance(kDsmlTag);
-  feed(g, bytes_of(" invoke>\n"));
+  feed(g, bytes_of("invoke>\n"));
   require(std::string(g.state_name()) == "d-invoke-or-close", std::string("after the invoke: ") + g.state_name());
   // Required (parallel): another invoke or the block's close, then EOS.
   g.advance('<');
   require(g.allows(kDsmlTag) && g.allows('/'), "another invoke or the close");
   g.advance('/');
   g.advance(kDsmlTag);
-  feed(g, bytes_of(" calls>"));
+  feed(g, bytes_of("tool_calls>"));
   require(same(allowed_ids(g), {kEosText}), "after the block: EOS only: " + show(allowed_ids(g)));
   g.advance(kEosText);
   require(std::string(g.state_name()) == "done", "done after EOS");
@@ -629,14 +629,14 @@ DGPP_TEST(tool_grammar_dsml_typed_values_named_single_and_open_keys) {
   GrammarState t(&vocab, spec, false);
   t.advance('<');
   t.advance(kDsmlTag);
-  feed(t, bytes_of(" calls>\n<"));
+  feed(t, bytes_of("tool_calls>\n<"));
   t.advance(kDsmlTag);
-  feed(t, bytes_of(" invoke name=\""));
+  feed(t, bytes_of("invoke name=\""));
   require(t.allows(kGetWeather) && !t.allows(kGetT) && !t.allows('p'), "named: only get_weather");
   feed(t, {kGetWeather});
   feed(t, bytes_of("\">\n<"));
   t.advance(kDsmlTag);
-  feed(t, bytes_of(" parameter name=\"days\" string=\""));
+  feed(t, bytes_of("parameter name=\"days\" string=\""));
   require(t.allows('f') && !t.allows('t'), "a JSON-typed value is not a string");
   feed(t, bytes_of("false\">"));
   require(t.allows('3') && !t.allows('x') && !t.allows('<'), "a JSON integer: digits first");
@@ -647,9 +647,9 @@ DGPP_TEST(tool_grammar_dsml_typed_values_named_single_and_open_keys) {
   t.advance('/');
   require(same(allowed_ids(t), {kDsmlTag}), "then the tag");
   t.advance(kDsmlTag);
-  feed(t, bytes_of(" parameter>\n<"));
+  feed(t, bytes_of("parameter>\n<"));
   t.advance(kDsmlTag);
-  feed(t, bytes_of(" parameter name=\"unit\" string=\""));
+  feed(t, bytes_of("parameter name=\"unit\" string=\""));
   require(t.allows('t') && !t.allows('f'), "an enum value is a string");
   feed(t, bytes_of("true\">"));
   require(t.allows('c') && t.allows('f') && !t.allows('k'), "an enum value: its texts");
@@ -657,37 +657,37 @@ DGPP_TEST(tool_grammar_dsml_typed_values_named_single_and_open_keys) {
   require(t.allows('<') && !t.allows('c'), "the enum text then its closer");
   feed(t, bytes_of("</"));
   t.advance(kDsmlTag);
-  feed(t, bytes_of(" parameter>\n</"));
+  feed(t, bytes_of("parameter>\n</"));
   t.advance(kDsmlTag);
-  feed(t, bytes_of(" invoke>\n"));
+  feed(t, bytes_of("invoke>\n"));
   // Named: no second invoke — the block closes.
   require(same(allowed_ids(t), {'<'}), "the block's close only");
   t.advance('<');
   require(same(allowed_ids(t), {'/'}), "no second invoke under named");
   feed(t, bytes_of("/"));
   t.advance(kDsmlTag);
-  feed(t, bytes_of(" calls>"));
+  feed(t, bytes_of("tool_calls>"));
   require(same(allowed_ids(t), {kEosText}), "named single: EOS only");
   // An open key set (get_time): free text through "\" string=\"".
   GrammarState o(&vocab, spec_of(GrammarSpec::Mode::kNamed, false, "get_time"), false);
   o.advance('<');
   o.advance(kDsmlTag);
-  feed(o, bytes_of(" calls>\n<"));
+  feed(o, bytes_of("tool_calls>\n<"));
   o.advance(kDsmlTag);
-  feed(o, bytes_of(" invoke name=\""));
+  feed(o, bytes_of("invoke name=\""));
   feed(o, {kGetT, kIme});
   feed(o, bytes_of("\">\n<"));
   o.advance(kDsmlTag);
-  feed(o, bytes_of(" parameter name=\""));
+  feed(o, bytes_of("parameter name=\""));
   require(std::string(o.state_name()) == "d-free-key", "an open key set is free text");
   require(o.allows('t') && !o.allows(kDsmlTag) && !o.allows(kEosText), "free key text");
   feed(o, bytes_of("tz\" string=\"true\">UTC</"));
   o.advance(kDsmlTag);
-  feed(o, bytes_of(" parameter>\n</"));
+  feed(o, bytes_of("parameter>\n</"));
   o.advance(kDsmlTag);
-  feed(o, bytes_of(" invoke>\n</"));
+  feed(o, bytes_of("invoke>\n</"));
   o.advance(kDsmlTag);
-  feed(o, bytes_of(" calls>"));
+  feed(o, bytes_of("tool_calls>"));
   require(same(allowed_ids(o), {kEosText}), "the open-key call closed cleanly");
   // Auto: text may end the turn without a call; a block, once opened,
   // completes; a disallowed id kills the grammar.
@@ -946,13 +946,13 @@ DGPP_TEST(tool_grammar_jsonOrToolsCommitsToOneBranch) {
       GrammarState call(&v, spec, false);
       if (dsml) {
         feed(call, {'<', kDsmlTag});
-        feed(call, bytes_of(" calls>\n<"));
+        feed(call, bytes_of("tool_calls>\n<"));
         feed(call, {kDsmlTag});
-        feed(call, bytes_of(" invoke name=\"ping\">\n</"));
+        feed(call, bytes_of("invoke name=\"ping\">\n</"));
         feed(call, {kDsmlTag});
-        feed(call, bytes_of(" invoke>\n</"));
+        feed(call, bytes_of("invoke>\n</"));
         feed(call, {kDsmlTag});
-        feed(call, bytes_of(" calls>"));
+        feed(call, bytes_of("tool_calls>"));
       } else {
         feed(call, {kToolOpen});
         feed(call, bytes_of(qwen ? "\n<function=ping>\n</function>\n" : "ping"));

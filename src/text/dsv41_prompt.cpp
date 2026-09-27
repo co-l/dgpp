@@ -14,6 +14,16 @@ using dgpp::minijson::Member;
 
 [[noreturn]] void refuse(const std::string& what) { throw std::runtime_error("dsv41 prompt: " + what); }
 
+// The 0731 encoder's DSML markers: the tag token is followed directly by the
+// element name (no space), and the block is "tool_calls" (the reference's
+// tool_call_template / tool_calls_template over dsml_token).
+const std::string kCallsOpen = std::string("<") + Dsv41Prompt::kDsml + "tool_calls>";
+const std::string kCallsClose = std::string("</") + Dsv41Prompt::kDsml + "tool_calls>";
+const std::string kInvokeOpen = std::string("<") + Dsv41Prompt::kDsml + "invoke";
+const std::string kInvokeClose = std::string("</") + Dsv41Prompt::kDsml + "invoke>";
+const std::string kParamOpen = std::string("<") + Dsv41Prompt::kDsml + "parameter";
+const std::string kParamClose = std::string("</") + Dsv41Prompt::kDsml + "parameter>";
+
 struct Param {
   std::string key;
   std::string value;  // the raw string, or the JSON text
@@ -68,102 +78,52 @@ std::string content_text(const minijson::Value* content, const std::string& wher
   return out;
 }
 
-// A tool result's content: a string, or a list of parts reduced to its
-// text parts "\n\n"-joined (the reference's process_image_messages runs
-// before the merge, so a tool message's list content becomes that text;
-// an image part is refused — the API serves text).
+// A tool result's content: a string, or a list of parts (the reference's
+// tool_result branch of the user's content_blocks): text parts verbatim,
+// any other part as "[Unsupported <type>]", the parts "\n\n"-joined.
 std::string tool_result_text(const minijson::Value* content, const std::string& where) {
-  return content_text(content, where);
-}
-
-// "ns::name" with an explicit namespace that must agree (the reference's
-// _split_tool_name).
-std::pair<std::string, std::string> split_tool_name(const std::string& name, const std::string& ns, bool has_ns) {
-  std::string space = has_ns ? ns : "";
-  bool have = has_ns;
-  std::string bare = name;
-  const size_t sep = name.find("::");
-  if (sep != std::string::npos) {
-    const std::string prefix = name.substr(0, sep);
-    bare = name.substr(sep + 2);
-    if (have && space != prefix) refuse("conflicting tool namespaces: " + space + " != " + prefix);
-    space = prefix;
-    have = true;
-  }
-  if (bare.find("::") != std::string::npos) refuse("tool name must not contain '::': " + bare);
-  if (have && space.find("::") != std::string::npos) refuse("tool namespace must not contain '::': " + space);
-  return {have ? space : std::string(), bare};
-}
-
-// The namespace of a tool entry or call: a string, or {name, description}.
-struct Namespace {
-  bool present = false;
-  std::string name;
-  std::string description;
-  bool has_description = false;
-};
-
-Namespace namespace_of(const minijson::Value* v) {
-  Namespace ns;
-  if (v == nullptr || v->is_null()) return ns;
-  ns.present = true;
-  if (v->is_string()) {
-    ns.name = std::string(v->as_string());
-  } else if (v->is_object()) {
-    const minijson::Value* n = v->find("name");
-    if (!n || !n->is_string()) refuse("namespace.name must be a string");
-    ns.name = std::string(n->as_string());
-    const minijson::Value* d = v->find("description");
-    if (d && d->is_string() && !d->as_string().empty()) {
-      ns.has_description = true;
-      ns.description = std::string(d->as_string());
-    }
-  } else {
-    refuse("namespace must be a string or an object");
-  }
-  return ns;
-}
-
-std::string qualified_tool_name_of(const minijson::Value& tool) {
-  const minijson::Value* fn = tool.find("function");
-  const minijson::Value& def = fn && fn->is_object() ? *fn : tool;
-  Namespace ns = namespace_of(tool.find("namespace"));
-  if (!ns.present) ns = namespace_of(def.find("namespace"));
-  const minijson::Value* name = def.find("name");
-  if (!name || !name->is_string()) refuse("tools[].function.name must be a string");
-  const auto [space, bare] = split_tool_name(std::string(name->as_string()), ns.name, ns.present);
-  return space.empty() ? bare : space + "::" + bare;
-}
-
-// One tool's schema line: the function object with its name qualified,
-// the namespace popped and its description prefixed (the reference's
-// tools_from_openai_format + to_json).
-std::string render_tool_schema(const minijson::Value& tool) {
-  const minijson::Value* fn = tool.find("function");
-  const minijson::Value& def = fn && fn->is_object() ? *fn : tool;
-  Namespace ns = namespace_of(tool.find("namespace"));
-  if (!ns.present) ns = namespace_of(def.find("namespace"));
-  const minijson::Value* name = def.find("name");
-  if (!name || !name->is_string()) refuse("tools[].function.name must be a string");
-  const auto [space, bare] = split_tool_name(std::string(name->as_string()), ns.name, ns.present);
-  const std::string qualified = space.empty() ? bare : space + "::" + bare;
-  Value::Members members;
-  bool has_description = false;
-  for (const Member& m : def.members()) {
-    if (m.key == "namespace") continue;
-    if (m.key == "name") {
-      members.emplace_back("name", Value::string_value(qualified));
-    } else if (m.key == "description") {
-      has_description = true;
-      std::string d = m.value.is_string() ? std::string(m.value.as_string()) : "";
-      if (ns.has_description) d = ns.description + "\n" + d;
-      members.emplace_back("description", Value::string_value(d));
+  if (content == nullptr || content->is_null()) return "";
+  if (content->is_string()) return std::string(content->as_string());
+  if (!content->is_array()) refuse(where + ".content must be a string or an array of content parts");
+  std::string out;
+  bool first = true;
+  for (const minijson::Value& part : content->items()) {
+    if (!part.is_object()) refuse(where + ".content parts must be objects");
+    const minijson::Value* type = part.find("type");
+    const std::string t = type && type->is_string() ? std::string(type->as_string()) : "None";
+    if (!first) out += "\n\n";
+    first = false;
+    if (t == "text") {
+      const minijson::Value* text = part.find("text");
+      if (text && text->is_string()) out += std::string(text->as_string());
     } else {
-      members.emplace_back(m.key, Value::from_minijson(m.value));
+      out += "[Unsupported " + t + "]";
     }
   }
-  if (ns.has_description && !has_description) members.emplace_back("description", Value::string_value(ns.description + "\n"));
-  return Value::map_value(std::move(members)).to_json(false);
+  return out;
+}
+
+// The reference's tools_from_openai_format: the function object, as is
+// (the entry's top-level "namespace" is ignored by the 0731 encoder). A
+// flat definition (no "function" key) is the entry itself — the service
+// accepts that shape.
+const minijson::Value* function_def_of(const minijson::Value& tool, const std::string& where) {
+  const minijson::Value* fn = tool.find("function");
+  if (fn && fn->is_object()) {
+    const minijson::Value* name = fn->find("name");
+    if (!name || !name->is_string()) refuse(where + ".function.name must be a string");
+    return fn;
+  }
+  if (!tool.is_object()) refuse(where + " must be an object");
+  const minijson::Value* name = tool.find("name");
+  if (!name || !name->is_string()) refuse(where + ".name must be a string");
+  return &tool;
+}
+
+// One tool's schema line: the function object serialized verbatim (the
+// reference's tools_from_openai_format + to_json).
+std::string render_tool_schema(const minijson::Value& tool) {
+  return Value::from_minijson(*function_def_of(tool, "tools[]")).to_json(false);
 }
 
 std::string render_tools(const minijson::Value& tools) {
@@ -175,20 +135,19 @@ std::string render_tools(const minijson::Value& tools) {
     first = false;
     schemas += render_tool_schema(t);
   }
-  const std::string D = Dsv41Prompt::kDsml;
   std::string out;
   out += "## Tools\n\n";
-  out += "You have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<" + D +
-         " calls>\" block like the following:\n\n";
-  out += "<" + D + " calls>\n";
-  out += "<" + D + " invoke name=\"$TOOL_NAME\">\n";
-  out += "<" + D + " parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</" + D + " parameter>\n";
+  out += "You have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"" +
+         kCallsOpen + "\" block like the following:\n\n";
+  out += kCallsOpen + "\n";
+  out += kInvokeOpen + " name=\"$TOOL_NAME\">\n";
+  out += kParamOpen + " name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE" + kParamClose + "\n";
   out += "...\n";
-  out += "</" + D + " invoke>\n";
-  out += "<" + D + " invoke name=\"$TOOL_NAME2\">\n";
+  out += kInvokeClose + "\n";
+  out += kInvokeOpen + " name=\"$TOOL_NAME2\">\n";
   out += "...\n";
-  out += "</" + D + " invoke>\n";
-  out += "</" + D + " calls>\n\n";
+  out += kInvokeClose + "\n";
+  out += kCallsClose + "\n\n";
   out += "String parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, "
          "arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\n";
   out += "If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside "
@@ -212,10 +171,7 @@ ToolCall parse_tool_call(const minijson::Value& tc, const std::string& where) {
     if (const minijson::Value* id = fn->find("id"); id && id->is_string()) call.id = std::string(id->as_string());
   const minijson::Value* name = fn->find("name");
   if (!name || !name->is_string()) refuse(where + ".function.name must be a string");
-  Namespace ns = namespace_of(tc.find("namespace"));
-  if (!ns.present) ns = namespace_of(fn->find("namespace"));
-  const auto [space, bare] = split_tool_name(std::string(name->as_string()), ns.name, ns.present);
-  call.name = space.empty() ? bare : space + "::" + bare;
+  call.name = std::string(name->as_string());
   const minijson::Value* args = fn->find("arguments");
   // The arguments: an object, or a JSON string of one (a double-encoded
   // string parses twice); anything else is {"arguments": <as given>}.
@@ -266,37 +222,41 @@ ToolCall parse_tool_call(const minijson::Value& tc, const std::string& where) {
 }
 
 std::string render_call(const ToolCall& c) {
-  const std::string D = Dsv41Prompt::kDsml;
   std::string lines;
   for (size_t i = 0; i < c.params.size(); ++i) {
     if (i) lines += "\n";
-    lines += "<" + D + " parameter name=\"" + c.params[i].key + "\" string=\"" + (c.params[i].is_string ? "true" : "false") +
-             "\">" + c.params[i].value + "</" + D + " parameter>";
+    lines += kParamOpen + " name=\"" + c.params[i].key + "\" string=\"" + (c.params[i].is_string ? "true" : "false") +
+             "\">" + c.params[i].value + kParamClose;
   }
-  return "<" + D + " invoke name=\"" + c.name + "\">\n" + lines + "\n</" + D + " invoke>";
+  return kInvokeOpen + " name=\"" + c.name + "\">\n" + lines + "\n" + kInvokeClose;
 }
 
+// The reference's last user index: roles user / developer only — a
+// mid-conversation system message does not move it.
 int find_last_user_index(const std::vector<Msg>& msgs) {
   for (int i = static_cast<int>(msgs.size()) - 1; i >= 0; --i)
-    if (msgs[static_cast<size_t>(i)].role == "user" || (msgs[static_cast<size_t>(i)].role == "system" && i > 0)) return i;
+    if (msgs[static_cast<size_t>(i)].role == "user") return i;
   return -1;
 }
 
-int effort_budget(const minijson::Value* v) {
-  if (v == nullptr || v->is_null()) return 75;  // the reference's default, "high"
-  if (v->is_number()) {
-    const int b = static_cast<int>(v->as_int());
-    if (b < 1 || b > 100) refuse("reasoning_effort must be in [1, 100]");
-    return b;
-  }
-  if (!v->is_string()) refuse("reasoning_effort must be a string or an integer");
+// The reference's reasoning-effort levels (encoding_dsv4.py): exactly
+// low / high / max, each realized as a text prefix prepended at the very
+// start of the prompt (before the system message) in thinking mode only;
+// "low" is the default and adds nothing. Any other value is refused.
+std::string effort_prefix(const minijson::Value* v) {
+  if (v == nullptr || v->is_null()) return "";  // the reference's default, "low"
+  if (!v->is_string()) refuse("reasoning_effort must be a string");
   const std::string_view s = v->as_string();
-  if (s == "low") return 50;
-  if (s == "high") return 75;
-  if (s == "max" || s == "xhigh") return 100;
-  if (s == "medium") return 62;
-  if (s == "minimal") return 25;
-  refuse("reasoning_effort must be minimal, low, medium, high or max (or an integer in [1, 100])");
+  if (s == "low") return "";
+  if (s == "high")
+    return "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
+           "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
+           "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n";
+  if (s == "max")
+    return "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
+           "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
+           "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n";
+  refuse("reasoning_effort must be low, high or max");
 }
 
 }  // namespace
@@ -322,7 +282,6 @@ std::string Dsv41Prompt::render(const minijson::Value& globals) {
   if (const minijson::Value* v = globals.find("enable_thinking"); v && v->is_bool()) thinking = v->as_bool();
   if (const minijson::Value* v = globals.find("thinking"); v && v->is_bool()) thinking = v->as_bool();
   if (const minijson::Value* v = globals.find("clear_thinking"); v && v->is_bool()) drop_thinking = v->as_bool();
-  const int budget = effort_budget(globals.find("reasoning_effort"));
 
   // ---- the messages in the reference's shape --------------------------------
   std::vector<Msg> raw;
@@ -451,19 +410,16 @@ std::string Dsv41Prompt::render(const minijson::Value& globals) {
 
   // ---- render ---------------------------------------------------------------------
   const int last_user = find_last_user_index(msgs);
-  const std::string D = kDsml;
+  const std::string effort = effort_prefix(globals.find("reasoning_effort"));
   std::string prompt = kBos;
   for (size_t index = 0; index < msgs.size(); ++index) {
     const Msg& m = msgs[index];
-    std::string effort;
-    if (index == 0 && thinking)
-      effort = "Reasoning Effort: " + std::to_string(budget) +
-               " (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
     std::string out;
-    if (index == 0 && (!effort.empty() || m.role == "system")) out += kSystem;
-    out += effort;
+    // The reference's effort prefix sits at the very start of the prompt,
+    // before the first message's content (encoding_dsv4.py render_message:
+    // `prompt += REASONING_EFFORT_PROMPTS[...]` then the role block).
+    if (index == 0 && thinking) out += effort;
     if (m.role == "system") {
-      if (index > 0) out += kSystem;
       out += m.content;
       if (m.tools) out += "\n\n" + render_tools(*m.tools);
     } else if (m.role == "user") {
@@ -482,7 +438,7 @@ std::string Dsv41Prompt::render(const minijson::Value& globals) {
           if (i) calls += "\n";
           calls += render_call(m.calls[i]);
         }
-        tc = "\n\n<" + D + " calls>\n" + calls + "\n</" + D + " calls>";
+        tc = "\n\n" + kCallsOpen + "\n" + calls + "\n" + kCallsClose;
       }
       std::string thinking_part;
       if (thinking && (!effective_drop || static_cast<int>(index) > last_user))
@@ -491,11 +447,13 @@ std::string Dsv41Prompt::render(const minijson::Value& globals) {
     } else {
       refuse("unknown role after preprocessing: " + m.role);
     }
-    // The transition: the generation header after the last user (or a
-    // mid-conversation system) message, or before an assistant message.
+    // The transition: the reference appends the generation header only after
+    // a user message — when the next message is an assistant (that block opens
+    // without a role marker) or this is the last message. A mid-conversation
+    // system message gets none: the following block carries its own opener.
     const bool followed_by_other =
         index + 1 < msgs.size() && msgs[index + 1].role != "assistant";
-    if (!followed_by_other && (m.role == "user" || (m.role == "system" && index > 0))) {
+    if (!followed_by_other && m.role == "user") {
       out += kAssistant;
       if (!effective_drop && thinking) out += kThinkOpen;
       else if (effective_drop && thinking && static_cast<int>(index) >= last_user) out += kThinkOpen;
@@ -506,6 +464,9 @@ std::string Dsv41Prompt::render(const minijson::Value& globals) {
   return prompt;
 }
 
-std::string Dsv41Prompt::qualified_tool_name(const minijson::Value& tool) { return qualified_tool_name_of(tool); }
+std::string Dsv41Prompt::qualified_tool_name(const minijson::Value& tool) {
+  const minijson::Value* fn = function_def_of(tool, "tool");
+  return std::string(fn->find("name")->as_string());
+}
 
 }  // namespace dgpp::text

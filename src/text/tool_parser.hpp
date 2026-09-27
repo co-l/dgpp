@@ -71,12 +71,13 @@ struct ChatMarker {
 // "<function=NAME>\n<parameter=K>\nV\n</parameter>\n...</function>\n" as
 // TEXT between the <tool_call> tokens — only the outer markers are single
 // ids, so the block is parsed from its decoded text when it closes;
-// DeepSeek-V4.1 writes DSML — "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke
-// name=\"NAME\">\n<｜DSML｜ parameter name=\"K\" string=\"true|false\">V</｜DSML｜
-// parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>" — where only the ｜DSML｜
-// tag token is an id (a special one: the service's decode skips it) and
-// every bracket and tag name is text; the block opens at the tag token
-// after a "<" and closes at the text "</｜DSML｜ calls>", parsed then.
+// DeepSeek-V4 writes DSML — "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke
+// name=\"NAME\">\n<｜DSML｜parameter name=\"K\" string=\"true|false\">V</｜DSML｜
+// parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>" — where only the
+// ｜DSML｜ tag token is an id (a special one: the service's decode skips
+// it) and every bracket and tag name is text; the block opens at the tag
+// token after a "<" and closes at the text "</｜DSML｜tool_calls>",
+// parsed then.
 enum class ToolFormat { kNone, kGlmMarkers, kQwenXml, kDsml };
 
 struct ChatMarkers {
