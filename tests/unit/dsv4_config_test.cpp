@@ -78,7 +78,8 @@ DGPP_TEST(dsv4_config_parses_the_release) {
   // The hash-routed prefix.
   require(c.num_hash_layers == 3 && c.has_tid2eid(), "hash layers");
   require(c.is_hash_layer(0) && c.is_hash_layer(2) && !c.is_hash_layer(3) && !c.is_hash_layer(-1), "hash prefix");
-  require(c.hc_mult == 4 && c.hc_sinkhorn_iters == 20 && c.hc_eps == 1e-6f && c.hc_coeff_rows() == 24, "mhc");
+  require(c.hc_mult == 4 && c.hc_sinkhorn_iters == 20 && c.hc_eps == 1e-6f && c.hc_coeff_rows() == 24 &&
+              c.hc_head_rows() == 4, "mhc");
   require(c.moe_intermediate_size == 2048 && c.n_routed_experts == 256 && c.num_experts_per_tok == 6 &&
               c.n_shared_experts == 1 && c.shared_expert_inter() == 2048,
           "moe");

@@ -91,8 +91,7 @@ class GlmMoeLayer {
                        const int64_t* input_ids = nullptr);
   void enqueue(const uint16_t* hidden, uint16_t* out, int tokens,
                cudaStream_t stream,
-               MoeExpertKernel kernel = MoeExpertKernel::kGemv,
-               const int64_t* input_ids = nullptr);
+               MoeExpertKernel kernel = MoeExpertKernel::kGemv);
   // The host path with the fp32 chain handed back UNROUNDED (out
   // [tokens, hidden] f32) — the Qwen MoE continues it with its BF16 shared
   // expert and rounds once after (models/qwen/moe_layer.hpp).
@@ -181,7 +180,8 @@ class GlmMoeLayer {
   // full chain with the shared expert) / out_f32 (the routed chain) is set.
   void enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16,
                            float* out_f32, int tokens, MoeTraceStaging* trace,
-                           cudaStream_t stream, int table_slot);
+                           cudaStream_t stream, int table_slot,
+                           const int64_t* input_ids = nullptr);
   // The eager paths' expert-table upload: fills the ring's next pinned
   // entry with every routed expert's three views (and the shared expert's
   // three after them when with_shared) and copies it to d_dst on stream —

@@ -73,7 +73,7 @@ __device__ __forceinline__ void router_select_warp(
     int32_t* __restrict__ ids, float* __restrict__ weights, int token,
     int n_experts, int top_k, float routed_scaling_factor, int norm_topk,
     float* s_scores, float* s_biased, int lane, bool staged = false,
-    bool hash_select = false, const int32_t* tid2eid = nullptr,
+    bool hash_select = false, const int64_t* tid2eid = nullptr,
     const int64_t* input_ids = nullptr);
 
 // With `sel_ids` set the select is FUSED: the token's dots
@@ -95,7 +95,7 @@ __global__ void moe_router_dots_kernel(const uint16_t* __restrict__ hidden,
                                        int top_k, float routed_scaling_factor,
                                        int norm_topk,
                                        int* __restrict__ counters,
-                                       const int32_t* tid2eid = nullptr,
+                                       const int64_t* tid2eid = nullptr,
                                        const int64_t* input_ids = nullptr) {
   extern __shared__ float sel_smem[];  // [2][n_experts] when fused
   __shared__ int s_last;
@@ -193,7 +193,9 @@ __device__ __forceinline__ void router_dot(const uint16_t* __restrict__ hidden,
     const float s = kMode == kRouterSqrtSoftplus ? sqrt_softplus_acc(dot)
                                                  : 1.0f / (1.0f + expf(-dot));
     scores[at] = s;
-    biased[at] = s + bias[e];
+    // The 0731 hash-routed prefix has no selection bias (bias = None): the
+    // exported biased row is then just the score.
+    biased[at] = bias != nullptr ? s + bias[e] : s;
   }
 }
 
@@ -235,7 +237,7 @@ __device__ __forceinline__ void router_select_warp(
     int32_t* __restrict__ ids, float* __restrict__ weights, int token,
     int n_experts, int top_k, float routed_scaling_factor, int norm_topk,
     float* s_scores, float* s_biased, int lane, bool staged,
-    bool hash_select, const int32_t* tid2eid, const int64_t* input_ids) {
+    bool hash_select, const int64_t* tid2eid, const int64_t* input_ids) {
   if (!staged) {
     const size_t row = static_cast<size_t>(token) * n_experts;
     for (int e = lane; e < n_experts; e += 32) {
@@ -270,9 +272,9 @@ __device__ __forceinline__ void router_select_warp(
   int sel[16];
   float wsel[16];
   if (hash_select) {
-    const int32_t* table_row = tid2eid + static_cast<int64_t>(input_ids[token]) * top_k;
+    const int64_t* table_row = tid2eid + static_cast<int64_t>(input_ids[token]) * top_k;
     for (int r = 0; r < top_k; ++r) {
-      sel[r] = table_row[r];
+      sel[r] = static_cast<int32_t>(table_row[r]);
       wsel[r] = s_scores[sel[r]];
     }
   } else {
@@ -333,7 +335,7 @@ __global__ void moe_router_select_kernel(const float* __restrict__ scores,
                                          int tokens, int n_experts, int top_k,
                                          float routed_scaling_factor,
                                          int norm_topk,
-                                         const int32_t* tid2eid = nullptr,
+                                         const int64_t* tid2eid = nullptr,
                                          const int64_t* input_ids = nullptr) {
   static_assert(kRouterSelectThreads == 32, "one warp per token");
   extern __shared__ float sel_smem[];  // [2][n_experts]: scores | biased
@@ -342,7 +344,7 @@ __global__ void moe_router_select_kernel(const float* __restrict__ scores,
   router_select_warp<kMode>(scores, biased, ids, weights, token, n_experts,
                                top_k, routed_scaling_factor, norm_topk,
                                sel_smem, sel_smem + n_experts, threadIdx.x,
-                               /*staged=*/true, tid2eid != nullptr, tid2eid,
+                               /*staged=*/false, tid2eid != nullptr, tid2eid,
                                input_ids);
 }
 
@@ -796,7 +798,7 @@ void launch_router_mode(const uint16_t* hidden, const uint16_t* gate,
                         const float* bias, int32_t* ids, float* weights,
                         float* scores, float* biased, const GlmMoeConfig& cfg,
                         int tokens, cudaStream_t stream, int* counters,
-                        bool allow_tiled, const int32_t* tid2eid = nullptr,
+                        bool allow_tiled, const int64_t* tid2eid = nullptr,
                         const int64_t* input_ids = nullptr) {
   const int vector_loads =
       (cfg.hidden % 8 == 0 && aligned16(hidden) && aligned16(gate)) ? 1 : 0;
@@ -846,13 +848,13 @@ void launch_moe_router(const uint16_t* hidden, const uint16_t* gate,
                        const float* bias, int32_t* ids, float* weights,
                        float* scores, float* biased, const GlmMoeConfig& cfg,
                        int tokens, cudaStream_t stream, int* counters,
-                       bool allow_tiled, const int32_t* tid2eid,
+                       bool allow_tiled, const int64_t* tid2eid,
                        const int64_t* input_ids) {
   GlmMoeConfig::validate_config(cfg);
   if (tokens <= 0) return;
   const bool softmax = cfg.router_mode == MoeRouterMode::SoftmaxTopk;
   check_router_args(hidden, gate, bias, ids, weights, scores, biased,
-                    /*bias_required=*/!softmax);
+                    /*bias_required=*/!softmax && !cfg.hash_route);
   if (cfg.n_experts > 65535 || tokens > 65535)
     throw std::invalid_argument("moe_router: grid dimension overflow");
   if (softmax)

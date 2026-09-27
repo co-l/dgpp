@@ -25,7 +25,7 @@ void launch_moe_router(const uint16_t* hidden, const uint16_t* gate,
                        int tokens, cudaStream_t stream,
                        int* counters = nullptr,
                        bool allow_tiled = true,
-                       const int32_t* tid2eid = nullptr,
+                       const int64_t* tid2eid = nullptr,
                        const int64_t* input_ids = nullptr);
 
 // swiglu with asymmetric clamps: gate clamp_max only, up clamp both; two

@@ -326,7 +326,9 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
       const std::string ip = p + "indexer.";
       a.idx_wq_b = load_fp8(ip + "wq_b");
       a.idx_wp = load_bf16(ip + "weights_proj.weight");
-      if (cfg.is_kv_source(layer)) {
+      // V4.1 reads the kv sources' index keys; the V4-Flash-0731 C4A
+      // indexer builds its own compressed keys (no wk / k_norm tensors).
+      if (cfg.variant != Dsv41Variant::V4 && cfg.is_kv_source(layer)) {
         a.idx_wk = load_bf16(ip + "wk.weight");
         a.idx_k_norm = load_bf16(ip + "k_norm.weight");
       }
@@ -342,9 +344,7 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
     }
     if (cfg.is_kv_source(layer)) {
       const std::string cp = p + "compressor.";
-      const int64_t hd = cfg.head_dim;
       const int64_t ratio = cfg.compress_ratio(layer);
-      const int64_t cw = (cfg.variant == Dsv41Variant::V4 && ratio == 4) ? 2 * hd : hd;
       a.comp_wkv = load_bf16(cp + "wkv.weight");
       if (ratio > 1) a.comp_wgate = load_bf16(cp + "wgate.weight");
       a.comp_norm = load_bf16(cp + "norm.weight");
@@ -352,14 +352,16 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
     }
   }
 
-  void build_moe(const std::string& p, bool draft) {
+  void build_moe(const std::string& p, int layer, bool draft) {
     Dsv41MoeResident& m = out.moe;
     m.router = load_bf16(p + "gate.weight");
-    m.router_bias = load_f32(p + "gate.bias");
+    // The 0731 hash-routed prefix carries no selection bias; the scores
+    // still gate the weights (the router kernel gets a null bias there).
+    if (!cfg.is_hash_layer(layer)) m.router_bias = load_f32(p + "gate.bias");
     // The V4 hash-routed prefix's static table (layers 0..num_hash_layers-1):
-    // int32 [vocab, topk], read verbatim (replicated) like the router.
+    // I64 [vocab, topk], read verbatim (replicated) like the router.
     if (cfg.is_hash_layer(layer))
-      m.tid2eid = static_cast<const int32_t*>(load_raw(p + "gate.tid2eid"));
+      m.tid2eid = static_cast<const int64_t*>(load_raw(p + "gate.tid2eid"));
     // gate.bias_vl (image tokens) is present and never loaded (plan D9).
     const int64_t I = geo.local_inter, S = geo.local_shared_inter, r = rank;
     m.local_inter = I;
@@ -427,6 +429,11 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
         d.markov_head = load_bf16(p + "markov_head.head.weight");
       }
       d.confidence = load_bf16_as_f32(p + "confidence_head.proj.weight");
+      if (cfg.variant == Dsv41Variant::V4) {
+        d.hc_head_fn = load_f32_as_bf16(p + "hc_head_fn");
+        d.hc_head_base = load_f32(p + "hc_head_base");
+        d.hc_head_scale = load_f32(p + "hc_head_scale");
+      }
     }
   }
 
@@ -439,7 +446,7 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
     out.ffn_norm = load_bf16(p + "ffn_norm.weight");
     build_mhc(p);
     build_attention(p + "attn.", layer);
-    build_moe(p + "ffn.", draft);
+    build_moe(p + "ffn.", layer, draft);
     if (cfg.has_engram(layer)) build_engram(p + "engram.", layer);
     if (draft) build_draft(p, layer);
   }
@@ -530,6 +537,10 @@ size_t Dsv41LoaderFamily::globals_bytes(const Dsv41TextConfig& cfg, int rank, in
   b += align_up_256(static_cast<size_t>(geo.embed_vocab_count) * H * 2);
   b += align_up_256(H * 2);
   b += align_up_256(static_cast<size_t>(geo.lm_vocab_count) * H * 2);
+  if (cfg.variant == Dsv41Variant::V4) {
+    const int64_t fn_bytes = static_cast<int64_t>(cfg.hc_head_rows()) * 4 * H * 2;  // bf16 resident
+    b += align_up_256(static_cast<size_t>(fn_bytes)) + align_up_256(static_cast<size_t>(cfg.hc_head_rows()) * 4) + align_up_256(4);
+  }
   return b;
 }
 
@@ -573,6 +584,27 @@ void Dsv41LoaderFamily::build_globals(const Dsv41TextConfig& cfg, const Dsv41Loc
               static_cast<size_t>(count) * row_bytes);
   source_bytes += static_cast<size_t>(count) * row_bytes;
   if (head == LoaderHeadSharding::Full) verbatim_bytes += static_cast<size_t>(count) * row_bytes;
+  if (cfg.variant == Dsv41Variant::V4) {
+    const TensorInfo& hf = lookup("hc_head_fn");
+    const float* hsrc = static_cast<const float*>(hf.data);
+    uint16_t* hfdst = static_cast<uint16_t*>(bump.alloc(hf.nbytes() / 2));
+    const size_t nfn = hf.nbytes() / 4;
+    for (size_t i = 0; i < nfn; ++i) {
+      float v;
+      std::memcpy(&v, hsrc + i, 4);
+      hfdst[i] = float_to_bf16_bits(v);
+    }
+    source_bytes += hf.nbytes();
+    verbatim_bytes += hf.nbytes();
+    out.hc_head_fn = hfdst;
+    const size_t base_bytes = static_cast<size_t>(cfg.hc_head_rows()) * 4;
+    out.hc_head_base = static_cast<const float*>(bump.alloc(base_bytes));
+    std::memcpy(bump.host(const_cast<float*>(out.hc_head_base)), lookup("hc_head_base").data, base_bytes);
+    out.hc_head_scale = static_cast<const float*>(bump.alloc(4));
+    std::memcpy(bump.host(const_cast<float*>(out.hc_head_scale)), lookup("hc_head_scale").data, 4);
+    source_bytes += hf.nbytes() + base_bytes + 4;
+    verbatim_bytes += hf.nbytes() + base_bytes + 4;
+  }
   out.lm_head = dst;
   out.lm_vocab_begin = begin;
   out.lm_vocab_count = count;

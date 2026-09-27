@@ -119,7 +119,7 @@ struct GlmMoeConfig {
 struct GlmMoeWeights {
   const uint16_t* router_gate = nullptr;  // bf16 [n_experts, hidden]
   const float* router_bias = nullptr;     // f32 [n_experts] (null: SoftmaxTopk)
-  const int32_t* tid2eid = nullptr;       // int32 [vocab, top_k] (the 0731 hash layers)
+  const int64_t* tid2eid = nullptr;       // I64 [vocab, top_k] (the 0731 hash layers)
   GlmQuantMatrix shared[3];               // gate, up, down (FP8; unset when n_shared_experts == 0)
   // The shared expert in NVFP4 (2026-09-09, GLM-4.7, docs/glm47_plan.md
   // D3): the routed experts' shapes exactly (one expert wide), so the

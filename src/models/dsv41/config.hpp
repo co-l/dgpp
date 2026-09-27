@@ -190,6 +190,10 @@ struct Dsv41TextConfig {
   int qk_nope_head_dim() const { return head_dim - qk_rope_head_dim; }
   int heads_per_group() const { return num_attention_heads / o_groups; }
   int hc_coeff_rows() const { return (2 + hc_mult) * hc_mult; }
+  // The V4 head collapse is a single hc_mult-row projection (reference
+  // Transformer: hc_head_fn [hc_mult, hc_mult * hidden]); distinct from the
+  // per-layer mHC mixing matrices (hc_coeff_rows, (2+hc_mult)*hc_mult rows).
+  int hc_head_rows() const { return hc_mult; }
 
   // The routed chain's configuration (models/glm/moe.hpp) for a backbone
   // layer or a draft stage: the sqrtsoftplus router with its bias, the
