@@ -26,11 +26,18 @@ namespace dgpp {
 struct Csa2PoolShape {
   int layers = 0;                // attention layers with a window ring (the draft stages included)
   std::vector<int> cache_ratio;  // per cache ordinal (a kv source), its compress ratio (1, 2, 4 or 128)
-  int tail_ordinals = 0;         // ratio-2 kv sources (compressor tails)
+  int tail_ordinals = 0;         // the compressor tails' ordinals
+  std::vector<int> tail_floats;  // fp32 count per tail ordinal (0: a tailless source)
+  std::vector<int> tail_inf;     // the score-half floats the reset fills with -inf (the reference's)
   int max_requests = 0;
   int64_t token_slots = 0;       // pool capacity in tokens, a multiple of block_tokens
   int block_tokens = 128;
   int ring_slots = 160;
+  // The cache row formats (the v4.1 plan; 0731 stores the dequantized bf16
+  // the reference caches):
+  LatentFormat main_format = LatentFormat::kFp4Block;
+  LatentFormat ring_format = LatentFormat::kFp8Block;
+  bool index_bf16 = false;       // 0731: the index rows are dequantized bf16 (no fp8 codes)
 };
 
 class Csa2StatePool {
@@ -45,14 +52,18 @@ class Csa2StatePool {
   static size_t cache_bytes(const Csa2PoolShape& shape);
   static constexpr LatentFormat kMainFormat = LatentFormat::kFp4Block;
   static constexpr LatentFormat kRingFormat = LatentFormat::kFp8Block;
+  LatentFormat main_format() const { return shape_.main_format; }
+  LatentFormat ring_format() const { return shape_.ring_format; }
+  bool index_bf16() const { return shape_.index_bf16; }
+  size_t index_row_bytes() const { return shape_.index_bf16 ? 2 * kCsa2IndexDim : kCsa2IndexDim; }
 
   const Csa2PoolShape& shape() const { return shape_; }
   int caches() const { return static_cast<int>(shape_.cache_ratio.size()); }
   int cache_ratio(int ord) const { return shape_.cache_ratio[static_cast<size_t>(ord)]; }
   int entries_per_block(int ord) const { return shape_.block_tokens / cache_ratio(ord); }
   int64_t entry_slots(int ord) const { return table_.total_blocks() * entries_per_block(ord); }
-  size_t main_row_bytes() const { return latent_row_bytes(kMainFormat, kCsa2Latent); }
-  size_t ring_row_bytes() const { return latent_row_bytes(kRingFormat, kCsa2Latent); }
+  size_t main_row_bytes() const { return latent_row_bytes(main_format(), kCsa2Latent); }
+  size_t ring_row_bytes() const { return latent_row_bytes(ring_format(), kCsa2Latent); }
   size_t ring_bytes_per_request() const { return static_cast<size_t>(shape_.ring_slots) * ring_row_bytes(); }
   int64_t total_blocks() const { return table_.total_blocks(); }
   int64_t token_slots() const { return shape_.token_slots; }
@@ -69,6 +80,9 @@ class Csa2StatePool {
   uint8_t* ring(int layer) const;         // [max_requests][ring_slots] rows
   const int32_t* ring_table() const { return ring_table_; }  // the identity [max_requests]
   float* tails(int tail_ord) const;       // [max_requests][2][512]
+  size_t tail_bytes_per_request(int ord) const {
+    return static_cast<size_t>(shape_.tail_floats[static_cast<size_t>(ord)]) * sizeof(float);
+  }
   size_t tail_bytes_per_request() const { return 2 * kCsa2Latent * sizeof(float); }
 
   // ---- block management (the shared table's protocol) --------------------

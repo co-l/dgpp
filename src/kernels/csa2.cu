@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <type_traits>
 #include <string>
 #include <vector>
 
@@ -229,10 +230,48 @@ __global__ void index_k_append_kernel(const uint16_t* k, const int32_t* req_ids,
   index_row_quant(k + i * kCsa2IndexDim, index_k + slot * kCsa2IndexDim, index_scale + slot,
                   violations, s_kmax);
 }
-__global__ void fold_weights_kernel(const uint16_t* w, const float* q_scale, float* out, int64_t n) {
+__global__ void fold_weights_kernel(const uint16_t* w, const float* q_scale, float fold, float* out,
+                                    int64_t n) {
   const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  out[i] = __fmul_rn(__fmul_rn(bf16_bits_to_float(w[i]), 0.015625f), q_scale[i]);
+  const float qs = q_scale != nullptr ? q_scale[i] : 1.0f;
+  out[i] = __fmul_rn(__fmul_rn(bf16_bits_to_float(w[i]), fold), qs);
+}
+// The 0731 bf16 index append: 128 bf16 per row into the slot.
+__global__ void index_k_append_bf16_kernel(const uint16_t* k, const int32_t* req_ids,
+                                           const int64_t* entries, const int32_t* block_tables,
+                                           int blocks_per_request, int entries_per_block,
+                                           uint16_t* index_k) {
+  const int64_t i = blockIdx.x;
+  const int64_t e = entries[i];
+  if (e < 0) return;
+  const int32_t blk = block_tables[int64_t(req_ids[i]) * blocks_per_request + e / entries_per_block];
+  const int64_t slot = int64_t(blk) * entries_per_block + (e % entries_per_block);
+  const uint16_t* src = k + i * kCsa2IndexDim;
+  uint16_t* dst = index_k + slot * kCsa2IndexDim;
+  const uint4* s4 = reinterpret_cast<const uint4*>(src);
+  uint4* d4 = reinterpret_cast<uint4*>(dst);
+#pragma unroll
+  for (int u = 0; u < kCsa2IndexDim / 8; ++u) d4[u] = s4[u];
+}
+// The 0731 per-head q renormalization: one block per (row, head), 256
+// threads x 2 elements.
+__global__ void q_renorm_kernel(uint16_t* q, int heads, float eps) {
+  __shared__ float red[8];
+  const int r = blockIdx.x;
+  const int h = blockIdx.y;
+  uint16_t* qr = q + (int64_t(r) * heads + h) * kCsa2Latent;
+  float ss = 0.0f;
+  for (int i = threadIdx.x; i < kCsa2Latent; i += kCsa2Threads) {
+    const float v = bf16_bits_to_float(qr[i]);
+    ss = __fmaf_rn(v, v, ss);
+  }
+  const float total = block_sum_256(ss, red);
+  const float m = bf16_bits_to_float(float_to_bf16_bits(__fdiv_rn(total, float(kCsa2Latent))));  // the mean, bf16
+  const float t = bf16_bits_to_float(float_to_bf16_bits(__fadd_rn(m, eps)));
+  const float rs = bf16_bits_to_float(float_to_bf16_bits(__fdiv_rn(1.0f, sqrtf(t))));
+  for (int i = threadIdx.x; i < kCsa2Latent; i += kCsa2Threads)
+    qr[i] = float_to_bf16_bits(__fmul_rn(bf16_bits_to_float(qr[i]), rs));
 }
 
 // ---- the compressor -------------------------------------------------------------------------
@@ -328,6 +367,356 @@ __global__ void compress_decode_update_kernel(const float* kv, const float* scor
   }
 }
 
+// ---- the 0731 activation roundings ------------------------------------------------------
+// One thread per row; the reference's in-place quantizers as bf16 values
+// (kernel.py act_quant with scale_fmt None / fp4_act_quant / rotate).
+__global__ void actquant8_dequant_kernel(const uint16_t* x, uint16_t* y, int rows) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  const uint16_t* xr = x + int64_t(r) * kCsa2Latent;
+  uint16_t* yr = y + int64_t(r) * kCsa2Latent;
+  for (int i = 448; i < kCsa2Latent; ++i) yr[i] = xr[i];  // the rope tail passes
+#pragma unroll
+  for (int b = 0; b < 7; ++b) {
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 64; ++j) amax = fmaxf(amax, fabsf(bf16_bits_to_float(xr[b * 64 + j])));
+    const float a = fmaxf(amax, 1e-4f);
+    const float s = a * (1.0f / 448.0f);
+#pragma unroll
+    for (int j = 0; j < 64; ++j) {
+      const float v = bf16_bits_to_float(xr[b * 64 + j]);
+      yr[b * 64 + j] = float_to_bf16_bits(fp8_e4m3_bits_to_float(float_to_fp8_e4m3_bits(v / s)) * s);
+    }
+  }
+}
+__global__ void hadamard128_kernel(const uint16_t* x, uint16_t* y, int rows) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  const uint16_t* xr = x + int64_t(r) * kCsa2IndexDim;
+  float v[kCsa2IndexDim];
+#pragma unroll
+  for (int i = 0; i < kCsa2IndexDim; ++i) v[i] = bf16_bits_to_float(xr[i]);
+#pragma unroll
+  for (int stage = 1; stage < kCsa2IndexDim; stage *= 2)
+#pragma unroll
+    for (int i = 0; i < kCsa2IndexDim; i += 2 * stage)
+#pragma unroll
+      for (int j = 0; j < stage; ++j) {
+        const float a = v[i + j], b = v[i + j + stage];
+        v[i + j] = a + b;
+        v[i + j + stage] = a - b;
+      }
+  const float sc = 0.08838834764831845f;  // 1 / sqrt(128)
+#pragma unroll
+  for (int i = 0; i < kCsa2IndexDim; ++i) y[int64_t(r) * kCsa2IndexDim + i] = float_to_bf16_bits(v[i] * sc);
+}
+__global__ void fp4_dequant_kernel(const uint16_t* x, uint16_t* y, int rows) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  const uint16_t* xr = x + int64_t(r) * kCsa2IndexDim;
+  uint16_t* yr = y + int64_t(r) * kCsa2IndexDim;
+#pragma unroll
+  for (int b = 0; b < 4; ++b) {
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) amax = fmaxf(amax, fabsf(bf16_bits_to_float(xr[b * 32 + j])));
+    const float a = fmaxf(amax, 6.0f * 1.1754943508222875e-38f);  // 6 * 2^-126
+    const float s = e8m0_byte_to_float(e8m0_ceil_log2_byte(a * (1.0f / 6.0f)));
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+      const float v = bf16_bits_to_float(xr[b * 32 + j]);
+      yr[b * 32 + j] = float_to_bf16_bits(fp4_e2m1_bits_to_float(float_to_fp4_e2m1_bits(v / s)) * s);
+    }
+  }
+}
+
+__global__ void fill_inf_kernel(float* p, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) p[i] = -INFINITY;
+}
+
+// ---- the 0731 compressors (the overlap windows at ratio 4, the full windows at 128) --
+// The reference's overlap compressor: per channel the softmax over the
+// window's items (fp32, max-subtracted; p_j = e_j / den), the fp32 weighted
+// kv sum, one bf16 rounding, then the one-rounding RMSNorm. At ratio 4 the
+// window overlaps: the previous window's first kv half (its [0:D]) is pooled
+// against its own second half (its [D:2D]) — eight items. The request's
+// state (fp32, 16 slots of 2D): slots 0..3 hold the last four tokens' kv
+// (raw) and slots 4..7 the current window's (kv, score + ape); when a window
+// completes, slots 0..3 take over 4..7. The scores are stored raw; the
+// score half of a fresh state is the reference's -inf (an unwritten slot's
+// softmax weight is exactly zero), which the pool's reset fills in.
+// The eight items of one channel (s8 the bias-adjusted scores, k8 the kv
+// values): p_j = exp(s_j - m) / den, the fp32 weighted kv sum, one bf16
+// rounding.
+__device__ __forceinline__ float pool8_channel(const float k8[8], const float s8[8]) {
+  float m = s8[0];
+#pragma unroll
+  for (int i = 1; i < 8; ++i) m = fmaxf(m, s8[i]);
+  float den = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) den = __fadd_rn(den, expf(s8[i] - m));
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) sum = __fmaf_rn(expf(s8[i] - m) / den, k8[i], sum);
+  return bf16_bits_to_float(float_to_bf16_bits(sum));
+}
+
+template <int D>
+__global__ void compress4_prefill_kernel(const float* kv, const float* score, int T, const float* ape,
+                                         const uint16_t* norm_w, float eps, uint16_t* latent_out,
+                                         float* tail, int blocks) {
+  constexpr int kRows = 2 * D;
+  __shared__ float red[8];
+  const int w = blockIdx.x;
+  const int W = T / 4;
+  if (w < W) {
+    constexpr int kPer = (D > kCsa2Threads) ? 2 : 1;  // 2 (512) or 1 (128)
+    float pooled[kPer];
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+      const int c = threadIdx.x + j * blockDim.x;
+      float s8[8];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const bool prev = i < 4;
+        const int row = prev ? (w > 0 ? (w - 1) * 4 + i : -1) : w * 4 + (i - 4);
+        const int col = prev ? c : c + D;
+        const int arow = prev ? i : i - 4;  // the ape is [4, 2D]: all items index 0..3
+        s8[i] = row >= 0 ? score[int64_t(row) * kRows + col] + ape[int64_t(arow) * kRows + col] : -INFINITY;
+      }
+      float k8[8];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const bool prev = i < 4;
+        const int row = prev ? (w > 0 ? (w - 1) * 4 + i : -1) : w * 4 + (i - 4);
+        const int col = prev ? c : c + D;
+        k8[i] = row >= 0 ? kv[int64_t(row) * kRows + col] : 0.0f;
+      }
+      const float v = pool8_channel(k8, s8);
+      pooled[j] = v;
+      ss = __fmaf_rn(v, v, ss);
+    }
+    const float total = block_sum_256(ss, red);
+    const float rs = rsqrtf(__fadd_rn(__fdiv_rn(total, float(D)), eps));
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+      const int c = threadIdx.x + j * blockDim.x;
+      latent_out[int64_t(w) * D + c] =
+          float_to_bf16_bits(__fmul_rn(bf16_bits_to_float(norm_w[c]), __fmul_rn(pooled[j], rs)));
+    }
+  }
+  if (w == blocks - 1 && tail != nullptr) {
+    // The chunk's boundary state (the reference's kv_state / score_state):
+    // the last four complete tokens in slots 0..3, the remainder in 4..;
+    // the unwritten slots stay 0 / -bias (the memory's zero).
+    const int cutoff = W * 4, R = T - cutoff;
+    for (int q = 0; q < 4; ++q)
+      for (int i = threadIdx.x; i < kRows; i += blockDim.x) {
+        const int row = cutoff - 4 + q;
+        tail[size_t(q) * kRows + i] = row >= 0 ? kv[int64_t(row) * kRows + i] : 0.0f;
+        tail[8 * kRows + size_t(q) * kRows + i] =
+            row >= 0 ? score[int64_t(row) * kRows + i] + ape[size_t(q) * kRows + i] : -INFINITY;
+      }
+    for (int r = 0; r < R; ++r)
+      for (int i = threadIdx.x; i < kRows; i += blockDim.x) {
+        const int row = cutoff + r;
+        tail[size_t(4 + r) * kRows + i] = kv[int64_t(row) * kRows + i];
+        tail[8 * kRows + size_t(4 + r) * kRows + i] =
+            score[int64_t(row) * kRows + i] + ape[size_t(r) * kRows + i];
+      }
+  }
+}
+
+template <int D>
+__global__ void compress4_decode_kernel(const float* kv, const float* score, const int32_t* req_ids,
+                                        const int64_t* pos, const int32_t* req_spans, const float* ape,
+                                        const uint16_t* norm_w, float eps, float* states,
+                                        uint16_t* latent_out, int64_t* entries_out, float* snapshots) {
+  constexpr int kRows = 2 * D;
+  constexpr int kState = 16 * kRows;
+  __shared__ float red[8];
+  const int q = blockIdx.x;
+  const int start = req_spans[2 * q], len = req_spans[2 * q + 1];
+  if (len <= 0) return;
+  float* st = states + int64_t(req_ids[start]) * kState;
+  for (int t = start; t < start + len; ++t) {
+    const int64_t p = pos[t];
+    uint16_t* lat = latent_out + int64_t(t) * D;
+    if (p < 0) {
+      for (int c = threadIdx.x; c < D; c += blockDim.x) lat[c] = 0;
+      if (threadIdx.x == 0 && entries_out != nullptr) entries_out[t] = -1;
+      continue;
+    }
+    const int c = int(p & 3);
+    for (int i = threadIdx.x; i < kRows; i += blockDim.x) {
+      st[size_t(4 + c) * kRows + i] = kv[int64_t(t) * kRows + i];
+      st[8 * kRows + size_t(4 + c) * kRows + i] =
+          score[int64_t(t) * kRows + i] + ape[size_t(c) * kRows + i];
+    }
+    if (c == 3) {
+      __syncthreads();  // this row's stash (an earlier row of the block) is complete
+      constexpr int kPer = (D > kCsa2Threads) ? 2 : 1;  // 2 (512) or 1 (128)
+      float pooled[kPer];
+      float ss = 0.0f;
+#pragma unroll
+      for (int j = 0; j < kPer; ++j) {
+        const int cc = threadIdx.x + j * blockDim.x;
+        float s8[8], k8[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          const int off = (i < 4) ? cc : cc + D;
+          k8[i] = st[size_t(i) * kRows + off];
+          s8[i] = st[8 * kRows + size_t(i) * kRows + off];
+        }
+        const float v = pool8_channel(k8, s8);
+        pooled[j] = v;
+        ss = __fmaf_rn(v, v, ss);
+      }
+      const float total = block_sum_256(ss, red);
+      const float rs = rsqrtf(__fadd_rn(__fdiv_rn(total, float(D)), eps));
+#pragma unroll
+      for (int j = 0; j < kPer; ++j) {
+        const int cc = threadIdx.x + j * blockDim.x;
+        lat[cc] = float_to_bf16_bits(__fmul_rn(bf16_bits_to_float(norm_w[cc]), __fmul_rn(pooled[j], rs)));
+      }
+      if (threadIdx.x == 0 && entries_out != nullptr) entries_out[t] = p / 4;
+      for (int i = threadIdx.x; i < 4 * kRows; i += blockDim.x) {
+        st[i] = st[4 * kRows + i];
+        st[8 * kRows + i] = st[8 * kRows + 4 * kRows + i];
+      }
+    } else {
+      for (int c2 = threadIdx.x; c2 < D; c2 += blockDim.x) lat[c2] = 0;
+      if (threadIdx.x == 0 && entries_out != nullptr) entries_out[t] = -1;
+    }
+    if (snapshots != nullptr && t != start + len - 1) {
+      __syncthreads();
+      float* snap = snapshots + int64_t(t) * kState;
+      for (int i = threadIdx.x; i < kState; i += blockDim.x) snap[i] = st[i];
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void compress128_prefill_kernel(const float* kv, const float* score, int T, const float* ape,
+                                           const uint16_t* norm_w, float eps, uint16_t* latent_out,
+                                           float* tail) {
+  __shared__ float red[8];
+  const int w = blockIdx.x;
+  if (tail != nullptr && w == T / 128) {
+    // The boundary state: the remainder rows' kv and score + ape in the
+    // slots 0..T % 128 - 1, the rest zero (the decode overwrites every
+    // slot before it pools).
+    const int R = T % 128;
+    for (int i = threadIdx.x; i < 256 * 512; i += kCsa2Threads) tail[i] = 0.0f;
+    for (int i = threadIdx.x; i < R * 512; i += kCsa2Threads) {
+      const int row = i / 512, c = i % 512;
+      tail[size_t(row) * 512 + c] = kv[int64_t((T / 128) * 128 + row) * 512 + c];
+      tail[128 * 512 + size_t(row) * 512 + c] = score[int64_t((T / 128) * 128 + row) * 512 + c] +
+                                                 ape[size_t(row) * 512 + c];
+    }
+    return;
+  }
+  constexpr int kPer = 2;
+  float pooled[kPer];
+  float ss = 0.0f;
+#pragma unroll
+  for (int j = 0; j < kPer; ++j) {
+    const int c = threadIdx.x + j * kCsa2Threads;
+    float m = -INFINITY;
+    for (int i = 0; i < 128; ++i)
+      m = fmaxf(m, score[int64_t(w * 128 + i) * 512 + c] + ape[int64_t(i) * 512 + c]);
+    float den = 0.0f;
+    for (int i = 0; i < 128; ++i)
+      den = __fadd_rn(den, expf(score[int64_t(w * 128 + i) * 512 + c] + ape[int64_t(i) * 512 + c] - m));
+    float sum = 0.0f;
+    for (int i = 0; i < 128; ++i) {
+      const float v = score[int64_t(w * 128 + i) * 512 + c] + ape[int64_t(i) * 512 + c];
+      sum = __fmaf_rn(expf(v - m) / den, kv[int64_t(w * 128 + i) * 512 + c], sum);
+    }
+    const float b = bf16_bits_to_float(float_to_bf16_bits(sum));
+    pooled[j] = b;
+    ss = __fmaf_rn(b, b, ss);
+  }
+  const float total = block_sum_256(ss, red);
+  const float rs = rsqrtf(__fadd_rn(__fdiv_rn(total, float(kCsa2Latent)), eps));
+#pragma unroll
+  for (int j = 0; j < kPer; ++j) {
+    const int c = threadIdx.x + j * kCsa2Threads;
+    latent_out[int64_t(w) * 512 + c] =
+        float_to_bf16_bits(__fmul_rn(bf16_bits_to_float(norm_w[c]), __fmul_rn(pooled[j], rs)));
+  }
+}
+
+__global__ void compress128_decode_kernel(const float* kv, const float* score, const int32_t* req_ids,
+                                          const int64_t* pos, const int32_t* req_spans, const float* ape,
+                                          const uint16_t* norm_w, float eps, float* states,
+                                          uint16_t* latent_out, int64_t* entries_out, float* snapshots) {
+  constexpr int kState = 256 * 512;
+  __shared__ float red[8];
+  const int q = blockIdx.x;
+  const int start = req_spans[2 * q], len = req_spans[2 * q + 1];
+  if (len <= 0) return;
+  float* st = states + int64_t(req_ids[start]) * kState;
+  for (int t = start; t < start + len; ++t) {
+    const int64_t p = pos[t];
+    uint16_t* lat = latent_out + int64_t(t) * 512;
+    if (p < 0) {
+      for (int c = threadIdx.x; c < 512; c += kCsa2Threads) lat[c] = 0;
+      if (threadIdx.x == 0) entries_out[t] = -1;
+      continue;
+    }
+    const int c = int(p & 127);
+    for (int i = threadIdx.x; i < 512; i += kCsa2Threads) {
+      st[size_t(c) * 512 + i] = kv[int64_t(t) * 512 + i];
+      st[128 * 512 + size_t(c) * 512 + i] =
+          score[int64_t(t) * 512 + i] + ape[size_t(c) * 512 + i];
+    }
+    if (c == 127) {
+      __syncthreads();
+      constexpr int kPer = 2;
+      float pooled[kPer];
+      float ss = 0.0f;
+#pragma unroll
+      for (int j = 0; j < kPer; ++j) {
+        const int cc = threadIdx.x + j * kCsa2Threads;
+        float m = -INFINITY;
+        for (int i = 0; i < 128; ++i) m = fmaxf(m, st[128 * 512 + size_t(i) * 512 + cc]);
+        float den = 0.0f;
+        for (int i = 0; i < 128; ++i)
+          den = __fadd_rn(den, expf(st[128 * 512 + size_t(i) * 512 + cc] - m));
+        float sum = 0.0f;
+        for (int i = 0; i < 128; ++i) {
+          const float v = st[128 * 512 + size_t(i) * 512 + cc];
+          sum = __fmaf_rn(expf(v - m) / den, st[size_t(i) * 512 + cc], sum);
+        }
+        const float b = bf16_bits_to_float(float_to_bf16_bits(sum));
+        pooled[j] = b;
+        ss = __fmaf_rn(b, b, ss);
+      }
+      const float total = block_sum_256(ss, red);
+      const float rs = rsqrtf(__fadd_rn(__fdiv_rn(total, float(kCsa2Latent)), eps));
+#pragma unroll
+      for (int j = 0; j < kPer; ++j) {
+        const int cc = threadIdx.x + j * kCsa2Threads;
+        lat[cc] = float_to_bf16_bits(__fmul_rn(bf16_bits_to_float(norm_w[cc]), __fmul_rn(pooled[j], rs)));
+      }
+      if (threadIdx.x == 0) entries_out[t] = p / 128;
+    } else {
+      for (int c2 = threadIdx.x; c2 < 512; c2 += kCsa2Threads) lat[c2] = 0;
+      if (threadIdx.x == 0) entries_out[t] = -1;
+    }
+    if (snapshots != nullptr && t != start + len - 1) {
+      __syncthreads();
+      float* snap = snapshots + int64_t(t) * kState;
+      for (int i = threadIdx.x; i < kState; i += kCsa2Threads) snap[i] = st[i];
+    }
+    __syncthreads();
+  }
+}
+
 // ---- the selections -----------------------------------------------------------------------
 // One entry's logit, warp-cooperative (lane l = heads l and l + 32): the fp8
 // dot in fp32 with contraction-proof arithmetic, relu, the folded weight, the
@@ -363,6 +752,39 @@ __device__ __forceinline__ float entry_logit(const uint2* q8, const uint32_t* kr
   for (int u = 0; u < PerLane; ++u) {
     const int h = lane + 32 * u;
     contrib = __fadd_rn(contrib, __fmul_rn(__fmul_rn(w[h], ks), fmaxf(partial[u], 0.0f)));
+  }
+  return warp_sum(contrib);
+}
+// The 0731 bf16 logit (the dequantized dot): lane l = heads l and l + 32,
+// the 128-dim dot in fp32 (fma chain), relu, the folded weight, the warp sum.
+// qb: smem [16 chunks][64 heads] uint4 (8 bf16 each, chunk-major); krow:
+// smem [32] uint2 (the entry's 128 bf16, lane l loads word l).
+template <int PerLane>
+__device__ __forceinline__ float entry_logit_bf16(const uint4* qb, const uint2* krow, const float* w) {
+  const int lane = threadIdx.x & 31;
+  float partial[PerLane] = {0.0f};
+#pragma unroll 8
+  for (int p = 0; p < 16; ++p) {
+    const uint2 k0 = krow[p * 2], k1 = krow[p * 2 + 1];
+    const uint16_t* kk = reinterpret_cast<const uint16_t*>(&k0);
+    const uint16_t* kk1 = reinterpret_cast<const uint16_t*>(&k1);
+#pragma unroll
+    for (int u = 0; u < PerLane; ++u) {
+      const int h = lane + 32 * u;
+      const uint4 qv = qb[p * 64 + h];
+      const uint16_t* qq = reinterpret_cast<const uint16_t*>(&qv);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        partial[u] = __fmaf_rn(bf16_bits_to_float(qq[j]), bf16_bits_to_float(kk[j]), partial[u]);
+        partial[u] = __fmaf_rn(bf16_bits_to_float(qq[j + 4]), bf16_bits_to_float(kk1[j]), partial[u]);
+      }
+    }
+  }
+  float contrib = 0.0f;
+#pragma unroll
+  for (int u = 0; u < PerLane; ++u) {
+    const int h = lane + 32 * u;
+    contrib = __fadd_rn(contrib, __fmul_rn(w[h], fmaxf(partial[u], 0.0f)));
   }
   return warp_sum(contrib);
 }
@@ -612,6 +1034,64 @@ __global__ void csa_decode_scores_kernel(
   }
 }
 
+// The 0731 bf16 decode scores (the dequantized dot, no scales, no
+// candidates): the fp8 kernel's stripe/warp structure with the bf16 logit.
+template <int PerLane>
+__global__ void csa_decode_scores_bf16_kernel(
+    const uint16_t* q_bf16, const float* w_folded, const int32_t* req_ids, const int64_t* pos_sel,
+    const int32_t* block_tables, int blocks_per_request, const uint16_t* index_k,
+    int entries_per_block, int select_k, uint64_t* keys, int64_t keys_stride) {
+  __shared__ uint4 qb[16 * 64];
+  __shared__ float w[64];
+  __shared__ uint2 krows[8 * 32];
+  const int r = blockIdx.y;
+  const int64_t p = pos_sel[r];
+  if (p < 0) return;
+  const int64_t visible = p + 1;
+  const int64_t n = visible;
+  if (n <= select_k) return;  // all kept; the selector writes the ids directly
+  const int32_t* table = block_tables + int64_t(req_ids[r]) * blocks_per_request;
+  {
+    constexpr int heads = 32 * PerLane;
+    const uint4* src = reinterpret_cast<const uint4*>(q_bf16 + int64_t(r) * heads * kCsa2IndexDim);
+    for (int i = threadIdx.x; i < heads * 16; i += blockDim.x) {
+      const int h = i / 16, c = i % 16;
+      qb[c * 64 + h] = src[h * 16 + c];
+    }
+    if (threadIdx.x < heads) w[threadIdx.x] = w_folded[int64_t(r) * heads + threadIdx.x];
+  }
+  __syncthreads();
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  uint2* staged = krows + warp * 32;
+  const int64_t stripe = (n + gridDim.x - 1) / gridDim.x;
+  const int64_t lo = min(n, int64_t(blockIdx.x) * stripe), hi = min(n, lo + stripe);
+  const int64_t sub = (hi - lo + 7) / 8;
+  const int64_t wlo = min(hi, lo + warp * sub), whi = min(hi, wlo + sub);
+  for (int64_t i = wlo; i < whi; i += 4) {
+    int64_t ids[4], slots[4];
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      ids[u] = i + u < whi ? i + u : -1;
+      slots[u] = ids[u] >= 0 ? entry_slot(table, entries_per_block, ids[u]) : -1;
+    }
+#pragma unroll
+    for (int u = 0; u < 4; ++u)
+      if (slots[u] >= 0) {
+        const uint2* kr = reinterpret_cast<const uint2*>(index_k + slots[u] * kCsa2IndexDim);
+        staged[u * 32 + lane] = kr[lane];
+      }
+    __syncwarp();
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      if (i + u >= whi) break;
+      const uint64_t key =
+          slots[u] >= 0 ? make_key(entry_logit_bf16<PerLane>(qb, staged + u * 32, w), ids[u]) : kCsa2KeyMax;
+      if (lane == 0) keys[int64_t(r) * keys_stride + i + u] = key;
+    }
+    __syncwarp();
+  }
+}
+
 template <bool Candidates>
 __global__ void csa_decode_select_kernel(const uint64_t* keys, int64_t keys_stride,
                                          const int64_t* pos_sel, const int32_t* cand,
@@ -670,7 +1150,7 @@ __global__ void logits_prefill_kernel(const float* dot, int64_t dot_stride, cons
   float total = -INFINITY;
   if (j < visible) {
     total = 0.0f;
-    const float ks = k_scale[j];
+    const float ks = k_scale != nullptr ? k_scale[j] : 1.0f;
     for (int h = 0; h < heads; ++h) {
       const float dv = fmaxf(dot[(int64_t(r) * heads + h) * dot_stride + j], 0.0f);
       total = __fadd_rn(total, __fmul_rn(__fmul_rn(w_folded[int64_t(r) * heads + h], ks), dv));
@@ -962,10 +1442,11 @@ void csa2_index_k_append(const void* k, const int32_t* req_ids, const int64_t* e
       static_cast<uint8_t*>(index_k), index_scale, violations);
   DGPP_CUDA_OK(cudaGetLastError());
 }
-void csa2_fold_weights(const void* w_bf16, const float* q_scale, float* out, int64_t n, cudaStream_t stream) {
+void csa2_fold_weights(const void* w_bf16, const float* q_scale, float fold, float* out, int64_t n,
+                       cudaStream_t stream) {
   if (n <= 0) return;
   fold_weights_kernel<<<unsigned((n + 255) / 256), 256, 0, stream>>>(static_cast<const uint16_t*>(w_bf16),
-                                                                     q_scale, out, n);
+                                                                     q_scale, fold, out, n);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
@@ -986,6 +1467,126 @@ void csa2_compress_decode_update(const float* kv, const float* score, const int3
   compress_decode_update_kernel<<<unsigned(num_requests), kCsa2Threads, 0, stream>>>(
       kv, score, req_ids, pos, req_spans, static_cast<const uint16_t*>(norm_w), eps, tails,
       static_cast<uint16_t*>(latent_out), entries_out, tail_snapshots);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+void csa2_actquant8_dequant_bf16(const uint16_t* x, uint16_t* y, int rows, cudaStream_t stream) {
+  actquant8_dequant_kernel<<<unsigned((rows + 255) / 256), 256, 0, stream>>>(x, y, rows);
+}
+void csa2_hadamard128_bf16(const uint16_t* x, uint16_t* y, int rows, cudaStream_t stream) {
+  hadamard128_kernel<<<unsigned((rows + 255) / 256), 256, 0, stream>>>(x, y, rows);
+}
+void csa2_fp4_dequant_bf16(const uint16_t* x, uint16_t* y, int rows, cudaStream_t stream) {
+  fp4_dequant_kernel<<<unsigned((rows + 255) / 256), 256, 0, stream>>>(x, y, rows);
+}
+
+void csa2_fill_inf(float* p, int n, cudaStream_t stream) {
+  if (n <= 0) return;
+  fill_inf_kernel<<<unsigned((n + 255) / 256), 256, 0, stream>>>(p, n);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+void csa2_index_k_append_bf16(const void* k, const int32_t* req_ids, const int64_t* entries, int n,
+                              const int32_t* block_tables, int blocks_per_request, int entries_per_block,
+                              void* index_k, cudaStream_t stream) {
+  if (n <= 0) return;
+  if (entries_per_block <= 0) throw std::invalid_argument("csa2_index_k_append_bf16: entries_per_block");
+  index_k_append_bf16_kernel<<<unsigned(n), 32, 0, stream>>>(static_cast<const uint16_t*>(k), req_ids,
+                                                             entries, block_tables, blocks_per_request,
+                                                             entries_per_block,
+                                                             static_cast<uint16_t*>(index_k));
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+void csa2_q_renorm_bf16(uint16_t* q, int rows, int heads, float eps, cudaStream_t stream) {
+  if (rows <= 0 || heads <= 0) return;
+  q_renorm_kernel<<<dim3(unsigned(rows), unsigned(heads)), kCsa2Threads, 0, stream>>>(q, heads, eps);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+__global__ void gather_index_bf16_kernel(const int32_t* block_table, int entries_per_block,
+                                         const uint16_t* index_k, int n, uint16_t* out) {
+  const int e = blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= n) return;
+  const int32_t blk = block_table[e / entries_per_block];
+  const uint16_t* src = index_k + (int64_t(blk) * entries_per_block + e % entries_per_block) * kCsa2IndexDim;
+  uint16_t* dst = out + int64_t(e) * kCsa2IndexDim;
+  const uint4* s4 = reinterpret_cast<const uint4*>(src);
+  uint4* d4 = reinterpret_cast<uint4*>(dst);
+#pragma unroll
+  for (int i = 0; i < kCsa2IndexDim / 8; ++i) d4[i] = s4[i];
+}
+void csa2_gather_index_bf16(const int32_t* block_table, int entries_per_block, const void* index_k, int n,
+                            void* out, cudaStream_t stream) {
+  if (n <= 0) return;
+  if (entries_per_block <= 0) throw std::invalid_argument("csa2_gather_index_bf16: entries_per_block");
+  gather_index_bf16_kernel<<<unsigned((n + 255) / 256), 256, 0, stream>>>(
+      block_table, entries_per_block, static_cast<const uint16_t*>(index_k), n,
+      static_cast<uint16_t*>(out));
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+void csa2_compress4_prefill(const float* kv, const float* score, int T, int D, const float* ape,
+                            const void* norm_w, float eps, void* latent_out, float* tail,
+                            cudaStream_t stream) {
+  if (T <= 0) return;
+  if (D != kCsa2Latent && D != kCsa2IndexDim)
+    throw std::invalid_argument("csa2_compress4_prefill: the width must be 512 or 128");
+  const int blocks = std::max(1, T / 4);
+  const int threads = (D == kCsa2Latent) ? kCsa2Threads : D;
+  if (D == kCsa2Latent)
+    compress4_prefill_kernel<512><<<unsigned(blocks), threads, 0, stream>>>(
+        kv, score, T, ape, static_cast<const uint16_t*>(norm_w), eps, static_cast<uint16_t*>(latent_out),
+        tail, blocks);
+  else
+    compress4_prefill_kernel<128><<<unsigned(blocks), threads, 0, stream>>>(
+        kv, score, T, ape, static_cast<const uint16_t*>(norm_w), eps, static_cast<uint16_t*>(latent_out),
+        tail, blocks);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+void csa2_compress4_decode(const float* kv, const float* score, const int32_t* req_ids,
+                           const int64_t* pos, const int32_t* req_spans, int num_requests, int D,
+                           const float* ape, const void* norm_w, float eps, float* states,
+                           void* latent_out, int64_t* entries_out, int tokens, float* snapshots,
+                           cudaStream_t stream) {
+  if (num_requests <= 0 || tokens <= 0) return;
+  const int threads = (D == kCsa2Latent) ? kCsa2Threads : D;
+  if (D == kCsa2Latent)
+    compress4_decode_kernel<512><<<unsigned(num_requests), threads, 0, stream>>>(
+        kv, score, req_ids, pos, req_spans, ape, static_cast<const uint16_t*>(norm_w), eps, states,
+        static_cast<uint16_t*>(latent_out), entries_out, snapshots);
+  else if (D == kCsa2IndexDim)
+    compress4_decode_kernel<128><<<unsigned(num_requests), threads, 0, stream>>>(
+        kv, score, req_ids, pos, req_spans, ape, static_cast<const uint16_t*>(norm_w), eps, states,
+        static_cast<uint16_t*>(latent_out), entries_out, snapshots);
+  else throw std::invalid_argument("csa2_compress4_decode: the width must be 512 or 128");
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+__global__ void sequential_topk_kernel(const int64_t* pos_sel, int32_t* topk, int32_t* counts, int col) {
+  const int r = blockIdx.x;
+  const int64_t n = std::min<int64_t>(pos_sel[r] + 1, col);  // entries 0..pos_sel: the count is pos_sel + 1
+  if (threadIdx.x == 0) counts[r] = int(n);
+  for (int k = threadIdx.x; k < col; k += blockDim.x) topk[int64_t(r) * col + k] = (k < n) ? k : -1;
+}
+void csa2_sequential_topk(const int64_t* pos_sel, int32_t* topk, int32_t* counts, int rows, int col, cudaStream_t stream) {
+  sequential_topk_kernel<<<unsigned(rows), 128, 0, stream>>>(pos_sel, topk, counts, col);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+void csa2_compress128_prefill(const float* kv, const float* score, int T, const float* ape,
+                              const void* norm_w, float eps, void* latent_out, float* tail, cudaStream_t stream) {
+  if (T <= 0) return;
+  const unsigned grid = static_cast<unsigned>(T / 128) + (tail != nullptr ? 1u : 0u);
+  compress128_prefill_kernel<<<grid, kCsa2Threads, 0, stream>>>(
+      kv, score, T, ape, static_cast<const uint16_t*>(norm_w), eps, static_cast<uint16_t*>(latent_out), tail);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+void csa2_compress128_decode(const float* kv, const float* score, const int32_t* req_ids,
+                             const int64_t* pos, const int32_t* req_spans, int num_requests,
+                             const float* ape, const void* norm_w, float eps, float* states,
+                             void* latent_out, int64_t* entries_out, int tokens, float* snapshots,
+                             cudaStream_t stream) {
+  if (num_requests <= 0 || tokens <= 0) return;
+  compress128_decode_kernel<<<unsigned(num_requests), kCsa2Threads, 0, stream>>>(
+      kv, score, req_ids, pos, req_spans, ape, static_cast<const uint16_t*>(norm_w), eps, states,
+      static_cast<uint16_t*>(latent_out), entries_out, snapshots);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
@@ -1050,6 +1651,35 @@ void csa2_select_candidates_decode(const void* q_fp8, const float* w_folded, con
       <<<unsigned(rows), kCsa2Threads, decode_select_smem(topk_blocks), stream>>>(
           keys_ws, max_entries, pos_sel, nullptr, 0, nullptr, block_size, topk_blocks, cand_out,
           cand_counts);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+void csa2_select_bf16_decode(const void* q_bf16, const float* w_folded, const int32_t* req_ids,
+                             const int64_t* pos_sel, int rows, const int32_t* block_tables,
+                             int blocks_per_request, const void* index_k, int entries_per_block,
+                             int heads, int select_k, uint64_t* keys_ws, int64_t max_entries,
+                             int32_t* topk_out, int32_t* counts, cudaStream_t stream) {
+  if (rows <= 0) return;
+  check_select_common(heads, select_k, "csa2_select_bf16_decode");
+  if (entries_per_block <= 0 || blocks_per_request <= 0 || keys_ws == nullptr)
+    throw std::invalid_argument("csa2_select_bf16_decode: shape or workspace");
+  (void)csa2_select_workspace_bytes(rows, max_entries);
+  const int stripes = std::max(1, 96 / rows);
+  const auto dim = dim3(unsigned(stripes), unsigned(rows));
+  const auto launch = [&](auto per_lane_tag) {
+    constexpr int pl = decltype(per_lane_tag)::value;
+    csa_decode_scores_bf16_kernel<pl><<<dim, kCsa2Threads, 0, stream>>>(
+        static_cast<const uint16_t*>(q_bf16), w_folded, req_ids, pos_sel, block_tables, blocks_per_request,
+        static_cast<const uint16_t*>(index_k), entries_per_block, select_k, keys_ws, max_entries);
+    DGPP_CUDA_OK(cudaGetLastError());
+  };
+  if (heads / 32 == 1)
+    launch(std::integral_constant<int, 1>{});
+  else
+    launch(std::integral_constant<int, 2>{});
+  csa_decode_select_kernel<false>
+      <<<unsigned(rows), kCsa2Threads, decode_select_smem(select_k), stream>>>(
+          keys_ws, max_entries, pos_sel, nullptr, 0, nullptr, 0, select_k, topk_out, counts);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

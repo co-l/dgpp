@@ -147,10 +147,11 @@ void csa2_index_k_append(const void* k, const int32_t* req_ids, const int64_t* e
                          int n, const int32_t* block_tables, int blocks_per_request,
                          int entries_per_block, void* index_k, float* index_scale,
                          unsigned* violations, cudaStream_t stream);
-// w_folded[i] = (fp32(bf16 w[i]) * (1/64)) * q_scale[i]: the reference's
-// weights_proj output (bf16) times 128^-0.5 * 32^-0.5 (2^-6, exact) with
-// the q scale folded in for the fp8 dot.
-void csa2_fold_weights(const void* w_bf16, const float* q_scale, float* out, int64_t n,
+// w_folded[i] = (fp32(bf16 w[i]) * fold) * q_scale[i]: the reference's
+// weights_proj output (bf16) times the softmax scale (v4.1: 128^-0.5 *
+// 32^-0.5 = 2^-6; 0731: 128^-0.5 * 64^-0.5 = 8192^-0.5) with the q scale
+// folded in (the bf16 path passes a nullptr scale).
+void csa2_fold_weights(const void* w_bf16, const float* q_scale, float fold, float* out, int64_t n,
                        cudaStream_t stream);
 
 // ---- the compressor at ratio 2 --------------------------------------------------------
@@ -177,6 +178,107 @@ void csa2_compress_decode_update(const float* kv, const float* score, const int3
                                  int num_requests, const void* norm_w, float eps,
                                  float* tails, void* latent_out, int64_t* entries_out,
                                  int tokens, float* tail_snapshots, cudaStream_t stream);
+
+// ---- the 0731 activation roundings (the release's in-place quantizers) ------
+// The 0731 reference applies its activation quantizers IN PLACE: the caches
+// store the dequantized bf16 values (inference/kernel.py act_quant with
+// scale_fmt None / fp4_act_quant, the indexer's Hadamard rotation). One
+// thread per row; y may alias x.
+// fp8 over the non-rope 448 (seven blocks of 64): s = fp32(max(absmax,
+// 1e-4) * (1 / 448)) (no power-of-two rounding), code = e4m3(x / s),
+// y = bf16(dequant(code) * s); the last 64 (the rope tail) pass through.
+void csa2_actquant8_dequant_bf16(const uint16_t* x, uint16_t* y, int rows, cudaStream_t stream);
+// The Hadamard rotation of the release's rotate_activation (the indexer's
+// 128 dims): y = bf16(H128(x) * (1 / sqrt(128))).
+void csa2_hadamard128_bf16(const uint16_t* x, uint16_t* y, int rows, cudaStream_t stream);
+// fp4 over the full 128 (four blocks of 32): s = 2^ceil(log2(max(absmax,
+// 6 * 2^-126) / 6)) (e8m0), code = e2m1(x / s), y = bf16(dequant(code) * s).
+void csa2_fp4_dequant_bf16(const uint16_t* x, uint16_t* y, int rows, cudaStream_t stream);
+// The 0731 per-head q renormalization (before the rotation): the reference's
+// q *= rsqrt(mean(q^2) + eps) per head — the mean in fp32 (bf16 result),
+// the + eps and the rsqrt in bf16, the element product one bf16 rounding.
+// q: bf16 [rows, heads, 512].
+void csa2_q_renorm_bf16(uint16_t* q, int rows, int heads, float eps, cudaStream_t stream);
+
+// p[0..n) = -inf (fp32): the compressor states' score-half init.
+void csa2_fill_inf(float* p, int n, cudaStream_t stream);
+
+// The 0731 selection runs on the dequantized bf16 values (no fp8 codes, no
+// scales). The visible entries' 128-dim bf16 rows gathered contiguous
+// (block table, `entries_per_block` per block).
+void csa2_gather_index_bf16(const int32_t* block_table, int entries_per_block, const void* index_k, int n,
+                            void* out, cudaStream_t stream);
+// The 0731 index rows into the cache slots (the bf16 planar form, 128 bf16
+// per row; entries -1 skipped).
+void csa2_index_k_append_bf16(const void* k, const int32_t* req_ids, const int64_t* entries, int n,
+                              const int32_t* block_tables, int blocks_per_request, int entries_per_block,
+                              void* index_k, cudaStream_t stream);
+// Decode: the dequantized-dot topk over every visible entry (no candidate
+// pool): q_bf16 [rows, heads, 128] (the dequantized, rotated tail included),
+// w_folded [rows, heads] (the weights with the softmax scale folded in),
+// index_k the bf16 index rows. The topk of entry ids (ascending) and counts.
+void csa2_select_bf16_decode(const void* q_bf16, const float* w_folded, const int32_t* req_ids,
+                             const int64_t* pos_sel, int rows, const int32_t* block_tables,
+                             int blocks_per_request, const void* index_k, int entries_per_block,
+                             int heads, int select_k, uint64_t* keys_ws, int64_t max_entries,
+                             int32_t* topk_out, int32_t* counts, cudaStream_t stream);
+// The C128A sequential selection (the reference's get_compress_topk_idxs):
+// topk_out[r][k] = k for k < min(pos_sel[r], col), counts_out[r] = that
+// count. The visible entries' prefix, no scoring.
+void csa2_sequential_topk(const int64_t* pos_sel, int32_t* topk_out, int32_t* counts_out, int rows, int col,
+                          cudaStream_t stream);
+
+// ---- the compressors at ratios 4 and 128 (the 0731 overlap windows) ----------
+// The 0731 reference's Compressor: per channel the fp32 softmax over the
+// window's items (max-subtracted, p_j = e_j / den), the fp32 weighted kv
+// sum, one bf16 rounding, then the one-rounding RMSNorm. The ratio-4 window
+// overlaps: it pools the previous window's first kv half against its own
+// second half (eight items of head_dim). The request state (fp32 per
+// request, `states`): the reference's kv_state then score_state — ratio 4,
+// 16 slots of 2*head_dim (the last four tokens' raw kv in slots 0..3, the
+// current window's kv and score + ape in 4..7, 0..3 taking 4..7 over after
+// a completed window); ratio 128, 256 slots of head_dim. The scores are
+// stored raw; the score half of a fresh state is the reference's -inf (an
+// unwritten slot's softmax weight is exactly zero), which the pool's reset
+// fills in (Csa2PoolShape::tail_inf).
+// Prefill: kv / score fp32 [T, 2D] (ratio 4) at chunk rows, ape fp32
+// [4, 2D] -> latent_out bf16 [T / 4, D] (the normed windows, not yet
+// rotated); the chunk's boundary state (the reference's kv_state /
+// score_state after the chunk) into `tail` (fp32 [16, 2D]) when non-null.
+// `D` is 512 (the main latent) or 128 (the indexer compressor's).
+void csa2_compress4_prefill(const float* kv, const float* score, int T, int D, const float* ape,
+                            const void* norm_w, float eps, void* latent_out, float* tail,
+                            cudaStream_t stream);
+// Decode: rows in request spans (start, len) in position order, the state
+// of request r at `states` + r * (16 * 2D). A row at position p stashes its
+// (kv, score + ape[p % 4]); p with (p + 1) % 4 == 0 pools the eight items
+// into latent_out[t], reports entries_out[t] = p / 4 and shifts the state
+// (a non-entry row zeroes its latent, entry -1). snapshots (optional,
+// speculative rows): fp32 [tokens, 16, 2D] — after every row that is not its
+// request's last, the state as it stands; rolling back to `a` accepted rows
+// = copying row start + a - 1 over the request's state. Padding rows (pos <
+// 0) touch nothing.
+void csa2_compress4_decode(const float* kv, const float* score, const int32_t* req_ids,
+                           const int64_t* pos, const int32_t* req_spans, int num_requests, int D,
+                           const float* ape, const void* norm_w, float eps, float* states,
+                           void* latent_out, int64_t* entries_out, int tokens, float* snapshots,
+                           cudaStream_t stream);
+// The ratio-128 compressor (the full window, no overlap): kv / score fp32
+// [T, 512], ape fp32 [128, 512] -> latent_out bf16 [T / 128, 512]; when
+// `tail` is non-null, the chunk's boundary state (256 slots: the remainder
+// rows' kv and score + ape in slots 0..T % 128 - 1, the rest zero) is
+// written to it (fp32 [256, 512]) for the decode continuation.
+void csa2_compress128_prefill(const float* kv, const float* score, int T, const float* ape,
+                              const void* norm_w, float eps, void* latent_out, float* tail,
+                              cudaStream_t stream);
+// Decode as the ratio-4 machine with 128 slots: the state of request r at
+// `states` + r * (256 * 512); p with (p + 1) % 128 == 0 pools, entry p / 128;
+// snapshots fp32 [tokens, 256, 512].
+void csa2_compress128_decode(const float* kv, const float* score, const int32_t* req_ids,
+                             const int64_t* pos, const int32_t* req_spans, int num_requests,
+                             const float* ape, const void* norm_w, float eps, float* states,
+                             void* latent_out, int64_t* entries_out, int tokens, float* snapshots,
+                             cudaStream_t stream);
 
 // ---- the candidate and restricted selections --------------------------------------
 // The candidate pool of a row (the reference's select_candidate_blocks):
