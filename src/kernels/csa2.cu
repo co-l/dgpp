@@ -329,45 +329,55 @@ __global__ void compress_decode_update_kernel(const float* kv, const float* scor
 }
 
 // ---- the selections -----------------------------------------------------------------------
-// One entry's logit, warp-cooperative (lane = head): the fp8 dot in fp32
-// with contraction-proof arithmetic, relu, the folded weight, the entry's
-// scale, the warp sum — dsa_select_decode's DecodeKeyFn arithmetic. q8:
-// smem [16 chunks][32 heads] uint2 (8 e4m3 each); krow: smem [32] u32
-// (the entry's 128 codes, lane l loads word l).
+// One entry's logit, warp-cooperative (lane l = heads l and l + 32): the fp8
+// dot in fp32 with contraction-proof arithmetic, relu, the folded weight, the
+// entry's scale, the warp sum — dsa_select_decode's DecodeKeyFn arithmetic.
+// q8: smem [16 chunks][32*PerLane heads] uint2 (8 e4m3 each); krow: smem
+// [32] u32 (the entry's 128 codes, lane l loads word l).
+template <int PerLane>
 __device__ __forceinline__ float entry_logit(const uint2* q8, const uint32_t* krow, const float* w,
                                              float ks) {
   const int lane = threadIdx.x & 31;
   const uint2* k2 = reinterpret_cast<const uint2*>(krow);
-  float partial = 0.0f;
+  float partial[PerLane] = {0.0f};
 #pragma unroll 8
   for (int p = 0; p < 16; ++p) {
-    const uint2 qv = q8[p * 32 + lane];
     const uint2 kv = k2[p];
-    const uint16_t* qq = reinterpret_cast<const uint16_t*>(&qv);
-    const uint16_t* kk = reinterpret_cast<const uint16_t*>(&kv);
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const float2 a = e4m3x2_to_float2(qq[j]);
-      const float2 b = e4m3x2_to_float2(kk[j]);
-      partial = __fadd_rn(partial, __fmul_rn(a.x, b.x));
-      partial = __fadd_rn(partial, __fmul_rn(a.y, b.y));
+    for (int u = 0; u < PerLane; ++u) {
+      const int h = lane + 32 * u;
+      const uint2 qv = q8[p * 32 * PerLane + h];
+      const uint16_t* qq = reinterpret_cast<const uint16_t*>(&qv);
+      const uint16_t* kk = reinterpret_cast<const uint16_t*>(&kv);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float2 a = e4m3x2_to_float2(qq[j]);
+        const float2 b = e4m3x2_to_float2(kk[j]);
+        partial[u] = __fadd_rn(partial[u], __fmul_rn(a.x, b.x));
+        partial[u] = __fadd_rn(partial[u], __fmul_rn(a.y, b.y));
+      }
     }
   }
-  partial = fmaxf(partial, 0.0f);
-  const float contrib = __fmul_rn(__fmul_rn(w[lane], ks), partial);
+  float contrib = 0.0f;
+#pragma unroll
+  for (int u = 0; u < PerLane; ++u) {
+    const int h = lane + 32 * u;
+    contrib = __fadd_rn(contrib, __fmul_rn(__fmul_rn(w[h], ks), fmaxf(partial[u], 0.0f)));
+  }
   return warp_sum(contrib);
 }
-// Stages a row's q (32 heads x 128 e4m3) chunk-major into smem and its
+// Stages a row's q (Heads heads x 128 e4m3) chunk-major into smem and its
 // folded weights.
+template <int Heads>
 __device__ __forceinline__ void stage_query(const uint8_t* q_fp8_row, const float* w_row,
                                             uint2* q8, float* w) {
-  // q_fp8_row: [32 heads][128] bytes = [32][16 chunks] uint2.
+  // q_fp8_row: [Heads heads][128] bytes = [Heads][16 chunks] uint2.
   const uint2* src = reinterpret_cast<const uint2*>(q_fp8_row);
-  for (int i = threadIdx.x; i < 32 * 16; i += blockDim.x) {
+  for (int i = threadIdx.x; i < Heads * 16; i += blockDim.x) {
     const int h = i / 16, c = i % 16;
-    q8[c * 32 + h] = src[h * 16 + c];
+    q8[c * Heads + h] = src[h * 16 + c];
   }
-  if (threadIdx.x < 32) w[threadIdx.x] = w_row[threadIdx.x];
+  if (threadIdx.x < Heads) w[threadIdx.x] = w_row[threadIdx.x];
 }
 __device__ __forceinline__ int64_t entry_slot(const int32_t* table, int entries_per_block, int64_t e) {
   const int32_t blk = table[e / entries_per_block];
@@ -503,14 +513,14 @@ __device__ inline void csa_select_radix(const uint64_t* keys, int64_t visible, i
 // Independent scoring stripes fill the existing decode key workspace.
 // Four index rows are fetched before their dots, preserving entry_logit's
 // per-head arithmetic while hiding the dependent table/key/scale loads.
-template <bool Candidates>
+template <bool Candidates, int PerLane>
 __global__ void csa_decode_scores_kernel(
     const uint8_t* q_fp8, const float* w_folded, const int32_t* req_ids, const int64_t* pos_sel,
     const int32_t* block_tables, int blocks_per_request, const uint8_t* index_k,
     const float* index_scale, int entries_per_block, const int32_t* cand, int cand_stride,
     const int32_t* cand_counts, int block_size, int select_k, uint64_t* keys, int64_t keys_stride) {
-  __shared__ uint2 q8[16 * 32];
-  __shared__ float w[32];
+  __shared__ uint2 q8[16 * 64];
+  __shared__ float w[64];
   __shared__ uint32_t krows[8 * 4 * 32];
   const int r = blockIdx.y;
   const int64_t p = pos_sel[r];
@@ -523,7 +533,8 @@ __global__ void csa_decode_scores_kernel(
   if (n <= select_k) return;
   const int32_t* table = block_tables + int64_t(req_ids[r]) * blocks_per_request;
   const int32_t* list = cand ? cand + int64_t(r) * cand_stride : nullptr;
-  stage_query(q_fp8 + int64_t(r) * 32 * kCsa2IndexDim, w_folded + int64_t(r) * 32, q8, w);
+  stage_query<32 * PerLane>(q_fp8 + int64_t(r) * 32 * PerLane * kCsa2IndexDim,
+                            w_folded + int64_t(r) * 32 * PerLane, q8, w);
   __syncthreads();
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   uint32_t* staged = krows + warp * 4 * 32;
@@ -560,7 +571,7 @@ __global__ void csa_decode_scores_kernel(
           __syncwarp();
 #pragma unroll
           for (int u = 0; u < 4; ++u)
-            if (slots[u] >= 0) best = fmaxf(best, entry_logit(q8, staged + u * 32, w, scales[u]));
+            if (slots[u] >= 0) best = fmaxf(best, entry_logit<PerLane>(q8, staged + u * 32, w, scales[u]));
           __syncwarp();
         }
       }
@@ -592,7 +603,7 @@ __global__ void csa_decode_scores_kernel(
       for (int u = 0; u < 4; ++u) {
         if (i + u >= whi) break;
         const uint64_t key = slots[u] >= 0
-                                 ? make_key(entry_logit(q8, staged + u * 32, w, scales[u]), ids[u])
+                                 ? make_key(entry_logit<PerLane>(q8, staged + u * 32, w, scales[u]), ids[u])
                                  : kCsa2KeyMax;
         if (lane == 0) keys[int64_t(r) * keys_stride + i + u] = key;
       }
@@ -980,9 +991,33 @@ void csa2_compress_decode_update(const float* kv, const float* score, const int3
 
 namespace {
 void check_select_common(int heads, int select_k, const char* who) {
-  if (heads != 32) throw std::invalid_argument(std::string(who) + ": the selection kernels pin 32 index heads");
+  if (heads != 32 && heads != 64)
+    throw std::invalid_argument(std::string(who) + ": the selection kernels take 32 or 64 index heads");
   if (select_k <= 0 || (select_k & (select_k - 1)) != 0 || select_k > kSelectMaxK)
     throw std::invalid_argument(std::string(who) + ": select_k must be a power of two <= 2048");
+}
+// The per-lane head count is the launch's compile-time axis; both widths
+// share the launch shape.
+template <bool Candidates>
+void launch_decode_scores(int per_lane, int rows, const uint8_t* q_fp8, const float* w_folded,
+                          const int32_t* req_ids, const int64_t* pos_sel, const int32_t* block_tables,
+                          int blocks_per_request, const uint8_t* index_k, const float* index_scale,
+                          int entries_per_block, const int32_t* cand, int cand_stride,
+                          const int32_t* cand_counts, int block_size, int select_k, uint64_t* keys,
+                          int64_t keys_ws, cudaStream_t stream) {
+  const int stripes = std::max(1, 96 / rows);
+  const auto dim = dim3(unsigned(stripes), unsigned(rows));
+  if (per_lane == 1) {
+    csa_decode_scores_kernel<Candidates, 1><<<dim, kCsa2Threads, 0, stream>>>(
+        q_fp8, w_folded, req_ids, pos_sel, block_tables, blocks_per_request, index_k, index_scale,
+        entries_per_block, cand, cand_stride, cand_counts, block_size, select_k, keys, keys_ws);
+    DGPP_CUDA_OK(cudaGetLastError());
+  } else {
+    csa_decode_scores_kernel<Candidates, 2><<<dim, kCsa2Threads, 0, stream>>>(
+        q_fp8, w_folded, req_ids, pos_sel, block_tables, blocks_per_request, index_k, index_scale,
+        entries_per_block, cand, cand_stride, cand_counts, block_size, select_k, keys, keys_ws);
+    DGPP_CUDA_OK(cudaGetLastError());
+  }
 }
 }  // namespace
 
@@ -1007,13 +1042,10 @@ void csa2_select_candidates_decode(const void* q_fp8, const float* w_folded, con
   if (topk_blocks > kCsa2CandidateMaxBlocks)
     throw std::invalid_argument("csa2_select_candidates_decode: topk_blocks exceeds the select bound");
   (void)csa2_select_workspace_bytes(rows, max_entries);
-  const int stripes = std::max(1, 96 / rows);
-  csa_decode_scores_kernel<true>
-      <<<dim3(unsigned(stripes), unsigned(rows)), kCsa2Threads, 0, stream>>>(
-          static_cast<const uint8_t*>(q_fp8), w_folded, req_ids, pos_sel, block_tables,
-          blocks_per_request, static_cast<const uint8_t*>(index_k), index_scale, entries_per_block,
-          nullptr, 0, nullptr, block_size, topk_blocks, keys_ws, max_entries);
-  DGPP_CUDA_OK(cudaGetLastError());
+  launch_decode_scores<true>(heads / 32, rows, static_cast<const uint8_t*>(q_fp8), w_folded, req_ids,
+                             pos_sel, block_tables, blocks_per_request, static_cast<const uint8_t*>(index_k),
+                             index_scale, entries_per_block, nullptr, 0, nullptr, block_size, topk_blocks,
+                             keys_ws, max_entries, stream);
   csa_decode_select_kernel<true>
       <<<unsigned(rows), kCsa2Threads, decode_select_smem(topk_blocks), stream>>>(
           keys_ws, max_entries, pos_sel, nullptr, 0, nullptr, block_size, topk_blocks, cand_out,
@@ -1036,13 +1068,10 @@ void csa2_select_listed_decode(const void* q_fp8, const float* w_folded, const i
   if (entries_per_block <= 0 || blocks_per_request <= 0 || keys_ws == nullptr)
     throw std::invalid_argument("csa2_select_listed_decode: shape or workspace");
   (void)csa2_select_workspace_bytes(rows, max_entries);
-  const int stripes = std::max(1, 96 / rows);
-  csa_decode_scores_kernel<false>
-      <<<dim3(unsigned(stripes), unsigned(rows)), kCsa2Threads, 0, stream>>>(
-          static_cast<const uint8_t*>(q_fp8), w_folded, req_ids, pos_sel, block_tables,
-          blocks_per_request, static_cast<const uint8_t*>(index_k), index_scale, entries_per_block,
-          cand, cand_stride, cand_counts, block_size, select_k, keys_ws, max_entries);
-  DGPP_CUDA_OK(cudaGetLastError());
+  launch_decode_scores<false>(heads / 32, rows, static_cast<const uint8_t*>(q_fp8), w_folded, req_ids,
+                              pos_sel, block_tables, blocks_per_request, static_cast<const uint8_t*>(index_k),
+                              index_scale, entries_per_block, cand, cand_stride, cand_counts, block_size,
+                              select_k, keys_ws, max_entries, stream);
   csa_decode_select_kernel<false>
       <<<unsigned(rows), kCsa2Threads, decode_select_smem(select_k), stream>>>(
           keys_ws, max_entries, pos_sel, cand, cand_stride, cand_counts, block_size, select_k,
@@ -1060,10 +1089,11 @@ void csa2_logits_prefill(const float* dot, int64_t dot_stride, const float* w_fo
   DGPP_CUDA_OK(cudaGetLastError());
 }
 void csa2_select_rows_prefill(const float* logits, int64_t logits_stride, const int64_t* pos_sel, int rows,
-                              int select_k, const int32_t* cand, int cand_stride, const int32_t* cand_counts,
-                              int block_size, int32_t* topk_out, int32_t* counts, cudaStream_t stream) {
+                              int heads, int select_k, const int32_t* cand, int cand_stride,
+                              const int32_t* cand_counts, int block_size, int32_t* topk_out,
+                              int32_t* counts, cudaStream_t stream) {
   if (rows <= 0) return;
-  check_select_common(32, select_k, "csa2_select_rows_prefill");
+  check_select_common(heads, select_k, "csa2_select_rows_prefill");
   if (select_k > kSelectTile / 2) throw std::invalid_argument("csa2_select_rows_prefill: select_k <= 1024");
   if (cand != nullptr && (cand_counts == nullptr || cand_stride <= 0 || block_size <= 0))
     throw std::invalid_argument("csa2_select_rows_prefill: a candidate pool needs its counts, stride and block size");
@@ -1073,10 +1103,10 @@ void csa2_select_rows_prefill(const float* logits, int64_t logits_stride, const 
   DGPP_CUDA_OK(cudaGetLastError());
 }
 void csa2_select_candidates_prefill(const float* logits, int64_t logits_stride, const int64_t* pos_sel,
-                                    int rows, int block_size, int topk_blocks, int32_t* cand_out,
+                                    int rows, int heads, int block_size, int topk_blocks, int32_t* cand_out,
                                     int32_t* cand_counts, cudaStream_t stream) {
   if (rows <= 0) return;
-  check_select_common(32, topk_blocks, "csa2_select_candidates_prefill");
+  check_select_common(heads, topk_blocks, "csa2_select_candidates_prefill");
   if (block_size <= 0 || topk_blocks > kCsa2CandidateMaxBlocks)
     throw std::invalid_argument("csa2_select_candidates_prefill: shape");
   csa2_prepare_kernel_smem();

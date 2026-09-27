@@ -501,17 +501,17 @@ namespace {
 // of `epb` entries per block (physical blocks permuted), random e4m3 rows
 // with power-of-two scales, a query per row.
 struct SelectFixture {
-  int n, epb, rows;
+  int n, epb, rows, heads;
   std::vector<int32_t> table;  // request 0's blocks
   std::vector<uint8_t> k;      // [slots, 128]
   std::vector<float> ks;       // [slots]
-  std::vector<uint8_t> q8;     // [rows, 32, 128]
-  std::vector<float> wf;       // [rows, 32]
+  std::vector<uint8_t> q8;     // [rows, heads, 128]
+  std::vector<float> wf;       // [rows, heads]
   std::vector<int64_t> pos_sel;
   std::vector<float> logits;   // [rows, n] the DSA oracle's (relu)
   DevBuf dk, dks, dq8, dwf, dt, dpos, dri;
-  SelectFixture(int n_, int epb_, std::vector<int64_t> ps, uint64_t seed, bool host_logits = true)
-      : n(n_), epb(epb_), rows(int(ps.size())), pos_sel(std::move(ps)) {
+  SelectFixture(int n_, int epb_, std::vector<int64_t> ps, uint64_t seed, bool host_logits = true, int heads_ = 32)
+      : n(n_), epb(epb_), rows(int(ps.size())), heads(heads_), pos_sel(std::move(ps)) {
     const int blocks = (n + epb - 1) / epb;
     table.resize(size_t(blocks));
     for (int b = 0; b < blocks; ++b) table[size_t(b)] = (b * 7 + 3) % blocks;
@@ -529,13 +529,13 @@ struct SelectFixture {
       k[i] = c;
     }
     for (int s = 0; s < slots; ++s) ks[size_t(s)] = std::ldexp(1.0f, -6 - int((seed + s) % 3));
-    q8.resize(size_t(rows) * 32 * 128);
+    q8.resize(size_t(rows) * heads * 128);
     for (size_t i = 0; i < q8.size(); ++i) {
       uint8_t c = uint8_t((seed * 17 + i * 40503u) >> 2);
       if ((c & 0x7F) == 0x7F) c = 0x30;
       q8[i] = c;
     }
-    wf.resize(size_t(rows) * 32);
+    wf.resize(size_t(rows) * heads);
     for (size_t i = 0; i < wf.size(); ++i) wf[i] = 0.01f * float((seed + i * 13) % 100) * std::ldexp(1.0f, -8);
     // The oracle logits over the logical entries.
     logits.assign(size_t(rows) * n, 0.0f);
@@ -547,7 +547,7 @@ struct SelectFixture {
       ksl[size_t(e)] = ks[size_t(slot)];
     }
     for (int r = 0; host_logits && r < rows; ++r)
-      dgpp::dsa_ref::pool_logits<float>(&q8[size_t(r) * 32 * 128], &wf[size_t(r) * 32], kl.data(), ksl.data(), n, 32, 128,
+      dgpp::dsa_ref::pool_logits<float>(&q8[size_t(r) * heads * 128], &wf[size_t(r) * heads], kl.data(), ksl.data(), n, heads, 128,
                                         &logits[size_t(r) * n], true);
     dk = upload(k); dks = upload(ks); dq8 = upload(q8); dwf = upload(wf); dt = upload(table); dpos = upload(pos_sel);
     dri = upload(std::vector<int32_t>(size_t(rows), 0));
@@ -669,10 +669,10 @@ DGPP_TEST(csa2_long_decode_selection_replays) {
   DGPP_CUDA_OK(cudaStreamDestroy(stream));
 }
 
-DGPP_TEST(csa2_selections_match_the_oracles) {
+void selections_match_the_oracles(int heads) {
   // 300 entries of 8 per block; queries seeing 0, 1, 37, 64 (a whole number
   // of blocks: the newest complete block pinned), 299 and 300 entries.
-  SelectFixture fx(300, 8, {-1, 0, 36, 63, 298, 299}, 0x5E1);
+  SelectFixture fx(300, 8, {-1, 0, 36, 63, 298, 299}, 0x5E1, true, heads);
   const int rows = fx.rows;
   DevBuf dsel_ws(dgpp::csa2_select_workspace_bytes(rows, fx.n));
   // 1) the listed select with no list = the plain top-k over the visible entries.
@@ -680,7 +680,7 @@ DGPP_TEST(csa2_selections_match_the_oracles) {
     DevBuf dtop(size_t(rows) * select_k * 4), dcnt(rows * 4);
     dgpp::csa2_select_listed_decode(
         fx.dq8.p, static_cast<const float*>(fx.dwf.p), fx.ri(), fx.ps(), rows, fx.tab(), fx.bpr(),
-        fx.dk.p, static_cast<const float*>(fx.dks.p), fx.epb, 32, nullptr, 0, nullptr, 0, select_k,
+        fx.dk.p, static_cast<const float*>(fx.dks.p), fx.epb, heads, nullptr, 0, nullptr, 0, select_k,
         static_cast<uint64_t*>(dsel_ws.p), fx.n, static_cast<int32_t*>(dtop.p),
         static_cast<int32_t*>(dcnt.p), 0);
     sync();
@@ -708,7 +708,7 @@ DGPP_TEST(csa2_selections_match_the_oracles) {
   for (const int replay : {0, 1}) {
     dgpp::csa2_select_candidates_decode(
         fx.dq8.p, static_cast<const float*>(fx.dwf.p), fx.ri(), fx.ps(), rows, fx.tab(), fx.bpr(),
-        fx.dk.p, static_cast<const float*>(fx.dks.p), fx.epb, 32, block_size, topk_blocks,
+        fx.dk.p, static_cast<const float*>(fx.dks.p), fx.epb, heads, block_size, topk_blocks,
         static_cast<uint64_t*>(dsel_ws.p), fx.n, static_cast<int32_t*>(dcand.p),
         static_cast<int32_t*>(dcc.p), 0);
     sync();
@@ -730,7 +730,7 @@ DGPP_TEST(csa2_selections_match_the_oracles) {
     DevBuf dtop(size_t(rows) * select_k * 4), dcnt(rows * 4);
     dgpp::csa2_select_listed_decode(
         fx.dq8.p, static_cast<const float*>(fx.dwf.p), fx.ri(), fx.ps(), rows, fx.tab(), fx.bpr(),
-        fx.dk.p, static_cast<const float*>(fx.dks.p), fx.epb, 32,
+        fx.dk.p, static_cast<const float*>(fx.dks.p), fx.epb, heads,
         static_cast<const int32_t*>(dcand.p), cand_stride, static_cast<const int32_t*>(dcc.p),
         block_size, select_k, static_cast<uint64_t*>(dsel_ws.p), fx.n,
         static_cast<int32_t*>(dtop.p), static_cast<int32_t*>(dcnt.p), 0);
@@ -751,21 +751,21 @@ DGPP_TEST(csa2_selections_match_the_oracles) {
   // then the plain / candidate / restricted selections over the rows.
   {
     const int64_t stride = fx.n + 5;
-    std::vector<float> dot(size_t(rows) * 32 * stride, 0.0f);
+    std::vector<float> dot(size_t(rows) * heads * stride, 0.0f);
     for (int r = 0; r < rows; ++r)
-      for (int h = 0; h < 32; ++h)
+      for (int h = 0; h < heads; ++h)
         for (int e = 0; e < fx.n; ++e) {
           const int slot = fx.table[size_t(e / fx.epb)] * fx.epb + e % fx.epb;
           float d = 0.0f;
           for (int i = 0; i < 128; ++i)
-            d += dgpp::fp8_e4m3_bits_to_float(fx.q8[(size_t(r) * 32 + h) * 128 + i]) * dgpp::fp8_e4m3_bits_to_float(fx.k[size_t(slot) * 128 + i]);
-          dot[(size_t(r) * 32 + h) * stride + e] = d;
+            d += dgpp::fp8_e4m3_bits_to_float(fx.q8[(size_t(r) * heads + h) * 128 + i]) * dgpp::fp8_e4m3_bits_to_float(fx.k[size_t(slot) * 128 + i]);
+          dot[(size_t(r) * heads + h) * stride + e] = d;
         }
     std::vector<float> ksl(size_t(fx.n));
     for (int e = 0; e < fx.n; ++e) ksl[size_t(e)] = fx.ks[size_t(fx.table[size_t(e / fx.epb)] * fx.epb + e % fx.epb)];
     DevBuf ddot = upload(dot), dksl = upload(ksl), dlog(size_t(rows) * stride * 4);
     dgpp::csa2_logits_prefill(static_cast<const float*>(ddot.p), stride, static_cast<const float*>(fx.dwf.p),
-                              static_cast<const float*>(dksl.p), fx.ps(), rows, fx.n, 32, static_cast<float*>(dlog.p), stride, 0);
+                              static_cast<const float*>(dksl.p), fx.ps(), rows, fx.n, heads, static_cast<float*>(dlog.p), stride, 0);
     sync();
     const auto lg = download<float>(dlog, size_t(rows) * stride);
     // The prefill logits use the same (w * ks) * relu(dot) sum as the
@@ -781,9 +781,9 @@ DGPP_TEST(csa2_selections_match_the_oracles) {
       }
     const int select_k = 32;
     DevBuf dtop(size_t(rows) * select_k * 4), dcnt(rows * 4), dcp(size_t(rows) * cand_stride * 4), dcpc(rows * 4);
-    dgpp::csa2_select_rows_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, select_k, nullptr, 0, nullptr, 0,
+    dgpp::csa2_select_rows_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, heads, select_k, nullptr, 0, nullptr, 0,
                                    static_cast<int32_t*>(dtop.p), static_cast<int32_t*>(dcnt.p), 0);
-    dgpp::csa2_select_candidates_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, block_size, topk_blocks,
+    dgpp::csa2_select_candidates_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, heads, block_size, topk_blocks,
                                          static_cast<int32_t*>(dcp.p), static_cast<int32_t*>(dcpc.p), 0);
     sync();
     const auto top = download<int32_t>(dtop, size_t(rows) * select_k);
@@ -801,7 +801,7 @@ DGPP_TEST(csa2_selections_match_the_oracles) {
       c.resize(size_t(cand_stride), -1);
       for (int i = 0; i < cand_stride; ++i) require(cp[size_t(r) * cand_stride + i] == c[size_t(i)], "prefill candidate list");
     }
-    dgpp::csa2_select_rows_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, select_k,
+    dgpp::csa2_select_rows_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, heads, select_k,
                                    static_cast<const int32_t*>(dcp.p), cand_stride, static_cast<const int32_t*>(dcpc.p), block_size,
                                    static_cast<int32_t*>(dtop.p), static_cast<int32_t*>(dcnt.p), 0);
     sync();
@@ -816,6 +816,16 @@ DGPP_TEST(csa2_selections_match_the_oracles) {
       for (int i = 0; i < select_k; ++i) require(top2[size_t(r) * select_k + i] == (i < int(want.size()) ? want[size_t(i)] : -1), "prefill restricted selection");
     }
   }
+}
+
+DGPP_TEST(csa2_selections_match_the_oracles) {
+  selections_match_the_oracles(32);
+  std::printf("[ OK ] csa2 selections match the oracles (32 index heads)\n");
+}
+
+DGPP_TEST(csa2_selections_64_heads_match_the_oracles) {
+  selections_match_the_oracles(64);
+  std::printf("[ OK ] csa2 selections match the oracles (64 index heads, the 0731 geometry)\n");
 }
 
 DGPP_TEST(csa2_attn_finish_merges_sources_with_the_sink_and_unrotates) {

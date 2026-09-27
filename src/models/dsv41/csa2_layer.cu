@@ -25,7 +25,7 @@ void Csa2Config::validate(const Csa2Config& c) {
     fail("heads and groups must divide by tp, heads by groups");
   if (c.local_heads() < 4 || (c.local_heads() & (c.local_heads() - 1)) != 0)
     fail("local heads must be a power of two >= 4 (the attention head-group tiling)");
-  if (c.index_heads != 32) fail("the selection kernels pin 32 index heads");
+  if (c.index_heads != 32 && c.index_heads != 64) fail("the selection kernels take 32 or 64 index heads");
   if (c.index_topk <= 0 || (c.index_topk & (c.index_topk - 1)) != 0 || c.index_topk > 1024)
     fail("index_topk must be a power of two <= 1024");
   if (c.candidate_block <= 0 || c.candidate_blocks <= 0 || c.candidate_blocks > kCsa2CandidateMaxBlocks ||
@@ -590,10 +590,11 @@ void Csa2Layer::enqueue_prefill(const void* hidden_in, Csa2StatePool& pool, int 
         dbg_logits_entries_ = n_gather;
         const size_t srow = size_t(row_base + row0);  // the selection state's row
         if (w_.candidate_source)
-          csa2_select_candidates_prefill(logits_, stride, pos_sel_ + row0, rows, cfg_.candidate_block, cfg_.candidate_blocks,
+          csa2_select_candidates_prefill(logits_, stride, pos_sel_ + row0, rows, cfg_.index_heads, cfg_.candidate_block,
+                                         cfg_.candidate_blocks,
                                          cand_ + srow * cfg_.candidate_blocks, cand_counts_ + srow, stream);
         const bool restricted = w_.candidate_source || w_.uses_candidates;
-        csa2_select_rows_prefill(logits_, stride, pos_sel_ + row0, rows, cfg_.index_topk,
+        csa2_select_rows_prefill(logits_, stride, pos_sel_ + row0, rows, cfg_.index_heads, cfg_.index_topk,
                                  restricted ? cand_ + srow * cfg_.candidate_blocks : nullptr, cfg_.candidate_blocks,
                                  restricted ? cand_counts_ + srow : nullptr, cfg_.candidate_block,
                                  topk_ + srow * cfg_.index_topk, counts_ + srow, stream);
