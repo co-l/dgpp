@@ -315,7 +315,7 @@ DGPP_TEST(csa2_index_quant_is_exact_in_the_planar_form_and_counts_violations) {
   // The fold: (bf16 w * 2^-6) * q_scale.
   const auto w = random_bf16_bits(0x1E0, int64_t(rows) * heads, -3, 2);
   DevBuf dw = upload(w), dwf(size_t(rows) * heads * 4);
-  dgpp::csa2_fold_weights(dw.p, static_cast<const float*>(dqs.p), static_cast<float*>(dwf.p), int64_t(rows) * heads, 0);
+  dgpp::csa2_fold_weights(dw.p, static_cast<const float*>(dqs.p), 0.015625f, static_cast<float*>(dwf.p), int64_t(rows) * heads, 0);
   sync();
   const auto wf = download<float>(dwf, size_t(rows) * heads);
   for (size_t i = 0; i < wf.size(); ++i)
@@ -501,17 +501,17 @@ namespace {
 // of `epb` entries per block (physical blocks permuted), random e4m3 rows
 // with power-of-two scales, a query per row.
 struct SelectFixture {
-  int n, epb, rows;
+  int n, epb, rows, heads;
   std::vector<int32_t> table;  // request 0's blocks
   std::vector<uint8_t> k;      // [slots, 128]
   std::vector<float> ks;       // [slots]
-  std::vector<uint8_t> q8;     // [rows, 32, 128]
-  std::vector<float> wf;       // [rows, 32]
+  std::vector<uint8_t> q8;     // [rows, heads, 128]
+  std::vector<float> wf;       // [rows, heads]
   std::vector<int64_t> pos_sel;
   std::vector<float> logits;   // [rows, n] the DSA oracle's (relu)
   DevBuf dk, dks, dq8, dwf, dt, dpos, dri;
-  SelectFixture(int n_, int epb_, std::vector<int64_t> ps, uint64_t seed, bool host_logits = true)
-      : n(n_), epb(epb_), rows(int(ps.size())), pos_sel(std::move(ps)) {
+  SelectFixture(int n_, int epb_, std::vector<int64_t> ps, uint64_t seed, bool host_logits = true, int heads_ = 32)
+      : n(n_), epb(epb_), rows(int(ps.size())), heads(heads_), pos_sel(std::move(ps)) {
     const int blocks = (n + epb - 1) / epb;
     table.resize(size_t(blocks));
     for (int b = 0; b < blocks; ++b) table[size_t(b)] = (b * 7 + 3) % blocks;
@@ -529,13 +529,13 @@ struct SelectFixture {
       k[i] = c;
     }
     for (int s = 0; s < slots; ++s) ks[size_t(s)] = std::ldexp(1.0f, -6 - int((seed + s) % 3));
-    q8.resize(size_t(rows) * 32 * 128);
+    q8.resize(size_t(rows) * heads * 128);
     for (size_t i = 0; i < q8.size(); ++i) {
       uint8_t c = uint8_t((seed * 17 + i * 40503u) >> 2);
       if ((c & 0x7F) == 0x7F) c = 0x30;
       q8[i] = c;
     }
-    wf.resize(size_t(rows) * 32);
+    wf.resize(size_t(rows) * heads);
     for (size_t i = 0; i < wf.size(); ++i) wf[i] = 0.01f * float((seed + i * 13) % 100) * std::ldexp(1.0f, -8);
     // The oracle logits over the logical entries.
     logits.assign(size_t(rows) * n, 0.0f);
@@ -547,7 +547,7 @@ struct SelectFixture {
       ksl[size_t(e)] = ks[size_t(slot)];
     }
     for (int r = 0; host_logits && r < rows; ++r)
-      dgpp::dsa_ref::pool_logits<float>(&q8[size_t(r) * 32 * 128], &wf[size_t(r) * 32], kl.data(), ksl.data(), n, 32, 128,
+      dgpp::dsa_ref::pool_logits<float>(&q8[size_t(r) * heads * 128], &wf[size_t(r) * heads], kl.data(), ksl.data(), n, heads, 128,
                                         &logits[size_t(r) * n], true);
     dk = upload(k); dks = upload(ks); dq8 = upload(q8); dwf = upload(wf); dt = upload(table); dpos = upload(pos_sel);
     dri = upload(std::vector<int32_t>(size_t(rows), 0));
@@ -669,10 +669,10 @@ DGPP_TEST(csa2_long_decode_selection_replays) {
   DGPP_CUDA_OK(cudaStreamDestroy(stream));
 }
 
-DGPP_TEST(csa2_selections_match_the_oracles) {
+void selections_match_the_oracles(int heads) {
   // 300 entries of 8 per block; queries seeing 0, 1, 37, 64 (a whole number
   // of blocks: the newest complete block pinned), 299 and 300 entries.
-  SelectFixture fx(300, 8, {-1, 0, 36, 63, 298, 299}, 0x5E1);
+  SelectFixture fx(300, 8, {-1, 0, 36, 63, 298, 299}, 0x5E1, true, heads);
   const int rows = fx.rows;
   DevBuf dsel_ws(dgpp::csa2_select_workspace_bytes(rows, fx.n));
   // 1) the listed select with no list = the plain top-k over the visible entries.
@@ -680,7 +680,7 @@ DGPP_TEST(csa2_selections_match_the_oracles) {
     DevBuf dtop(size_t(rows) * select_k * 4), dcnt(rows * 4);
     dgpp::csa2_select_listed_decode(
         fx.dq8.p, static_cast<const float*>(fx.dwf.p), fx.ri(), fx.ps(), rows, fx.tab(), fx.bpr(),
-        fx.dk.p, static_cast<const float*>(fx.dks.p), fx.epb, 32, nullptr, 0, nullptr, 0, select_k,
+        fx.dk.p, static_cast<const float*>(fx.dks.p), fx.epb, heads, nullptr, 0, nullptr, 0, select_k,
         static_cast<uint64_t*>(dsel_ws.p), fx.n, static_cast<int32_t*>(dtop.p),
         static_cast<int32_t*>(dcnt.p), 0);
     sync();
@@ -708,7 +708,7 @@ DGPP_TEST(csa2_selections_match_the_oracles) {
   for (const int replay : {0, 1}) {
     dgpp::csa2_select_candidates_decode(
         fx.dq8.p, static_cast<const float*>(fx.dwf.p), fx.ri(), fx.ps(), rows, fx.tab(), fx.bpr(),
-        fx.dk.p, static_cast<const float*>(fx.dks.p), fx.epb, 32, block_size, topk_blocks,
+        fx.dk.p, static_cast<const float*>(fx.dks.p), fx.epb, heads, block_size, topk_blocks,
         static_cast<uint64_t*>(dsel_ws.p), fx.n, static_cast<int32_t*>(dcand.p),
         static_cast<int32_t*>(dcc.p), 0);
     sync();
@@ -730,7 +730,7 @@ DGPP_TEST(csa2_selections_match_the_oracles) {
     DevBuf dtop(size_t(rows) * select_k * 4), dcnt(rows * 4);
     dgpp::csa2_select_listed_decode(
         fx.dq8.p, static_cast<const float*>(fx.dwf.p), fx.ri(), fx.ps(), rows, fx.tab(), fx.bpr(),
-        fx.dk.p, static_cast<const float*>(fx.dks.p), fx.epb, 32,
+        fx.dk.p, static_cast<const float*>(fx.dks.p), fx.epb, heads,
         static_cast<const int32_t*>(dcand.p), cand_stride, static_cast<const int32_t*>(dcc.p),
         block_size, select_k, static_cast<uint64_t*>(dsel_ws.p), fx.n,
         static_cast<int32_t*>(dtop.p), static_cast<int32_t*>(dcnt.p), 0);
@@ -751,21 +751,21 @@ DGPP_TEST(csa2_selections_match_the_oracles) {
   // then the plain / candidate / restricted selections over the rows.
   {
     const int64_t stride = fx.n + 5;
-    std::vector<float> dot(size_t(rows) * 32 * stride, 0.0f);
+    std::vector<float> dot(size_t(rows) * heads * stride, 0.0f);
     for (int r = 0; r < rows; ++r)
-      for (int h = 0; h < 32; ++h)
+      for (int h = 0; h < heads; ++h)
         for (int e = 0; e < fx.n; ++e) {
           const int slot = fx.table[size_t(e / fx.epb)] * fx.epb + e % fx.epb;
           float d = 0.0f;
           for (int i = 0; i < 128; ++i)
-            d += dgpp::fp8_e4m3_bits_to_float(fx.q8[(size_t(r) * 32 + h) * 128 + i]) * dgpp::fp8_e4m3_bits_to_float(fx.k[size_t(slot) * 128 + i]);
-          dot[(size_t(r) * 32 + h) * stride + e] = d;
+            d += dgpp::fp8_e4m3_bits_to_float(fx.q8[(size_t(r) * heads + h) * 128 + i]) * dgpp::fp8_e4m3_bits_to_float(fx.k[size_t(slot) * 128 + i]);
+          dot[(size_t(r) * heads + h) * stride + e] = d;
         }
     std::vector<float> ksl(size_t(fx.n));
     for (int e = 0; e < fx.n; ++e) ksl[size_t(e)] = fx.ks[size_t(fx.table[size_t(e / fx.epb)] * fx.epb + e % fx.epb)];
     DevBuf ddot = upload(dot), dksl = upload(ksl), dlog(size_t(rows) * stride * 4);
     dgpp::csa2_logits_prefill(static_cast<const float*>(ddot.p), stride, static_cast<const float*>(fx.dwf.p),
-                              static_cast<const float*>(dksl.p), fx.ps(), rows, fx.n, 32, static_cast<float*>(dlog.p), stride, 0);
+                              static_cast<const float*>(dksl.p), fx.ps(), rows, fx.n, heads, static_cast<float*>(dlog.p), stride, 0);
     sync();
     const auto lg = download<float>(dlog, size_t(rows) * stride);
     // The prefill logits use the same (w * ks) * relu(dot) sum as the
@@ -781,9 +781,9 @@ DGPP_TEST(csa2_selections_match_the_oracles) {
       }
     const int select_k = 32;
     DevBuf dtop(size_t(rows) * select_k * 4), dcnt(rows * 4), dcp(size_t(rows) * cand_stride * 4), dcpc(rows * 4);
-    dgpp::csa2_select_rows_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, select_k, nullptr, 0, nullptr, 0,
+    dgpp::csa2_select_rows_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, heads, select_k, nullptr, 0, nullptr, 0,
                                    static_cast<int32_t*>(dtop.p), static_cast<int32_t*>(dcnt.p), 0);
-    dgpp::csa2_select_candidates_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, block_size, topk_blocks,
+    dgpp::csa2_select_candidates_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, heads, block_size, topk_blocks,
                                          static_cast<int32_t*>(dcp.p), static_cast<int32_t*>(dcpc.p), 0);
     sync();
     const auto top = download<int32_t>(dtop, size_t(rows) * select_k);
@@ -801,7 +801,7 @@ DGPP_TEST(csa2_selections_match_the_oracles) {
       c.resize(size_t(cand_stride), -1);
       for (int i = 0; i < cand_stride; ++i) require(cp[size_t(r) * cand_stride + i] == c[size_t(i)], "prefill candidate list");
     }
-    dgpp::csa2_select_rows_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, select_k,
+    dgpp::csa2_select_rows_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, heads, select_k,
                                    static_cast<const int32_t*>(dcp.p), cand_stride, static_cast<const int32_t*>(dcpc.p), block_size,
                                    static_cast<int32_t*>(dtop.p), static_cast<int32_t*>(dcnt.p), 0);
     sync();
@@ -816,6 +816,16 @@ DGPP_TEST(csa2_selections_match_the_oracles) {
       for (int i = 0; i < select_k; ++i) require(top2[size_t(r) * select_k + i] == (i < int(want.size()) ? want[size_t(i)] : -1), "prefill restricted selection");
     }
   }
+}
+
+DGPP_TEST(csa2_selections_match_the_oracles) {
+  selections_match_the_oracles(32);
+  std::printf("[ OK ] csa2 selections match the oracles (32 index heads)\n");
+}
+
+DGPP_TEST(csa2_selections_64_heads_match_the_oracles) {
+  selections_match_the_oracles(64);
+  std::printf("[ OK ] csa2 selections match the oracles (64 index heads, the 0731 geometry)\n");
 }
 
 DGPP_TEST(csa2_attn_finish_merges_sources_with_the_sink_and_unrotates) {
@@ -952,6 +962,638 @@ DGPP_TEST(csa2_window_attention_end_to_end_matches_sparse_attn) {
   };
   run(3, {3, 0, 2}, "short ring");
   run(last, {283, 300, 315}, "wrapped ring");
+}
+
+// ---- the 0731 activation roundings (quantize-dequantize, bf16 values) ------
+// The reference (inference/kernel.py) applies its activation quantizers in
+// place: the cache stores the dequantized bf16. The host mirrors the kernel's
+// fp32 arithmetic; the kernels must land the same bf16 bits.
+void ref_actquant8_dequant(const uint16_t* x, uint16_t* y) {
+  for (int i = 448; i < 512; ++i) y[i] = x[i];  // the rope tail passes
+  for (int b = 0; b < 7; ++b) {
+    float amax = 0.0f;
+    for (int j = 0; j < 64; ++j) amax = std::max(amax, std::fabs(bf16_bits_to_float(x[b * 64 + j])));
+    const float a = amax > 1e-4f ? amax : 1e-4f;
+    const float s = a * (1.0f / 448.0f);  // the fp32 scale (no power-of-two rounding)
+    for (int j = 0; j < 64; ++j) {
+      const float v = bf16_bits_to_float(x[b * 64 + j]);
+      y[b * 64 + j] = float_to_bf16_bits(dgpp::fp8_e4m3_bits_to_float(dgpp::float_to_fp8_e4m3_bits(v / s)) * s);
+    }
+  }
+}
+void ref_hadamard128(const uint16_t* x, uint16_t* y) {
+  float v[128];
+  for (int i = 0; i < 128; ++i) v[i] = bf16_bits_to_float(x[i]);
+  for (int stage = 1; stage < 128; stage *= 2)
+    for (int i = 0; i < 128; i += 2 * stage)
+      for (int j = 0; j < stage; ++j) {
+        const float a = v[i + j], b = v[i + j + stage];
+        v[i + j] = a + b;
+        v[i + j + stage] = a - b;
+      }
+  const float sc = 0.08838834764831845f;  // 1 / sqrt(128)
+  for (int i = 0; i < 128; ++i) y[i] = float_to_bf16_bits(v[i] * sc);
+}
+
+DGPP_TEST(csa2_0731_actquant8_dequant_matches_the_reference) {
+  const int rows = 577;
+  std::vector<uint16_t> x(size_t(rows) * 512), want(size_t(rows) * 512), got(size_t(rows) * 512);
+  uint64_t s = 0x5A5A1234ull;
+  for (size_t i = 0; i < x.size(); ++i) {
+    s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+    const float v = (float(s % 100000) / 100000.0f - 0.5f) * 4.0f * (0.1f + float((s >> 32) % 97) / 97.0f);
+    x[i] = float_to_bf16_bits(v);
+  }
+  // The crafted rows: an all-zero block (the 1e-4 floor), the e4m3 max, a
+  // small value that the scale's rounding must carry.
+  x[0] = x[1] = x[2] = x[3] = 0;
+  x[448] = float_to_bf16_bits(448.0f);
+  x[449] = float_to_bf16_bits(0.1875f);
+  for (int c = 0; c < 64; ++c) x[size_t(512) + c] = float_to_bf16_bits(0.25f);
+  for (int r = 0; r < rows; ++r) ref_actquant8_dequant(x.data() + size_t(r) * 512, want.data() + size_t(r) * 512);
+  DevBuf dx(rows * 512 * 2), dy(rows * 512 * 2);
+  dx.upload(x.data(), x.size() * 2);
+  dgpp::csa2_actquant8_dequant_bf16(static_cast<const uint16_t*>(dx.p), static_cast<uint16_t*>(dy.p), rows, nullptr);
+  dy.download(got.data(), got.size() * 2);
+  int mism = 0;
+  for (size_t i = 0; i < got.size(); ++i)
+    if (got[i] != want[i]) {
+      if (mism < 4)
+        std::printf("    row %zu col %zu: got %g want %g\n", i / 512, i % 512, bf16_bits_to_float(got[i]),
+                    bf16_bits_to_float(want[i]));
+      ++mism;
+    }
+  require(mism == 0, "the fp8 non-rope rounding must be bitwise the reference's (got " + std::to_string(mism) + " of " +
+                        std::to_string(got.size()) + ")");
+}
+
+DGPP_TEST(csa2_0731_hadamard128_dequant_matches_the_reference) {
+  const int rows = 313;
+  std::vector<uint16_t> x(size_t(rows) * 128), want(size_t(rows) * 128), got(size_t(rows) * 128);
+  uint64_t s = 0x12345678ull;
+  for (size_t i = 0; i < x.size(); ++i) {
+    s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+    x[i] = float_to_bf16_bits(float(s % 4000) / 4000.0f - 0.5f);
+  }
+  for (int r = 0; r < rows; ++r) ref_hadamard128(x.data() + size_t(r) * 128, want.data() + size_t(r) * 128);
+  DevBuf dx(rows * 128 * 2), dy(rows * 128 * 2);
+  dx.upload(x.data(), x.size() * 2);
+  dgpp::csa2_hadamard128_bf16(static_cast<const uint16_t*>(dx.p), static_cast<uint16_t*>(dy.p), rows, nullptr);
+  dy.download(got.data(), got.size() * 2);
+  int mism = 0;
+  for (size_t i = 0; i < got.size(); ++i)
+    if (got[i] != want[i]) {
+      if (mism < 4)
+        std::printf("    row %zu col %zu: got %g want %g\n", i / 128, i % 128, bf16_bits_to_float(got[i]),
+                    bf16_bits_to_float(want[i]));
+      ++mism;
+    }
+  require(mism == 0, "the Hadamard rounding must be bitwise the oracle's (got " + std::to_string(mism) + " of " +
+                        std::to_string(got.size()) + ")");
+}
+
+DGPP_TEST(csa2_0731_fp4_dequant_matches_the_reference) {
+  const int rows = 251;
+  std::vector<uint16_t> x(size_t(rows) * 128), want(size_t(rows) * 128), got(size_t(rows) * 128);
+  uint64_t s = 0xABCD1234ull;
+  for (size_t i = 0; i < x.size(); ++i) {
+    s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+    const float v = (float(s % 20000) / 20000.0f - 0.5f) * (0.01f + float((s >> 40) % 200) / 200.0f);
+    x[i] = float_to_bf16_bits(v);
+  }
+  // The crafted rows: an all-zero block (the 6 * 2^-126 floor) and the fp4
+  // max at the scale's edge.
+  x[0] = x[1] = x[2] = x[3] = 0;
+  x[size_t(128)] = float_to_bf16_bits(6.0f);
+  for (int r = 0; r < rows; ++r) {
+    float tmp[128];
+    ref_fp4_e8m0_dequant(x.data() + size_t(r) * 128, tmp);
+    for (int i = 0; i < 128; ++i) want[size_t(r) * 128 + i] = float_to_bf16_bits(tmp[i]);
+  }
+  DevBuf dx(rows * 128 * 2), dy(rows * 128 * 2);
+  dx.upload(x.data(), x.size() * 2);
+  dgpp::csa2_fp4_dequant_bf16(static_cast<const uint16_t*>(dx.p), static_cast<uint16_t*>(dy.p), rows, nullptr);
+  dy.download(got.data(), got.size() * 2);
+  int mism = 0;
+  for (size_t i = 0; i < got.size(); ++i)
+    if (got[i] != want[i]) {
+      if (mism < 4)
+        std::printf("    row %zu col %zu: got %g want %g\n", i / 128, i % 128, bf16_bits_to_float(got[i]),
+                    bf16_bits_to_float(want[i]));
+      ++mism;
+    }
+  require(mism == 0, "the fp4 e8m0/32 rounding must be bitwise the reference's (got " + std::to_string(mism) +
+                        " of " + std::to_string(got.size()) + ")");
+}
+
+// ---- the 0731 compressors (the overlap windows at ratio 4, the full
+// windows at 128) ------------------------------------------------------------
+// Mirrors model.py's Compressor: per channel the fp32 softmax over the item
+// scores (max-subtracted, p_j = e_j / den), the fp32 weighted kv sum, one
+// bf16 rounding, then the one-rounding RMSNorm. The scores are stored with a
+// The scores are stored raw; the score half of a fresh state is -inf (the
+// reference's), an unwritten slot's softmax weight is exactly zero.
+void ref_pool_items(int items, int D, const float* const* kv, const float* const* sc,
+                    const uint16_t* w, float eps, uint16_t* out) {
+  std::vector<uint16_t> pooled(static_cast<size_t>(D));
+  for (int c = 0; c < D; ++c) {
+    float m = -INFINITY;
+    for (int j = 0; j < items; ++j) m = std::max(m, sc[j][c]);
+    float den = 0.0f;
+    for (int j = 0; j < items; ++j) den += std::exp(sc[j][c] - m);
+    float sum = 0.0f;
+    for (int j = 0; j < items; ++j) sum += kv[j][c] * (std::exp(sc[j][c] - m) / den);
+    pooled[size_t(c)] = float_to_bf16_bits(sum);
+  }
+  ref_rmsnorm(pooled.data(), w, D, eps, out);
+}
+// The prefill window's eight items (the previous window's first kv half
+// against the window's own second half).
+void ref_c4_window_items(const float* kv, const float* score, const float* ape, int w, int D,
+                         std::vector<std::vector<float>>& k, std::vector<std::vector<float>>& s) {
+  k.assign(8, std::vector<float>(size_t(D)));
+  s.assign(8, std::vector<float>(size_t(D)));
+  for (int j = 0; j < 8; ++j) {
+    const bool prev = j < 4;
+    const int row = prev ? (w > 0 ? (w - 1) * 4 + j : -1) : w * 4 + (j - 4);
+    for (int c = 0; c < D; ++c) {
+      const int col = prev ? c : c + D;
+      const int arow = prev ? j : j - 4;  // the ape is [4, 2D]: all items index 0..3
+      k[size_t(j)][size_t(c)] = row >= 0 ? kv[size_t(row) * 2 * D + col] : 0.0f;
+      s[size_t(j)][size_t(c)] = row >= 0 ? score[size_t(row) * 2 * D + col] + ape[size_t(arow) * 2 * D + col] : -INFINITY;
+    }
+  }
+}
+// The ratio-4 request state (the reference's kv_state / score_state): slots
+// 0..3 the last four tokens' kv (raw), 4..7 the current window's (kv,
+// score + ape); after a completed window 0..3 take 4..7 over.
+struct RefC4State {
+  std::vector<float> kv[8], sc[8];  // each [2D]; sc stored with the bias
+  RefC4State(int D) {
+    for (int i = 0; i < 8; ++i) {
+      kv[i].assign(size_t(2 * D), 0.0f);
+      sc[i].assign(size_t(2 * D), -INFINITY);
+    }
+  }
+  void from_tail(const float* tail, int D) {
+    for (int i = 0; i < 8; ++i) {
+      std::copy(tail + size_t(i) * 2 * D, tail + size_t(i) * 2 * D + 2 * D, kv[i].begin());
+      std::copy(tail + size_t(8 + i) * 2 * D, tail + size_t(8 + i) * 2 * D + 2 * D, sc[i].begin());
+    }
+  }
+  std::vector<uint16_t> step(const float* kvt, const float* sct, const float* ape, int64_t p, int D,
+                             const uint16_t* w, float eps) {
+    const int c = int(p & 3);
+    for (int i = 0; i < 2 * D; ++i) {
+      kv[4 + c][size_t(i)] = kvt[i];
+      sc[4 + c][size_t(i)] = sct[i] + ape[size_t(c) * 2 * D + i];
+    }
+    std::vector<uint16_t> out;
+    if ((p + 1) % 4 == 0) {
+      std::vector<std::vector<float>> k(8, std::vector<float>(size_t(D))), s(8, std::vector<float>(size_t(D)));
+      for (int j = 0; j < 8; ++j)
+        for (int cc = 0; cc < D; ++cc) {
+          const int off = (j < 4) ? cc : cc + D;
+          k[size_t(j)][size_t(cc)] = kv[j][size_t(off)];
+          s[size_t(j)][size_t(cc)] = sc[j][size_t(off)];
+        }
+      const float* kp[8], *sp[8];
+      for (int j = 0; j < 8; ++j) {
+        kp[j] = k[size_t(j)].data();
+        sp[j] = s[size_t(j)].data();
+      }
+      out.resize(size_t(D));
+      ref_pool_items(8, D, kp, sp, w, eps, out.data());
+      for (int i = 0; i < 4; ++i) {
+        kv[i] = kv[4 + i];
+        sc[i] = sc[4 + i];
+      }
+    }
+    return out;
+  }
+};
+// The ratio-128 request state (the same machine, 128 slots, no overlap).
+struct RefC128State {
+  std::vector<float> kv[128], sc[128];  // each [512]; sc stored with the bias
+  RefC128State() {
+    for (int i = 0; i < 128; ++i) {
+      kv[i].assign(512, 0.0f);
+      sc[i].assign(512, 0.0f);
+    }
+  }
+  std::vector<uint16_t> step(const float* kvt, const float* sct, const float* ape, int64_t p,
+                             const uint16_t* w, float eps) {
+    const int c = int(p & 127);
+    for (int i = 0; i < 512; ++i) {
+      kv[c][size_t(i)] = kvt[i];
+      sc[c][size_t(i)] = sct[i] + ape[size_t(c) * 512 + i];
+    }
+    std::vector<uint16_t> out;
+    if ((p + 1) % 128 == 0) {
+      std::vector<std::vector<float>> k(128, std::vector<float>(512)), s(128, std::vector<float>(512));
+      for (int j = 0; j < 128; ++j) {
+        for (int cc = 0; cc < 512; ++cc) {
+          k[size_t(j)][size_t(cc)] = kv[j][size_t(cc)];
+          s[size_t(j)][size_t(cc)] = sc[j][size_t(cc)];
+        }
+      }
+      const float* kp[128], *sp[128];
+      for (int j = 0; j < 128; ++j) {
+        kp[j] = k[size_t(j)].data();
+        sp[j] = s[size_t(j)].data();
+      }
+      out.resize(512);
+      ref_pool_items(128, 512, kp, sp, w, eps, out.data());
+    }
+    return out;
+  }
+};
+
+DGPP_TEST(csa2_0731_compress4_prefill_windows_tail_and_indexer_width) {
+  const int T = 10, D = 512;  // two complete windows + two remainder tokens
+  const float eps = 1e-20f;
+  std::vector<float> kv(size_t(T) * 2 * D), score(size_t(T) * 2 * D), ape(4 * 2 * D);
+  {
+    const auto kb = random_bf16_bits(0xD0, int64_t(T) * 2 * D, -4, 2);
+    const auto sb = random_bf16_bits(0xD1, int64_t(T) * 2 * D, -3, 2);
+    const auto ab = random_bf16_bits(0xD2, int64_t(4 * 2 * D), -2, 1);
+    for (size_t i = 0; i < kv.size(); ++i) {
+      kv[i] = bf16_bits_to_float(kb[i]);
+      score[i] = bf16_bits_to_float(sb[i]);
+    }
+    for (size_t i = 0; i < ape.size(); ++i) ape[i] = bf16_bits_to_float(ab[i]);
+  }
+  const auto norm_w = random_bf16_bits(0xD3, D, -2, 1);
+  DevBuf dkv = upload(kv), dsc = upload(score), dap = upload(ape), dw = upload(norm_w),
+      dlat(size_t(T / 4) * D * 2);
+  std::vector<float> tail0(16 * 2 * D);
+  for (int i = 8 * 2 * D; i < 16 * 2 * D; ++i) tail0[size_t(i)] = -INFINITY;  // the pool's reset
+  DevBuf dtail = upload(tail0);
+  dgpp::csa2_compress4_prefill(static_cast<const float*>(dkv.p), static_cast<const float*>(dsc.p), T, D,
+                               static_cast<const float*>(dap.p), dw.p, eps, dlat.p,
+                               static_cast<float*>(dtail.p), 0);
+  sync();
+  const auto lat = download<uint16_t>(dlat, size_t(T / 4) * D);
+  std::vector<uint16_t> want(size_t(T / 4) * D);
+  std::vector<std::vector<float>> k, s;
+  for (int w = 0; w < T / 4; ++w) {
+    ref_c4_window_items(kv.data(), score.data(), ape.data(), w, D, k, s);
+    const float* kp[8], *sp[8];
+    for (int j = 0; j < 8; ++j) {
+      kp[j] = k[size_t(j)].data();
+      sp[j] = s[size_t(j)].data();
+    }
+    ref_pool_items(8, D, kp, sp, norm_w.data(), eps, want.data() + size_t(w) * D);
+  }
+  require_bf16("prefill windows", compare_bf16(lat, want, 2), 1e-3, 0.005);
+  // The boundary state: slots 0..3 the raw kv of rows 4..7, slots 4..5 the
+  // remainder rows 8..9, the scores with the bias; slots 6..7 unwritten.
+  const auto tail = download<float>(dtail, 16 * 2 * D);
+  const int cutoff = T - (T % 4);
+  for (int i = 0; i < 2 * D; ++i) {
+    for (int q = 0; q < 4; ++q) {
+      const int row = cutoff - 4 + q;
+      require(tail[size_t(q) * 2 * D + i] == kv[size_t(row) * 2 * D + i], "the boundary kv slot " + std::to_string(q));
+      require(tail[8 * 2 * D + size_t(q) * 2 * D + i] == score[size_t(row) * 2 * D + i] + ape[size_t(q) * 2 * D + i],
+              "the boundary score slot " + std::to_string(q));
+    }
+    for (int r = 0; r < 2; ++r) {
+      const int row = cutoff + r;
+      require(tail[size_t(4 + r) * 2 * D + i] == kv[size_t(row) * 2 * D + i], "the remainder kv slot " + std::to_string(r));
+      require(tail[8 * 2 * D + size_t(4 + r) * 2 * D + i] == score[size_t(row) * 2 * D + i] + ape[size_t(r) * 2 * D + i],
+              "the remainder score slot " + std::to_string(r));
+    }
+    for (int r = 2; r < 4; ++r) {
+      require(tail[size_t(4 + r) * 2 * D + i] == 0.0f, "an unwritten kv slot");
+      require(std::isinf(tail[8 * 2 * D + size_t(4 + r) * 2 * D + i]) && tail[8 * 2 * D + size_t(4 + r) * 2 * D + i] < 0,
+              "an unwritten score slot is -inf");
+    }
+  }
+  // The indexer width (D = 128): two windows of an eight-token chunk.
+  const int Di = 128, Ti = 8;
+  std::vector<float> kvi(size_t(Ti) * 2 * Di), sci(size_t(Ti) * 2 * Di), apei(4 * 2 * Di);
+  {
+    const auto kb = random_bf16_bits(0xD4, int64_t(Ti) * 2 * Di, -4, 2);
+    const auto sb = random_bf16_bits(0xD5, int64_t(Ti) * 2 * Di, -3, 2);
+    const auto ab = random_bf16_bits(0xD6, int64_t(4 * 2 * Di), -2, 1);
+    for (size_t i = 0; i < kvi.size(); ++i) {
+      kvi[i] = bf16_bits_to_float(kb[i]);
+      sci[i] = bf16_bits_to_float(sb[i]);
+    }
+    for (size_t i = 0; i < apei.size(); ++i) apei[i] = bf16_bits_to_float(ab[i]);
+  }
+  const auto wni = random_bf16_bits(0xD7, Di, -2, 1);
+  DevBuf dkvi = upload(kvi), dsci = upload(sci), dapi = upload(apei), dwi = upload(wni),
+      dlati(size_t(Ti / 4) * Di * 2), dtaili(16 * 2 * Di * 4);
+  DGPP_CUDA_OK(cudaMemset(dtaili.p, 0, 16 * 2 * Di * 4));
+  dgpp::csa2_compress4_prefill(static_cast<const float*>(dkvi.p), static_cast<const float*>(dsci.p), Ti, Di,
+                               static_cast<const float*>(dapi.p), dwi.p, eps, dlati.p,
+                               static_cast<float*>(dtaili.p), 0);
+  sync();
+  const auto lati = download<uint16_t>(dlati, size_t(Ti / 4) * Di);
+  std::vector<uint16_t> wanti(size_t(Ti / 4) * Di);
+  for (int w = 0; w < Ti / 4; ++w) {
+    ref_c4_window_items(kvi.data(), sci.data(), apei.data(), w, Di, k, s);
+    const float* kp[8], *sp[8];
+    for (int j = 0; j < 8; ++j) {
+      kp[j] = k[size_t(j)].data();
+      sp[j] = s[size_t(j)].data();
+    }
+    ref_pool_items(8, Di, kp, sp, wni.data(), eps, wanti.data() + size_t(w) * Di);
+  }
+  require_bf16("the indexer-width windows", compare_bf16(lati, wanti, 2), 1e-3, 0.005);
+}
+
+DGPP_TEST(csa2_0731_compress4_decode_state_machine_snapshots_and_rollback) {
+  const int D = 512;
+  const float eps = 1e-20f;
+  // Request A continues a T = 10 prefill (its boundary state is the
+  // prefill's tail) at positions 10..17; request B is fresh at 100..107.
+  const int T = 10;
+  std::vector<float> kva(size_t(T) * 2 * D), sca(size_t(T) * 2 * D), ape(4 * 2 * D);
+  {
+    const auto kb = random_bf16_bits(0xE0, int64_t(T) * 2 * D, -4, 2);
+    const auto sb = random_bf16_bits(0xE1, int64_t(T) * 2 * D, -3, 2);
+    const auto ab = random_bf16_bits(0xE2, int64_t(4 * 2 * D), -2, 1);
+    for (size_t i = 0; i < kva.size(); ++i) {
+      kva[i] = bf16_bits_to_float(kb[i]);
+      sca[i] = bf16_bits_to_float(sb[i]);
+    }
+    for (size_t i = 0; i < ape.size(); ++i) ape[i] = bf16_bits_to_float(ab[i]);
+  }
+  const auto norm_w = random_bf16_bits(0xE3, D, -2, 1);
+  DevBuf dape = upload(ape), dw = upload(norm_w);
+  DevBuf dkv0 = upload(kva), dsc0 = upload(sca), dlat0(size_t(T / 4) * D * 2), dtail0(16 * 2 * D * 4);
+  DGPP_CUDA_OK(cudaMemset(dtail0.p, 0, dtail0.bytes));
+  dgpp::csa2_compress4_prefill(static_cast<const float*>(dkv0.p), static_cast<const float*>(dsc0.p), T, D,
+                               static_cast<const float*>(dape.p), dw.p, eps, dlat0.p,
+                               static_cast<float*>(dtail0.p), 0);
+  sync();
+  const auto tail0 = download<float>(dtail0, 16 * 2 * D);
+
+  const int tokens = 16;
+  const std::vector<int32_t> req_ids = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};
+  const std::vector<int64_t> pos = {10, 11, 12, 13, 14, 15, 16, 17, 100, 101, 102, 103, 104, 105, 106, 107};
+  const std::vector<int32_t> spans = {0, 8, 8, 8};
+  std::vector<float> kvd(size_t(tokens) * 2 * D), scd(size_t(tokens) * 2 * D);
+  {
+    const auto kb = random_bf16_bits(0xE4, int64_t(tokens) * 2 * D, -4, 2);
+    const auto sb = random_bf16_bits(0xE5, int64_t(tokens) * 2 * D, -3, 2);
+    for (size_t i = 0; i < kvd.size(); ++i) {
+      kvd[i] = bf16_bits_to_float(kb[i]);
+      scd[i] = bf16_bits_to_float(sb[i]);
+    }
+  }
+  std::vector<float> states(2 * 16 * 2 * D, 0.0f);
+  std::copy(tail0.begin(), tail0.end(), states.begin());  // request A's state = the prefill's
+  for (size_t i = 16 * 2 * D + 8 * 2 * D; i < 2 * 16 * 2 * D; ++i) states[i] = -INFINITY;  // request B fresh
+  DevBuf dkvd = upload(kvd), dscd = upload(scd), dri = upload(req_ids), dpos = upload(pos), dsp = upload(spans),
+      dst = upload(states), dlat(size_t(tokens) * D * 2), dent(size_t(tokens) * 8),
+      dsnap(size_t(tokens) * 16 * 2 * D * 4);
+  DGPP_CUDA_OK(cudaMemset(dsnap.p, 0x7F, dsnap.bytes));
+  dgpp::csa2_compress4_decode(static_cast<const float*>(dkvd.p), static_cast<const float*>(dscd.p),
+                              static_cast<const int32_t*>(dri.p), static_cast<const int64_t*>(dpos.p),
+                              static_cast<const int32_t*>(dsp.p), 2, D, static_cast<const float*>(dape.p), dw.p,
+                              eps, static_cast<float*>(dst.p), dlat.p, static_cast<int64_t*>(dent.p), tokens,
+                              static_cast<float*>(dsnap.p), 0);
+  sync();
+  const auto lat = download<uint16_t>(dlat, size_t(tokens) * D);
+  const auto ent = download<int64_t>(dent, tokens);
+  const auto snap = download<float>(dsnap, size_t(tokens) * 16 * 2 * D);
+  const auto fin = download<float>(dst, 2 * 16 * 2 * D);
+  const std::vector<int64_t> want_ent = {-1, 2, -1, -1, -1, 3, -1, -1, -1, -1, -1, 25, -1, -1, -1, 26};
+  require(ent == want_ent, "the entry ids");
+
+  // The oracle: A steps from the prefill's boundary state, B from zero.
+  RefC4State refA(D), refB(D);
+  refA.from_tail(tail0.data(), D);
+  std::vector<std::vector<uint16_t>> oracle(tokens);
+  for (int t = 0; t < tokens; ++t) {
+    auto& m = (req_ids[t] == 0) ? refA : refB;
+    oracle[t] = m.step(&kvd[size_t(t) * 2 * D], &scd[size_t(t) * 2 * D], ape.data(), pos[t], D, norm_w.data(), eps);
+  }
+  for (const int t : {1, 5, 11, 15}) {
+    const std::vector<uint16_t> g(lat.begin() + size_t(t) * D, lat.begin() + (size_t(t) + 1) * D);
+    require_bf16("decode window " + std::to_string(pos[t]), compare_bf16(g, oracle[t], 2), 1e-3, 0.005);
+  }
+  for (const int t : {0, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14})
+    for (int c = 0; c < D; ++c) require(lat[size_t(t) * D + c] == 0, "a non-entry row's latent is zero");
+
+  // The snapshots and the final states are the machine's (bitwise).
+  RefC4State oa(D), ob(D);
+  oa.from_tail(tail0.data(), D);
+  for (int t = 0; t < tokens; ++t) {
+    const bool isA = req_ids[t] == 0;
+    auto& m = isA ? oa : ob;
+    m.step(&kvd[size_t(t) * 2 * D], &scd[size_t(t) * 2 * D], ape.data(), pos[t], D, norm_w.data(), eps);
+    if (t < tokens - 1 && t != 7) {  // no snapshot on a request's last row
+      for (int i = 0; i < 8; ++i)
+        for (int c = 0; c < 2 * D; ++c) {
+          require(snap[(size_t(t) * 16 + i) * 2 * D + c] == m.kv[i][size_t(c)], "the snapshot's kv slot " + std::to_string(c));
+          require(snap[(size_t(t) * 16 + 8 + i) * 2 * D + c] == m.sc[i][size_t(c)], "the snapshot's score slot " + std::to_string(c));
+        }
+    }
+  }
+  for (int i = 0; i < 8; ++i)
+    for (int c = 0; c < 2 * D; ++c) {
+      require(fin[size_t(i) * 2 * D + c] == oa.kv[i][size_t(c)], "the final state's kv slot " + std::to_string(c));
+      require(fin[8 * 2 * D + size_t(i) * 2 * D + c] == oa.sc[i][size_t(c)], "the final state's score slot " + std::to_string(c));
+      require(fin[16 * 2 * D + size_t(i) * 2 * D + c] == ob.kv[i][size_t(c)], "the final state B's kv slot " + std::to_string(c));
+      require(fin[24 * 2 * D + size_t(i) * 2 * D + c] == ob.sc[i][size_t(c)], "the final state B's score slot " + std::to_string(c));
+    }
+
+  // Rollback: restore request A's snapshot after row 1 (the position-11
+  // completion) and replay rows 2..7 — the latents must come back bitwise.
+  {
+    std::vector<float> st2 = fin;
+    std::copy(snap.begin() + 1 * 16 * 2 * D, snap.begin() + 2 * 16 * 2 * D, st2.begin());
+    const std::vector<int32_t> sp2 = {2, 6, 8, 8};
+    DevBuf dst2 = upload(st2), dsp2 = upload(sp2), dl2(size_t(tokens) * D * 2), de2(size_t(tokens) * 8);
+    dgpp::csa2_compress4_decode(static_cast<const float*>(dkvd.p), static_cast<const float*>(dscd.p),
+                                static_cast<const int32_t*>(dri.p), static_cast<const int64_t*>(dpos.p),
+                                static_cast<const int32_t*>(dsp2.p), 2, D, static_cast<const float*>(dape.p), dw.p,
+                                eps, static_cast<float*>(dst2.p), dl2.p, static_cast<int64_t*>(de2.p), tokens,
+                                nullptr, 0);
+    sync();
+    const auto l2 = download<uint16_t>(dl2, size_t(tokens) * D);
+    require(std::equal(l2.begin() + 2 * D, l2.begin() + 8 * D, lat.begin() + 2 * D),
+            "the replay after a rollback is bitwise");
+  }
+}
+
+DGPP_TEST(csa2_0731_compress128_prefill_and_decode) {
+  const int D = 512;
+  const float eps = 1e-20f;
+  // Prefill: 200 tokens, one complete window + a 72-row remainder (the
+  // boundary state into the tail).
+  const int T = 200;
+  std::vector<float> kv(size_t(T) * D), score(size_t(T) * D), ape(128 * D);
+  {
+    const auto kb = random_bf16_bits(0xF0, int64_t(T) * D, -4, 2);
+    const auto sb = random_bf16_bits(0xF1, int64_t(T) * D, -3, 2);
+    const auto ab = random_bf16_bits(0xF2, int64_t(128 * D), -2, 1);
+    for (size_t i = 0; i < kv.size(); ++i) {
+      kv[i] = bf16_bits_to_float(kb[i]);
+      score[i] = bf16_bits_to_float(sb[i]);
+    }
+    for (size_t i = 0; i < ape.size(); ++i) ape[i] = bf16_bits_to_float(ab[i]);
+  }
+  const auto norm_w = random_bf16_bits(0xF3, D, -2, 1);
+  std::vector<float> tail(256 * D, -1.0f);
+  DevBuf dkv = upload(kv), dsc = upload(score), dap = upload(ape), dw = upload(norm_w), dlat(D * 2), dta = upload(tail);
+  dgpp::csa2_compress128_prefill(static_cast<const float*>(dkv.p), static_cast<const float*>(dsc.p), T,
+                                 static_cast<const float*>(dap.p), dw.p, eps, dlat.p, static_cast<float*>(dta.p), 0);
+  sync();
+  const auto lat = download<uint16_t>(dlat, D);
+  std::vector<uint16_t> want(D);
+  {
+    std::vector<std::vector<float>> k(128, std::vector<float>(D)), s(128, std::vector<float>(D));
+    for (int w = 0; w < T / 128; ++w) {
+      for (int j = 0; j < 128; ++j)
+        for (int c = 0; c < D; ++c) {
+          k[size_t(j)][size_t(c)] = kv[size_t(w * 128 + j) * D + c];
+          s[size_t(j)][size_t(c)] = score[size_t(w * 128 + j) * D + c] + ape[size_t(j) * D + c];
+        }
+      const float* kp[128], *sp[128];
+      for (int j = 0; j < 128; ++j) {
+        kp[j] = k[size_t(j)].data();
+        sp[j] = s[size_t(j)].data();
+      }
+      ref_pool_items(128, D, kp, sp, norm_w.data(), eps, want.data() + size_t(w) * D);
+    }
+  }
+  require_bf16("the 128-rows windows", compare_bf16(lat, want, 2), 1e-3, 0.005);
+  const auto tailg = download<float>(dta, 256 * D);
+  {
+    const int R = T % 128;
+    RefC128State st;
+    for (int i = 0; i < R; ++i)
+      st.step(&kv[size_t(128 + i) * D], &score[size_t(128 + i) * D], ape.data(), 128 + i, norm_w.data(), eps);
+    for (int i = 0; i < 128; ++i)
+      for (int c = 0; c < D; ++c) {
+        if (tailg[size_t(i) * D + c] != st.kv[i][size_t(c)])
+          throw std::runtime_error("tail kv slot " + std::to_string(i) + " c " + std::to_string(c) +
+                                   " got " + std::to_string(tailg[size_t(i) * D + c]) + " want " +
+                                   std::to_string(st.kv[i][size_t(c)]));
+        if (tailg[128 * D + size_t(i) * D + c] != st.sc[i][size_t(c)])
+          throw std::runtime_error("tail sc slot " + std::to_string(i) + " c " + std::to_string(c) +
+                                   " got " + std::to_string(tailg[128 * D + size_t(i) * D + c]) +
+                                   " want " + std::to_string(st.sc[i][size_t(c)]));
+      }
+  }
+
+  // Decode: request A at 508..511 (the 511 completion, entry 4), request B
+  // at 100..103 (no completion).
+  const int tokens = 8;
+  const std::vector<int32_t> req_ids = {0, 0, 0, 0, 1, 1, 1, 1};
+  const std::vector<int64_t> pos = {508, 509, 510, 511, 100, 101, 102, 103};
+  const std::vector<int32_t> spans = {0, 4, 4, 4};
+  std::vector<float> kvd(size_t(tokens) * D), scd(size_t(tokens) * D);
+  {
+    const auto kb = random_bf16_bits(0xF4, int64_t(tokens) * D, -4, 2);
+    const auto sb = random_bf16_bits(0xF5, int64_t(tokens) * D, -3, 2);
+    for (size_t i = 0; i < kvd.size(); ++i) {
+      kvd[i] = bf16_bits_to_float(kb[i]);
+      scd[i] = bf16_bits_to_float(sb[i]);
+    }
+  }
+  std::vector<float> states(2 * 256 * D, 0.0f);
+  DevBuf dkvd = upload(kvd), dscd = upload(scd), dri = upload(req_ids), dpos = upload(pos), dsp = upload(spans),
+      dst = upload(states), dlatd(size_t(tokens) * D * 2), dent(size_t(tokens) * 8), dsnap(size_t(tokens) * 256 * D * 4);
+  DGPP_CUDA_OK(cudaMemset(dsnap.p, 0x7F, dsnap.bytes));
+  dgpp::csa2_compress128_decode(static_cast<const float*>(dkvd.p), static_cast<const float*>(dscd.p),
+                                static_cast<const int32_t*>(dri.p), static_cast<const int64_t*>(dpos.p),
+                                static_cast<const int32_t*>(dsp.p), 2, static_cast<const float*>(dap.p), dw.p,
+                                eps, static_cast<float*>(dst.p), dlatd.p, static_cast<int64_t*>(dent.p), tokens,
+                                static_cast<float*>(dsnap.p), 0);
+  sync();
+  const auto latd = download<uint16_t>(dlatd, size_t(tokens) * D);
+  const auto ent = download<int64_t>(dent, tokens);
+  const auto snap = download<float>(dsnap, size_t(tokens) * 256 * D);
+  const auto fin = download<float>(dst, 2 * 256 * D);
+  const std::vector<int64_t> want_ent = {-1, -1, -1, 3, -1, -1, -1, -1};
+  require(ent == want_ent, "the entry ids");
+  RefC128State oa, ob;
+  std::vector<uint16_t> pooled;
+  for (int t = 0; t < tokens; ++t) {
+    auto& m = (req_ids[t] == 0) ? oa : ob;
+    pooled = m.step(&kvd[size_t(t) * D], &scd[size_t(t) * D], ape.data(), pos[t], norm_w.data(), eps);
+    const std::vector<uint16_t> g(latd.begin() + size_t(t) * D, latd.begin() + (size_t(t) + 1) * D);
+    if (pooled.empty())
+      for (int c = 0; c < D; ++c) require(g[size_t(c)] == 0, "a non-entry row's latent is zero");
+    else require_bf16("the completion window", compare_bf16(g, pooled, 2), 1e-3, 0.005);
+    if (t < tokens - 1 && t != 3) {  // no snapshot on a request's last row
+      for (int i = 0; i < 128; ++i)
+        for (int c = 0; c < D; ++c) {
+          require(snap[(size_t(t) * 256 + i) * D + c] == m.kv[i][size_t(c)], "the snapshot's kv slot " + std::to_string(i));
+          require(snap[(size_t(t) * 256 + 128 + i) * D + c] == m.sc[i][size_t(c)], "the snapshot's score slot " + std::to_string(i));
+        }
+    }
+  }
+  for (int i = 0; i < 128; ++i)
+    for (int c = 0; c < D; ++c) {
+      require(fin[size_t(i) * D + c] == oa.kv[i][size_t(c)], "the final state's kv slot " + std::to_string(i));
+      require(fin[128 * D + size_t(i) * D + c] == oa.sc[i][size_t(c)], "the final state's score slot " + std::to_string(i));
+      require(fin[256 * D + size_t(i) * D + c] == ob.kv[i][size_t(c)], "the final state B's kv slot " + std::to_string(i));
+      require(fin[384 * D + size_t(i) * D + c] == ob.sc[i][size_t(c)], "the final state B's score slot " + std::to_string(i));
+    }
+}
+
+
+DGPP_TEST(csa2_0731_q_renorm_matches_the_reference) {
+  // The 0731 per-head renorm: mean(q^2) fp32 -> bf16, + eps in bf16, rsqrt
+  // in bf16, the element product one bf16 rounding.
+  const int rows = 5, heads = 7;
+  const float eps = 1e-20f;
+  std::vector<uint16_t> x(size_t(rows) * heads * 512);
+  {
+    const auto b = random_bf16_bits(0x5A, int64_t(rows) * heads * 512, -3, 2);
+    x.assign(b.begin(), b.end());
+  }
+  DevBuf dx = upload(x);
+  dgpp::csa2_q_renorm_bf16(static_cast<uint16_t*>(dx.p), rows, heads, eps, 0);
+  sync();
+  const auto got = download<uint16_t>(dx, x.size());
+  for (int r = 0; r < rows; ++r)
+    for (int h = 0; h < heads; ++h) {
+      float ss = 0.0f;
+      for (int i = 0; i < 512; ++i) {
+        const float v = bf16_bits_to_float(x[(size_t(r) * heads + h) * 512 + size_t(i)]);
+        ss = std::fmaf(v, v, ss);
+      }
+      const float m = bf16_bits_to_float(float_to_bf16_bits(ss / 512.0f));
+      const float t = bf16_bits_to_float(float_to_bf16_bits(m + eps));
+      const float rs = bf16_bits_to_float(float_to_bf16_bits(1.0f / std::sqrt(t)));
+      for (int i = 0; i < 512; ++i) {
+        const size_t at = (size_t(r) * heads + h) * 512 + size_t(i);
+        const float want = bf16_bits_to_float(float_to_bf16_bits(
+            bf16_bits_to_float(x[at]) * rs));
+        if (got[at] != float_to_bf16_bits(want)) {
+          throw std::runtime_error("renorm element " + std::to_string(at) + " got " + std::to_string(bf16_bits_to_float(got[at])) +
+                                   " want " + std::to_string(want) + " rs " + std::to_string(rs));
+        }
+      }
+    }
+}
+
+
+DGPP_TEST(csa2_sequential_topk_lists_every_visible_entry) {
+  // The C128A selection: every visible entry; a row before the first
+  // complete block has none (a negative entry position).
+  const int rows = 5, col = 4;
+  const std::vector<int64_t> pos_sel = {-1, -1, 0, 5, 3};
+  auto dpos = upload<int64_t>(pos_sel);
+  DevBuf dtopk(size_t(rows) * col * 4), dcounts(rows * 4);
+  dgpp::csa2_sequential_topk(static_cast<const int64_t*>(dpos.p), static_cast<int32_t*>(dtopk.p),
+                             static_cast<int32_t*>(dcounts.p), rows, col, 0);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  const auto got_topk = download<int32_t>(dtopk, size_t(rows) * col);
+  const auto got_counts = download<int32_t>(dcounts, rows);
+  require(got_counts == std::vector<int32_t>{0, 0, 1, 4, 4}, "sequential counts");
+  const std::vector<int32_t> want_topk = {
+      -1, -1, -1, -1, -1, -1, -1, -1, 0, -1, -1, -1, 0, 1, 2, 3, 0, 1, 2, 3,
+  };
+  require(got_topk == want_topk, "sequential topk");
 }
 
 int main() { return dgpp::test::run_all(); }
