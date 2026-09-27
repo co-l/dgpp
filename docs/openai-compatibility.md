@@ -43,6 +43,28 @@ values return HTTP 400 naming `ignore_eos`. When `true`, sampled EOS tokens
 still count toward usage but do not end generation. The token limit, stop
 strings, cancellation and resource limits still apply.
 
+## Streaming keep-alives (DGPP extension)
+
+Both `POST /v1/chat/completions` and `POST /v1/completions` send SSE comments
+while an accepted stream waits in the queue, prefills or pauses between output
+chunks. The comment payload is `: keep-alive\n\n`, carried in the normal
+chunked HTTP response. Comments never enter the completion content, token
+usage, finish reason or `[DONE]` sequence. Multiple chat choices share one
+keep-alive timer, and all comments stop when the stream ends or disconnects.
+
+The server default is 30 seconds of silence. `http.sse_ping_interval` in the
+cluster JSON changes it; `--sse-ping-interval` overrides JSON. A request with
+`"stream": true` may set top-level `"sse_ping_interval": 15` to override either,
+or `-1` to disable pings. Values must be integers in 1–2147483647 or `-1`;
+invalid values, including explicit null, and use without `stream: true`
+return HTTP 400 naming `sse_ping_interval` before admission.
+
+SSE parsers ignore comment lines. Network read timeouts can be kept alive by
+the bytes even if the parser hides them; an application timeout waiting for a
+completion chunk still needs its own policy. Pings do not extend server
+engine or shutdown deadlines. Optional `return_progress` / `prompt_progress`
+events are not implemented by this extension.
+
 ## File inputs
 
 User messages accept `{ "type": "file", "file": { "filename": "report.pdf",
@@ -206,6 +228,11 @@ still return explicit errors. Unknown fields inside `chat_template_kwargs`
 remain errors because that object explicitly requests prompt changes.
 
 Streaming uses `chat.completion.chunk` events followed by `[DONE]`.
+Each choice's assistant-role preamble arrives immediately before its first
+output, or before its terminal chunk if the completion is empty. The legacy
+route likewise delays its initial empty text chunk. HTTP headers and SSE
+keep-alive comments may arrive while the request is queued or prefilling;
+they are not completion events.
 With `stream_options.include_usage: true`, ordinary chunks carry `usage: null`
 and one final chunk carries aggregate usage with `choices: []`. Interrupted
 streams may have no final usage chunk. Content logprobs may follow content in

@@ -32,6 +32,17 @@ revisions recorded with them.
 
 ## Serving support
 
+Completion streams delay their preamble until output is available, with a
+terminal fallback for empty responses. Host regressions cover both endpoints,
+multiple choices, UTF-8 tails and keep-alive compatibility; see the
+[PR #57 record](benchmarks/results/2026-09-26-lazy-sse-preamble.md).
+
+Issue #49 adds SSE keep-alive comments during admission, prefill and gaps in
+stream output. The interval defaults to 30 seconds and is configurable through
+cluster JSON, CLI and each streaming request; `-1` disables it. Optional prompt
+progress events remain separate work. See the
+[implementation and validation record](benchmarks/results/2026-09-26-sse-keep-alive.md).
+
 The engine watchdog observes successful collective completions inside model
 chunks, preventing a false timeout while tensor-parallel prefill is still
 advancing. Controlled TP2 regression and genuine-stall tests pass; a full
@@ -64,9 +75,10 @@ startup checks whether the selected model and request capacity fit.
 
 The text API supports streaming, tools, supported JSON schemas, reasoning
 output, sampling controls, logprobs, stop strings and multiple chat choices.
-Unsupported fields are rejected by name. GLM-5.3-Flash also supports PNG/JPEG
-image inputs with a native vision encoder, journaled RGB pixels, streaming
-and MTP. Image requests bypass prefix caching and grouped prefill; see
+Unsupported fields are rejected by name. GLM-5.3-Flash and Qwen3.8-Flash-Next
+support PNG/JPEG/WebP image inputs with native vision encoders, journaled RGB
+pixels, streaming and MTP. Image requests support prefix caching and
+resumable prefill, and bypass grouped prefill; see
 [image inputs](docs/vision.md). Audio and video inputs are unsupported.
 Vision arithmetic now follows the CUDA BF16 eager reference, with fixed
 full-encoder and isolated-operation gates. The

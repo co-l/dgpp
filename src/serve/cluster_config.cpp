@@ -130,7 +130,14 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
             fail(what, "'http.max_body_bytes' must be an integer (positive 64-bit byte count)");
           c.http_max_body_bytes = integer(p.value, "http.max_body_bytes", what, 1,
                                           std::numeric_limits<int64_t>::max());
-        } else fail(what, "unknown key 'http." + p.key + "'");
+        } else if (p.key == "sse_ping_interval") {
+          if (p.value.kind() != Value::Kind::Int || !valid_sse_ping_interval(p.value.as_int()))
+            fail(what,
+                 "'http.sse_ping_interval' must be -1 (disabled) or an integer in [1, 2147483647] "
+                 "seconds");
+          c.sse_ping_interval = static_cast<int>(p.value.as_int());
+        } else
+          fail(what, "unknown key 'http." + p.key + "'");
       }
     } else if (k == "node_env") {
       if (!v.is_array()) fail(what, "'node_env' must be an array");

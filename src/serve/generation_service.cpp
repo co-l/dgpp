@@ -17,6 +17,7 @@
 
 #include "common/log.hpp"
 #include "serve/json_out.hpp"
+#include "serve/utf8.hpp"
 
 namespace dgpp::serve {
 
@@ -521,6 +522,9 @@ GenerationService::GenerationService(const ServiceConfig& cfg,
     throw std::invalid_argument("GenerationService: frontend required");
   if (cfg_.model_id.empty())
     throw std::invalid_argument("GenerationService: model_id required");
+  if (!valid_sse_ping_interval(cfg_.sse_ping_interval))
+    throw std::invalid_argument(
+        "GenerationService: sse_ping_interval must be -1 or positive seconds");
   meters_ = sched_.meters();
   prefix_stats_ = engine_->prefix_engine_stats();
   boundary_ids_ = frontend_->boundary_token_ids();
@@ -1702,6 +1706,14 @@ void GenerationService::handle(const HttpRequest& req,
     route_health(w);
     return;
   }
+  if (p == "/metrics/prometheus") {
+    if (req.method != "GET") {
+      respond_error(w, 405, "use GET for metrics", "invalid_request_error");
+      return;
+    }
+    route_metrics_prometheus(w);
+    return;
+  }
   if (p == "/metrics" || p == "/v1/metrics") {
     if (req.method != "GET") {
       respond_error(w, 405, "use GET for metrics", "invalid_request_error");
@@ -1826,6 +1838,26 @@ bool GenerationService::parse_ignore_eos(const minijson::Value& body, HttpRespon
   return true;
 }
 
+bool GenerationService::parse_sse_ping_interval(const minijson::Value& body, HttpResponseWriter& w,
+                                                bool stream, int* interval) {
+  *interval = cfg_.sse_ping_interval;
+  const auto* value = body.find("sse_ping_interval");
+  if (!value) return true;
+  if (value->kind() != minijson::Value::Kind::Int || !valid_sse_ping_interval(value->as_int())) {
+    respond_error(
+        w, 400, "sse_ping_interval must be -1 (disabled) or an integer in [1, 2147483647] seconds",
+        "invalid_request_error", "sse_ping_interval");
+    return false;
+  }
+  if (!stream) {
+    respond_error(w, 400, "sse_ping_interval requires stream: true", "invalid_request_error",
+                  "sse_ping_interval");
+    return false;
+  }
+  *interval = static_cast<int>(value->as_int());
+  return true;
+}
+
 bool GenerationService::parse_stream_options(const minijson::Value& body, HttpResponseWriter& w,
                                               bool stream, bool* usage, bool* obfuscation) {
   *usage = false;
@@ -1899,6 +1931,8 @@ void GenerationService::route_chat_completions(const HttpRequest& req,
   }
   bool include_usage = false, include_obfuscation = true;
   if (!parse_stream_options(body, w, stream, &include_usage, &include_obfuscation)) return;
+  int sse_ping_interval = cfg_.sse_ping_interval;
+  if (!parse_sse_ping_interval(body, w, stream, &sse_ping_interval)) return;
   // prefix_cache (ours, M7): false opts the request out of the prefix
   // cache — no attach, no snapshot of its state.
   bool prefix_cache = true;
@@ -2025,6 +2059,7 @@ void GenerationService::route_chat_completions(const HttpRequest& req,
   }
   const int64_t created = std::time(nullptr);
   auto group = std::make_shared<ChoiceGroup>();
+  group->sse_ping_interval = sse_ping_interval;
   group->n = n;
   group->choices.resize(static_cast<size_t>(n));
   const std::vector<int64_t> boundaries = prompt_boundaries(prompt);
@@ -2137,6 +2172,8 @@ void GenerationService::route_completions(const HttpRequest& req,
   }
   bool include_usage = false, include_obfuscation = false;
   if (!parse_stream_options(body, w, stream, &include_usage, &include_obfuscation)) return;
+  int sse_ping_interval = cfg_.sse_ping_interval;
+  if (!parse_sse_ping_interval(body, w, stream, &sse_ping_interval)) return;
   bool prefix_cache = true;
   if (const dgpp::minijson::Value* pcv = body.find("prefix_cache")) {
     if (!pcv->is_bool()) {
@@ -2213,6 +2250,7 @@ void GenerationService::route_completions(const HttpRequest& req,
   }
   record->sched_id = record->id;
   record->group = std::make_shared<ChoiceGroup>();
+  record->group->sse_ping_interval = sse_ping_interval;
   record->group->choices.resize(1);
   record->call_seed = record->tag;
   record->stop.stops = stops;
@@ -2280,8 +2318,39 @@ Scheduler::Meters GenerationService::meters() const {
   return meters_;
 }
 
-void GenerationService::route_metrics(HttpResponseWriter& w) {
+// GET /metrics/prometheus (Prometheus text exposition for spec-decode
+// counters; tool-eval-bench scrapes these for acceptance rate / length)
+void GenerationService::route_metrics_prometheus(HttpResponseWriter& w) {
   Scheduler::Meters m;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    m = meters_;
+  }
+  uint64_t drafted = 0, accepted = 0;
+  for (int p = 0; p < m.mtp.depth && p < 8; ++p) {
+    drafted += m.mtp.attempts[p];
+    accepted += m.mtp.accepts[p];
+  }
+  std::string out =
+      "# HELP spec_decode_num_draft_tokens_total Cumulative MTP draft tokens verified.\n"
+      "# TYPE spec_decode_num_draft_tokens_total counter\n"
+      "spec_decode_num_draft_tokens_total ";
+  out.append(std::to_string(drafted));
+  out.append(
+      "\n# HELP spec_decode_num_accepted_tokens_total Cumulative accepted draft tokens.\n"
+      "# TYPE spec_decode_num_accepted_tokens_total counter\n"
+      "spec_decode_num_accepted_tokens_total ");
+  out.append(std::to_string(accepted));
+  out.append(
+      "\n# HELP spec_decode_num_drafts_total Cumulative verification rounds.\n"
+      "# TYPE spec_decode_num_drafts_total counter\n"
+      "spec_decode_num_drafts_total ");
+  out.append(std::to_string(m.mtp.attempts[0]));
+  out.push_back('\n');
+  w.respond(200, "text/plain; version=0.0.4", std::move(out));
+}
+
+void GenerationService::route_metrics(HttpResponseWriter& w) {  Scheduler::Meters m;
   Stats st;
   const auto prefills = engine_->prefill_monitor()->snapshot();
   dgpp::sched::SchedulerEngine::PrefixEngineStats pe;
@@ -2814,10 +2883,6 @@ void append_bytes_array(std::string* out, const std::string& s) {
 
 }  // namespace
 
-namespace {
-void sanitize_utf8(std::string* text);  // the delta streams' UTF-8 discipline, below
-}  // namespace
-
 std::string GenerationService::logprobs_content(const StreamRecord& r,
                                                 size_t from, size_t to,
                                                 bool unreported_only) const {
@@ -2892,12 +2957,16 @@ std::string GenerationService::legacy_logprobs(const StreamRecord& r, size_t fro
       offsets.push_back(',');
     }
     first = false;
-    append_json_string(&tokens, tok);
+    std::string shown = tok;
+    sanitize_utf8(&shown);
+    append_json_string(&tokens, shown);
     append_json_float(&lps, r.lps[i].logprob);
     tops.push_back('{');
     for (size_t j = 0; j < r.lps[i].top_logprobs.size(); ++j) {
       if (j) tops.push_back(',');
-      append_json_string(&tops, frontend_->decode_ids({r.lps[i].top_logprobs[j].first}));
+      shown = frontend_->decode_ids({r.lps[i].top_logprobs[j].first});
+      sanitize_utf8(&shown);
+      append_json_string(&tops, shown);
       tops.push_back(':');
       append_json_float(&tops, r.lps[i].top_logprobs[j].second);
     }
@@ -3002,6 +3071,14 @@ void GenerationService::pump_file_work() {
 void GenerationService::idle() { pump_file_work(); pump_records(); }
 
 void GenerationService::write_stream_event(StreamRecord& r, std::string event, bool usage) {
+  // Delay the preamble until an actual completion chunk is ready. Empty
+  // completions still need it before their terminal chunk, and UTF-8 tails
+  // can produce the first output only when the stream is finishing.
+  if (!usage && !r.first_chunk_sent) {
+    r.first_chunk_sent = true;
+    write_stream_event(r, r.chat ? chat_chunk_first(r.id, r.created_unix, r.model, r.choice)
+                                 : text_chunk_first(r.id, r.created_unix, r.model));
+  }
   event.pop_back();  // every caller supplies a complete completion JSON object
   if (r.include_usage && !usage) event.append(",\"usage\":null");
   if (r.report_service_tier) event.append(",\"service_tier\":\"default\"");
@@ -3022,77 +3099,6 @@ void GenerationService::write_stream_event(StreamRecord& r, std::string event, b
   r.writer->write_event(event);
 }
 
-// ---------------------------------------------------------------------------
-// UTF-8 discipline for the delta streams (the soak's find, 2026-09-05): a
-// token's decoded bytes can end inside a multi-byte character, and a JSON
-// text that is not UTF-8 breaks a strict client (Python's json.loads on
-// the payload bytes raised, and the soak's chat workers died on the first
-// accented name). carry_utf8 prepends the field's held bytes, holds back an
-// incomplete trailing sequence for the next delta, and replaces invalid
-// bytes with U+FFFD; finish_utf8 renders what is still held at the end.
-// ---------------------------------------------------------------------------
-namespace {
-
-size_t utf8_sequence_length(unsigned char b) {
-  if (b < 0x80) return 1;
-  if ((b & 0xE0) == 0xC0) return 2;
-  if ((b & 0xF0) == 0xE0) return 3;
-  if ((b & 0xF8) == 0xF0) return 4;
-  return 0;  // a stray continuation or an invalid lead byte
-}
-
-constexpr const char* kReplacement = "\xEF\xBF\xBD";  // U+FFFD
-
-void carry_utf8(std::string* text, std::string* carry) {
-  if (!carry->empty()) {
-    text->insert(0, *carry);
-    carry->clear();
-  }
-  std::string out;
-  out.reserve(text->size());
-  const size_t n = text->size();
-  size_t i = 0;
-  while (i < n) {
-    const unsigned char b = static_cast<unsigned char>((*text)[i]);
-    const size_t len = utf8_sequence_length(b);
-    if (len == 0) {
-      out.append(kReplacement);
-      ++i;
-      continue;
-    }
-    bool continuation_ok = true;
-    const size_t have = std::min(len, n - i);
-    for (size_t k = 1; k < have; ++k)
-      if ((static_cast<unsigned char>((*text)[i + k]) & 0xC0) != 0x80) continuation_ok = false;
-    if (!continuation_ok) {
-      out.append(kReplacement);
-      ++i;
-      continue;
-    }
-    if (have < len) {  // incomplete at the end: the next delta completes it
-      carry->assign(*text, i, n - i);
-      break;
-    }
-    out.append(*text, i, len);
-    i += len;
-  }
-  text->swap(out);
-}
-
-std::string finish_utf8(std::string* carry) {
-  if (carry->empty()) return {};
-  carry->clear();
-  return kReplacement;  // an incomplete character at the very end
-}
-
-void sanitize_utf8(std::string* text) {
-  std::string carry;
-  carry_utf8(text, &carry);
-  text->append(finish_utf8(&carry));
-}
-
-}  // namespace
-
 void GenerationService::flush_chat_stream(StreamRecord& r) {
   // Take the unflushed events (and, when a chunk will carry them, the
   // logprobs entries since the last flush) under the lock; format and
@@ -3103,11 +3109,6 @@ void GenerationService::flush_chat_stream(StreamRecord& r) {
     std::lock_guard<std::mutex> lock(mutex_);
     events.swap(r.pending);
     lp_json = take_content_logprobs(r);
-  }
-  if (!r.first_chunk_sent) {
-    r.first_chunk_sent = true;
-    write_stream_event(r,
-        chat_chunk_first(r.id, r.created_unix, r.model, r.choice));
   }
   for (const ParserEvent& ev : events) {
     std::string delta;
@@ -3146,9 +3147,10 @@ void GenerationService::flush_chat_stream(StreamRecord& r) {
   }
   // Logprobs follow the batch's visible deltas. An empty delta is valid;
   // provenance may arrive after a buffered parser block or stop tail.
-  if (!lp_json.empty())
+  if (!lp_json.empty()) {
     write_stream_event(r, chat_chunk_delta(r.id, r.created_unix, r.model,
                                            "{}", lp_json, r.choice));
+  }
 }
 
 // The stream's end: whatever a field still holds is an incomplete
@@ -3180,10 +3182,6 @@ void GenerationService::flush_legacy_stream(StreamRecord& r) {
       lp_json = legacy_logprobs(r, r.lps_flushed, r.lps.size());
       r.lps_flushed = r.lps.size();
     }
-  }
-  if (!r.first_chunk_sent) {
-    r.first_chunk_sent = true;
-    write_stream_event(r, text_chunk_first(r.id, r.created_unix, r.model));
   }
   carry_utf8(&delta, &r.carry_text);
   if (!delta.empty())
@@ -3398,6 +3396,14 @@ void GenerationService::pump_records() {
     // Records leave the list only here — done and (writer drained or
     // dead). A cancelled-but-still-generating record keeps its entry
     // until on_retire lands.
+  }
+
+  // Drain all choices and terminal events first. The writer owns one silence
+  // clock per connection; sibling choices cannot cause duplicate pings. This
+  // runs on the HTTP thread even while an engine pass is blocked in prefill.
+  for (auto& r : live) {
+    if (r->stream && r->writer != nullptr && !r->writer_dead && !r->group->ended)
+      r->writer->ping_if_idle(r->group->sse_ping_interval);
   }
 
   std::lock_guard<std::mutex> lock(mutex_);

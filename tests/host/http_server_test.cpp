@@ -143,6 +143,21 @@ class TestHandler : public HttpHandler {
       w.write_event("second");
       w.write_event("third");
       w.end_stream();
+    } else if (req.path == "/comments" && req.method == "GET") {
+      require(!w.write_comment("before"), "comments require an open stream");
+      w.begin_stream();
+      require(w.write_comment("keep-alive"), "comment queued");
+      bool rejected = false;
+      try {
+        w.write_comment("unsafe\ndata: injected");
+      } catch (const std::invalid_argument&) {
+        rejected = true;
+      }
+      require(rejected, "a comment cannot inject an SSE event");
+      w.write_event("[DONE]");
+      w.end_stream();
+      require(!w.write_comment("after"), "no comments after termination");
+      w.ping_if_idle(1);
     } else if (req.path == "/drip" && req.method == "GET") {
       w.begin_stream();
       drip_.push_back(&w);  // drained from idle(), like the service
@@ -416,6 +431,16 @@ DGPP_TEST(http_sseStream_chunkedEventsInOrderWithTerminal) {
   require(first < second && second < third, "events in order");
   require(terminal != std::string::npos && terminal > third,
           "terminal chunk after the last event");
+}
+
+DGPP_TEST(http_sseComments_chunkedFramingAndStreamBoundaries) {
+  ServerHandle sh;
+  Client client(sh.port());
+  client.send_all("GET /comments HTTP/1.1\r\nHost: t\r\n\r\n");
+  const auto response = client.read_available(100);
+  const auto body = response.substr(response.find("\r\n\r\n") + 4);
+  require(body == "e\r\n: keep-alive\n\n\r\ne\r\ndata: [DONE]\n\n\r\n0\r\n\r\n",
+          "comment and event have distinct SSE framing inside valid HTTP chunks: " + body);
 }
 
 DGPP_TEST(http_sseIdleDrain_eventsArriveAcrossLoopPasses) {

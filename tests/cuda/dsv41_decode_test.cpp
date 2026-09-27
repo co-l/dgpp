@@ -847,10 +847,35 @@ int run_fixture(const std::string& dir) {
         const RowCompare rc = compare_row(tc.rows[i].data(), to.rows[i].data(), V);
         worst = std::max(worst, rc.l2);
         if (!rc.top1_equal) (rc.near_tie ? soft : hard) += 1;
+        if (!rc.top1_equal && i < 4)
+          std::printf("[DBG] row %zu: l2 %.6g V=%d to_size=%zu tc_size=%zu to_argmax=%d tc_argmax=%d to_top=%.4g tc_top=%.4g\n",
+                      i, rc.l2, V, to.rows[i].size(), tc.rows[i].size(),
+                      argmax(to.rows[i].data(), static_cast<int>(to.rows[i].size())),
+                      argmax(tc.rows[i].data(), static_cast<int>(tc.rows[i].size())),
+                      to.rows[i][argmax(to.rows[i].data(), static_cast<int>(to.rows[i].size()))],
+                      tc.rows[i][argmax(tc.rows[i].data(), static_cast<int>(tc.rows[i].size()))]);
       }
       std::printf("[ .. ] decode after the bounded chunked prefill vs after the one-shot (24 rows, the same tokens): %d rows with equal "
                   "selections — worst relative l2 %.3g, top-1 hard %d near-tie %d; %d rows with a selection difference exempt\n",
                   kept, worst, hard, soft, differ);
+      if (hard > 0 && tc.states.size() > 1) {
+        const auto& pre = cb.debug_layer_pre();
+        for (size_t i = 1; i < tc.states.size(); ++i)
+          for (size_t l = 0; l < tc.states[i].size(); ++l)
+            for (float v : tc.states[i][l])
+              if (!std::isfinite(v)) {
+                std::printf("[DBG] first non-finite stream at decode row %zu layer %zu\n", i, l);
+                goto dbg_done;
+              }
+        for (size_t l = 0; l < pre.size(); ++l)
+          for (float v : pre[l])
+            if (!std::isfinite(v))
+              std::printf("[DBG] non-finite pre at layer %zu: %g\n", l, v);
+        const auto& rows = tc.rows[1];
+        std::printf("[DBG] tc row1 logits: first 4 = %.4g %.4g %.4g %.4g; last 4 = %.4g %.4g %.4g %.4g\n",
+                    rows[0], rows[1], rows[2], rows[3], rows[508], rows[509], rows[510], rows[511]);
+      }
+    dbg_done:;
       require(hard == 0, "bounded chunked decode: a top-1 mismatch beyond the near-tie margin");
       require(worst < 1e-1, "bounded chunked decode: relative l2 over the long-audit budget");
       require(kept >= 8, "bounded chunked decode: too few rows with equal selections");

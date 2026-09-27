@@ -84,8 +84,8 @@ its node.
 | `cluster_glm-5.3-flash_nvfp4-fp8_w4.example.json` | GLM-5.3-Flash NVFP4/FP8 hybrid, four nodes, MTP depth 1, bf16 latent cache, 768K context, an 8 GiB prefix arena |
 | `cluster_glm-5.3-flash_nvfp4-fp8_w2.example.json` | the same hybrid on two nodes, FP8 latent cache, 132K context on four request slots (160K with `--bf16-weights checkpoint --kv-capacity 163840`) |
 | `cluster_qwen-3.8-flash-next_fp8_w{2,4}.example.json` | Qwen FP8 with MTP depth 1, four or two nodes |
-| `cluster_qwen-3.8-flash-next_nvfp4_w{1,2}.example.json` | Qwen NVFP4 on one or two Sparks, MTP depth 1, the dense projections FP8 at load, a mapped n-gram table |
-| `cluster_qwen-3.8-flash-next_nvfp4-radixark_w{1,2}.example.json` | RadixArk's Qwen NVFP4 on one or two Sparks, identical engine configuration to the NVIDIA release |
+| `cluster_qwen-3.8-flash-next_nvfp4_w{1,2}.example.json` | Qwen NVFP4 on one or two Sparks, MTP depth 1, dense projections FP8 at load, mapped n-gram table; the single-Spark example selects a 256K shared pool and 4K busy/idle prefill |
+| `cluster_qwen-3.8-flash-next_nvfp4-radixark_w{1,2}.example.json` | RadixArk Qwen NVFP4 on one or two Sparks; the single-Spark recipe selects MTP depth 2, grow admission and 4K busy/idle prefill |
 | `cluster_glm-4.7_nvfp4_w4.example.json` | GLM-4.7 NVFP4, four nodes, MTP depth 1 |
 | `cluster_glm-5.3_int4-int8_w4.example.json` | the full GLM-5.3 (int4/int8 RTN), four nodes, MTP depth 1, eight request slots, 100K bf16 context (120K with `--bf16-weights checkpoint --kv-capacity 122880`), the embedding vocab-sharded |
 | `cluster_deepseek-v4.1-flash_mxfp4-fp8_w4.example.json` | DeepSeek-V4.1-Flash as shipped, four nodes, six request slots, DSpark depth 4 with the scheduled verify depth, the bounded prefill, 128K context |
@@ -235,6 +235,37 @@ two-node template) holds 262,144 tokens with a 2 GiB prefix arena, and one
 slot would reach about 534,000. Decode costs what the doubled per-rank weight read
 implies, near 1.75x the four-node pace; prefill costs about 1.45x
 (benchmarks.md §3 to §6).
+
+### Streaming keep-alives
+
+Streaming chat and text completions send the SSE comment `: keep-alive` followed
+by a blank line after 30 seconds without output. This covers the admission
+queue, prefill and pauses between output chunks. To change the interval, add
+this top-level section to the deployment JSON:
+
+```json
+{
+  "http": {
+    "sse_ping_interval": 15
+  }
+}
+```
+
+The value is an integer number of seconds in 1–2147483647; `-1` disables pings.
+Zero, fractional values, booleans and null are rejected. The binary flag
+`--sse-ping-interval 15` overrides JSON and is also accepted through the
+launcher's `--knobs`. Restart the server to change its default; the rank 0
+startup log reports the effective interval. A streaming request can override
+it with the top-level `sse_ping_interval` field, including `-1` to disable.
+Precedence is request, CLI, cluster JSON, then the 30-second default.
+
+Choose an interval shorter than the proxy or client's network idle timeout.
+Keep response buffering disabled along the path; the supplied nginx example
+uses `proxy_buffering off`. SSE parsers ignore comments, so they do not become
+content, usage or finish events. They can keep a transport read alive even
+when the application only receives parsed completion chunks, but do not reset
+an application's deadline waiting for such a chunk. Server engine and shutdown
+deadlines are unchanged. Non-streaming responses receive no pings.
 
 ### Large document and agent requests
 
@@ -426,10 +457,11 @@ requests. The default, -1, selects 256 tokens rounded down to the engine
 alignment and capped by its prefill limit (at least one aligned unit).
 An explicit zero preserves full-prompt admission within a scheduler pass;
 model and snapshot boundaries still split the work. Qwen retains its internal
-2,048-token limit and reports token progress after each completed chunk.
+4,096-token limit and reports token progress after each completed chunk.
 The resolved budget is logged at startup and carried in rank 0's warm record.
-The four-rank GLM-5.3-Flash deployment explicitly selects 256-token busy and
-2,048-token idle budgets.
+The single-Spark NVIDIA and RadixArk Qwen NVFP4 templates explicitly select
+4,096-token busy and idle budgets. The four-rank GLM-5.3-Flash deployment
+explicitly selects 256-token busy and 2,048-token idle budgets.
 A positive budget executes one aligned prefill chunk per tick, followed by
 a decode pass for active requests. Try 256 or 512 tokens; the budget must
 be a multiple of the snapshot alignment and fit the prefill scratch limit.
@@ -783,7 +815,12 @@ the prompts. Its artifacts land under `build-ci/fabric-runs/failure_drill_*`.
   cuBLASLt's algorithm, fp8 rows above the streaming tensor-core GEMM to 256
   rows. Qwen's 17-64-token decode walks keep BF16 products kernel-only regardless
   of this bound. A value of 256 restores the pre-2026-09-14 lowering (every decode row count
-  through the chunks) for an A/B, and `DGPP_SYNC_EAGER=1` makes an eager row — a prefill chunk,
+  through the chunks) for an A/B. `DGPP_BUS_ENGINE_IDLE_SLEEP_US=n` — a site
+  setting, forwarded to every rank — lets the bus engine thread sleep n µs
+  when the world is truly idle (no armed window, no outstanding collective,
+  and n µs of straight quiet), trading a bit of request-start latency for the
+  idle core the hot spin otherwise holds; unset keeps the legacy hot-spin
+  exactly. `DGPP_SYNC_EAGER=1` makes an eager row — a prefill chunk,
   the sampled fallback's verify and re-draft — synchronize after every
   stage and validate its selection list before the attention, naming the
   stage a fault came from; the fault hunt's knob, not for serving) — the one-hour soak had written 307,000

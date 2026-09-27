@@ -149,6 +149,7 @@ struct ServeKnobs {
   uint16_t http_port = 8080;
   std::string http_bind = "127.0.0.1";
   int64_t http_max_body_bytes = dgpp::serve::kDefaultHttpMaxBodyBytes;
+  int sse_ping_interval = dgpp::serve::kDefaultSsePingInterval;
   int max_connections = 64;
   int queue_limit = 64;
   int default_max_tokens = 256;
@@ -901,6 +902,7 @@ int serve_openai(dgpp::sched::SchedulerEngine* engine, int64_t vocab_size,
   scfg.model_id = model_display;
   scfg.default_max_tokens = k.default_max_tokens;
   scfg.queue_limit = k.queue_limit;
+  scfg.sse_ping_interval = k.sse_ping_interval;
   scfg.sampling_defaults = k.sampling_defaults;
   scfg.fixed_seed = k.fixed_seed;
   scfg.reasoning_in_content = k.reasoning_in_content;
@@ -1112,6 +1114,10 @@ int main(int argc, char** argv) {
       "    engine knob below; flags given after it override\n"
       "  [--port N (default 18080; rank 0 only)]\n"
       "  [--bind-host IPV4 (default 127.0.0.1; rank 0 only)]\n"
+      "  [--sse-ping-interval N (default 30 seconds; -1 disables; rank 0 only)]:\n"
+      "    SSE comments while a stream is silent; overrides http.sse_ping_interval\n"
+      "    in cluster JSON; request sse_ping_interval overrides the server setting.\n"
+      "    N must be -1 or an integer in [1, 2147483647]; engine deadlines are unchanged.\n"
       "  [--http-max-body-bytes N (default 268435456 = 256 MiB; rank 0 only)]:\n"
       "    positive serialized request-body byte limit, independent of KV tokens\n"
       "  [--kv-capacity TOKENS (default 8192)]: the KV pool per rank; a prompt\n"
@@ -1170,7 +1176,8 @@ int main(int argc, char** argv) {
       "    tokens, grows at tick top, and sheds the youngest request\n"
       "    (finish_reason length) when the pool runs out; every rank takes\n"
       "    rank 0's policy from the warm record\n"
-      "  [--prefill-budget-tokens N (default -1)]: automatic aligned chunks on supported graph engines; 0 "
+      "  [--prefill-budget-tokens N (default -1)]: automatic aligned chunks on supported graph "
+      "engines; 0 "
       "disables\n"
       "  [--prefill-idle-budget-tokens N (default 0)]: larger budget without active decode; 0 uses "
       "the busy budget\n"
@@ -1195,6 +1202,7 @@ int main(int argc, char** argv) {
   uint16_t port = 8080, fabric_port = 29970, journal_port = 29971;
   int64_t kv_capacity = 8192;
   int64_t http_max_body_bytes = dgpp::serve::kDefaultHttpMaxBodyBytes;
+  int sse_ping_interval = dgpp::serve::kDefaultSsePingInterval;
   std::string kv_dtype = "bf16";  // the latent cache's format
   std::string ngram_table = "resident";  // the Qwen n-gram table: resident | mmap
   std::string fp8_head = "gemv";
@@ -1266,6 +1274,7 @@ int main(int argc, char** argv) {
     port = static_cast<uint16_t>(c.http_port);
     http_bind = c.http_bind;
     http_max_body_bytes = c.http_max_body_bytes;
+    sse_ping_interval = c.sse_ping_interval;
     if (!c.node_env.empty()) {
       if (rank < 0 || rank >= world) {
         DGPP_LOG_ERROR("rank is outside configured nodes");
@@ -1336,15 +1345,25 @@ int main(int argc, char** argv) {
     else if (a == "--checkpoint-dir") ckpt = next();
     else if (a == "--port") port = static_cast<uint16_t>(std::stoi(next()));
     else if (a == "--bind-host") http_bind = next();
-    else if (a == "--http-max-body-bytes") {
+    else if (a == "--sse-ping-interval") {
+      const std::string value = next();
+      const auto [end, error] =
+          std::from_chars(value.data(), value.data() + value.size(), sse_ping_interval);
+      if (error != std::errc{} || end != value.data() + value.size() ||
+          !dgpp::serve::valid_sse_ping_interval(sse_ping_interval)) {
+        DGPP_LOG_ERROR(
+            "--sse-ping-interval must be -1 (disabled) or an integer in [1, 2147483647] seconds");
+        return 2;
+      }
+    } else if (a == "--http-max-body-bytes") {
       const std::string value = next();
       const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), http_max_body_bytes);
       if (error != std::errc{} || end != value.data() + value.size() || http_max_body_bytes < 1) {
         DGPP_LOG_ERROR("--http-max-body-bytes must be a positive integer byte count");
         return 2;
       }
-    }
-    else if (a == "--kv-capacity") kv_capacity = std::stoll(next());
+    } else if (a == "--kv-capacity")
+      kv_capacity = std::stoll(next());
     else if (a == "--kv-dtype") kv_dtype = next();
     else if (a == "--ngram-table") ngram_table = next();
     else if (a == "--dense-weights") dense_weights = next();
@@ -1606,6 +1625,7 @@ int main(int argc, char** argv) {
     std::fputs(kUsage, stderr);
     return 1;
   }
+  if (rank == 0) DGPP_LOG_INFO("serve: SSE ping interval {} s (-1 disables)", sse_ping_interval);
   if (kv_capacity < 1 || max_concurrency < 1 || queue_limit < 1 ||
       default_max_tokens < 1 || max_connections < 1) {
     DGPP_LOG_ERROR("all capacity knobs must be >= 1");
@@ -2059,6 +2079,7 @@ int main(int argc, char** argv) {
     knobs.http_port = port;
     knobs.http_bind = http_bind;
     knobs.http_max_body_bytes = http_max_body_bytes;
+    knobs.sse_ping_interval = sse_ping_interval;
     knobs.max_connections = max_connections;
     knobs.queue_limit = queue_limit;
     knobs.admission.mode = admission_mode == "grow"

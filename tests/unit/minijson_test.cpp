@@ -43,6 +43,62 @@ DGPP_TEST(minijson_escape_decode_produces_owned_storage) {
     throw std::runtime_error("escape decode mismatch");
 }
 
+DGPP_TEST(minijson_unicode_escaped_and_raw_strings_agree) {
+  const std::pair<const char*, const char*> cases[] = {
+      {R"(\u0041)", "A"}, {R"(\u00e9)", "\xC3\xA9"},
+      {R"(\u0800)", "\xE0\xA0\x80"}, {R"(\ud7ff)", "\xED\x9F\xBF"},
+      {R"(\ue000)", "\xEE\x80\x80"}, {R"(\uffff)", "\xEF\xBF\xBF"},
+      {R"(\ud83d\udced)", "📭"}, {R"(\uD83C\uDFE2)", "🏢"},
+      {R"(\ud840\udc00)", "𠀀"},
+      {R"(\ud800\udc00)", "\xF0\x90\x80\x80"},
+      {R"(\udbff\udfff)", "\xF4\x8F\xBF\xBF"},
+      {R"(\ud83d\udced\ud83c\udfe2)", "📭🏢"},
+  };
+  for (const auto& [escaped, utf8] : cases) {
+    const std::string input = "\"" + std::string(escaped) + "\"";
+    const std::string raw = "\"" + std::string(utf8) + "\"";
+    const auto decoded = parse(input);
+    if (decoded.root.as_string() != utf8 ||
+        decoded.root.as_string() != parse(raw).root.as_string())
+      throw std::runtime_error("escaped/raw mismatch: " + input);
+    const std::string object = "{\"" + std::string(escaped) + "\":\"ok\"}";
+    if (parse(object).root.at(utf8).as_string() != "ok")
+      throw std::runtime_error("escaped object key mismatch");
+  }
+}
+
+DGPP_TEST(minijson_unicode_unpaired_surrogates_preserve_following_text) {
+  const std::pair<const char*, const char*> cases[] = {
+      {R"("\ud800")", "�"}, {R"("\udbff")", "�"},
+      {R"("\udc00")", "�"}, {R"("\udfff")", "�"},
+      {R"("\ud800x")", "�x"}, {R"("\ud800\u0041")", "�A"},
+      {R"("\ud800\n")", "�\n"}, {R"("\ud800\ud800")", "��"},
+      {R"("\udced\ud83d")", "��"},
+      {R"("\ud800\ud83d\udced")", "�📭"},
+      {R"("\udc00\ud83d\udced")", "�📭"},
+      {R"("\\ud83d\\udced")", R"(\ud83d\udced)"},
+  };
+  for (const auto& [input, expected] : cases)
+    if (parse(input).root.as_string() != expected)
+      throw std::runtime_error(std::string("unpaired surrogate mismatch: ") + input);
+}
+
+DGPP_TEST(minijson_unicode_requires_four_hex_digits) {
+  for (const char* input : {R"("\u")", R"("\u123")", R"("\u12xz")",
+                            R"("\u000g")", R"("\ug000")", R"("\u+123")",
+                            R"("\u-123")", R"("\u 123")", R"("\u0x41")",
+                            R"("\ud800\u")", R"("\ud800\udc0")",
+                            R"("\ud800\udc0x")", R"("\ud800\u12xz")"}) {
+    bool threw = false;
+    try {
+      (void)parse(input);
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    if (!threw) throw std::runtime_error(std::string("accepted malformed escape: ") + input);
+  }
+}
+
 DGPP_TEST(minijson_trailing_whitespace_and_consumed_count) {
   auto r = parse("  [1, 2, 3]   \n\t ");
   if (!r.root.is_array() || r.root.items().size() != 3)

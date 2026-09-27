@@ -148,6 +148,25 @@ class SiteEnvTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "http.max_body_bytes"):
                     site_env.resolve_config(self.config, self.values())
 
+    def test_sse_ping_interval_survives_deployment_resolution(self):
+        cfg = json.loads(self.config.read_text())
+        for interval in (-1, 1, 30, 2147483647):
+            with self.subTest(interval=interval):
+                cfg["http"] = {"sse_ping_interval": interval}
+                self.config.write_text(json.dumps(cfg))
+                resolved = site_env.resolve_config(self.config, self.values())
+                self.assertEqual(resolved["http"]["sse_ping_interval"], interval)
+                self.assertEqual(resolved["http"]["port"], 18888)
+
+    def test_invalid_sse_ping_intervals_fail(self):
+        cfg = json.loads(self.config.read_text())
+        for interval in (0, -2, True, None, "30", 1.5, 1.0, 2147483648, 1e100):
+            with self.subTest(interval=interval):
+                cfg["http"] = {"sse_ping_interval": interval}
+                self.config.write_text(json.dumps(cfg))
+                with self.assertRaisesRegex(ValueError, "http.sse_ping_interval"):
+                    site_env.resolve_config(self.config, self.values())
+
     def test_empty_user_has_consistent_login_fallback(self):
         with patch.object(site_env.getpass, "getuser", return_value="fallback"):
             self.assertEqual(site_env.ssh_user(self.values(DGPP_SSH_USER="")), "fallback")

@@ -17,6 +17,40 @@ class ServeStartupTest(unittest.TestCase):
             raise unittest.SkipTest("set DGPP_SERVE_TEST_BINARY to the freshly built server")
         cls.binary = str(Path(binary).resolve(strict=True))
 
+    def test_sse_ping_interval_config_cli_precedence_and_help(self):
+        with tempfile.TemporaryDirectory(prefix="dgpp-sse-ping-") as directory:
+            config = Path(directory) / "cluster.json"
+            for settings, flags, expected in (
+                ({}, [], 30),
+                ({"sse_ping_interval": 7}, [], 7),
+                ({"sse_ping_interval": -1}, [], -1),
+                ({"sse_ping_interval": 7}, ["--sse-ping-interval", "-1"], -1),
+                ({"sse_ping_interval": -1}, ["--sse-ping-interval", "2"], 2),
+            ):
+                with self.subTest(settings=settings, flags=flags):
+                    config.write_text(json.dumps({"model": "unused/model", "nodes": ["127.0.0.1"],
+                                                  "http": settings}))
+                    result = subprocess.run(
+                        [self.binary, "--config", str(config), "--model", "", "--checkpoint-dir", directory,
+                         "--max-connections", "0", *flags],
+                        env={**os.environ, "CUDA_VISIBLE_DEVICES": "", "DGPP_LOG_LEVEL": "info"},
+                        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(f"SSE ping interval {expected} s", result.stdout)
+                    self.assertIn("all capacity knobs must be >= 1", result.stdout)
+        help_result = subprocess.run([self.binary, "--help"], text=True, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, timeout=10)
+        self.assertIn("--sse-ping-interval", help_result.stdout)
+        self.assertIn("http.sse_ping_interval", help_result.stdout)
+
+    def test_sse_ping_interval_invalid_cli_values(self):
+        for value in ("0", "-2", "true", "1.5", "1.0", "2147483648", "1x", ""):
+            with self.subTest(value=value):
+                result = subprocess.run([self.binary, "--sse-ping-interval", value], text=True,
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10)
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("--sse-ping-interval must be", result.stdout)
+
     def run_world(self, settings, head_modes=None):
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))

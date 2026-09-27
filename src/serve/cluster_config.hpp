@@ -36,6 +36,7 @@ struct ClusterConfig {
   int http_port = 18080;
   std::string http_bind = "127.0.0.1";
   int64_t http_max_body_bytes = kDefaultHttpMaxBodyBytes;
+  int sse_ping_interval = kDefaultSsePingInterval;
   // Local paths and device names may differ by rank; no credentials belong here.
   std::vector<std::map<std::string, std::string>> node_env;
   int fabric_port = 29970;

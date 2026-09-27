@@ -150,6 +150,25 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
   require(one.http_max_body_bytes == 256ll * 1024 * 1024, "HTTP body default supports large prefills");
 }
 
+DGPP_TEST(cluster_config_sse_ping_interval_defaults_overrides_and_validation) {
+  const auto defaults = dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t");
+  require(defaults.sse_ping_interval == 30, "streams ping after 30 seconds by default");
+  for (int interval : {-1, 1, 30, 2147483647}) {
+    const auto config = dgpp::serve::parse_cluster_config(
+        R"({"model":"m","nodes":["h"],"http":{"sse_ping_interval":)" + std::to_string(interval) +
+            "}}",
+        "t");
+    require(config.sse_ping_interval == interval, "explicit interval survives config parsing");
+  }
+  for (const char* value :
+       {"0", "-2", "true", "null", "\"30\"", "1.5", "1.0", "2147483648", "1e100"}) {
+    const auto error = refusal(
+        std::string(R"({"model":"m","nodes":["h"],"http":{"sse_ping_interval":)") + value + "}}");
+    require(error.find("http.sse_ping_interval") != std::string::npos,
+            "invalid interval rejected by name");
+  }
+}
+
 DGPP_TEST(cluster_config_world_size_one_runs_locally) {
   const auto c = dgpp::serve::parse_cluster_config(
       R"({"model":"m","world_size":1})", "t");

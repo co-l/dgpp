@@ -49,6 +49,8 @@ glm_gen.tokens.txt
 # glm_serve writes rank 0's op stream beside the binary; serve_run.sh moves it into the run log
 /serve_rank*.ops
 dist/
+# dgpp-cluster writes its deployment logs here.
+log/
 # The TP tests write this fixture into their working directory; never track a copy
 glm_tp_fixture/
 glm_tp_fixture_fp4/
@@ -57,6 +59,8 @@ qwen_engine_fixture/
 qwen_loader_fixture/
 glm_dsa_loader_fixture/
 mimo_loader_fixture/
+dsv41_loader_fixture/
+dsv41_model_fixture/
 mimo_loader_image_cache/
 glm_dsa_engine_fixture/
 glm_dsa_engine_fixture_wide_*/

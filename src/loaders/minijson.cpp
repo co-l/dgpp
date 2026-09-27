@@ -4,8 +4,18 @@ namespace dgpp::minijson {
 
 namespace {
 
-// Decodes JSON escape sequences into `out`. Assumes well-formed input
-// (validated before calling): every backslash has a known follower.
+unsigned decode_hex_quad(std::string_view raw, size_t pos) {
+  if (pos > raw.size() || raw.size() - pos < 4)
+    throw std::runtime_error("minijson: bad \\u");
+  unsigned cp = 0;
+  const char* end = raw.data() + pos + 4;
+  const auto res = std::from_chars(raw.data() + pos, end, cp, 16);
+  if (res.ec != std::errc() || res.ptr != end)
+    throw std::runtime_error("minijson: bad hex");
+  return cp;
+}
+
+// Decodes JSON escapes, replacing unpaired UTF-16 surrogates with U+FFFD.
 void decode_escapes(std::string_view raw, std::string& out) {
   out.clear();
   out.reserve(raw.size());
@@ -23,18 +33,37 @@ void decode_escapes(std::string_view raw, std::string& out) {
       case 'b': out.push_back('\b'); break;
       case 'f': out.push_back('\f'); break;
       case 'u': {
-        if (i + 4 >= raw.size()) throw std::runtime_error("minijson: bad \\u");
-        unsigned cp = 0;
-        auto res = std::from_chars(raw.data() + i + 1, raw.data() + i + 5, cp, 16);
-        if (res.ec != std::errc()) throw std::runtime_error("minijson: bad hex");
+        unsigned cp = decode_hex_quad(raw, i + 1);
         i += 4;
+        if (cp >= 0xD800 && cp <= 0xDBFF) {
+          // JSON represents supplementary characters as two UTF-16 escapes.
+          // Only consume the second escape when it completes this pair.
+          if (raw.size() - i > 2 && raw[i + 1] == '\\' && raw[i + 2] == 'u') {
+            const unsigned lo = decode_hex_quad(raw, i + 3);
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+              cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+              i += 6;
+            } else {
+              cp = 0xFFFD;
+            }
+          } else {
+            cp = 0xFFFD;
+          }
+        } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+          cp = 0xFFFD;
+        }
         if (cp < 0x80) {
           out.push_back(static_cast<char>(cp));
         } else if (cp < 0x800) {
           out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
           out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-        } else {
+        } else if (cp < 0x10000) {
           out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+          out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+          out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        } else {
+          out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+          out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
           out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
           out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
         }

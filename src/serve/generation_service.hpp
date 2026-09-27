@@ -165,6 +165,7 @@ struct ServiceConfig {
   std::string model_id;
   int default_max_tokens = 256;  // when the request omits max_tokens
   int queue_limit = 64;          // admission bound; beyond → 503
+  int sse_ping_interval = kDefaultSsePingInterval;  // seconds; -1 disables
   dgpp::sched::AdmissionPolicy admission;  // full-reserve unless told otherwise
   // The sampling defaults every omitted request field takes: the
   // checkpoint's generation_config.json with the process's overrides
@@ -355,6 +356,7 @@ class GenerationService : public HttpHandler,
   // one end sequence once every choice is done — the usage summed, the
   // one-shot's choices assembled by index.
   struct ChoiceGroup {
+    int sse_ping_interval = kDefaultSsePingInterval;
     int n = 1;
     int finished = 0;            // choices whose end sequence is written
     bool ended = false;          // the stream ended / the one-shot answered
@@ -449,10 +451,13 @@ class GenerationService : public HttpHandler,
   void route_models(const HttpRequest& req, HttpResponseWriter& w);
   void route_health(HttpResponseWriter& w) const;
   void route_metrics(HttpResponseWriter& w);
+  void route_metrics_prometheus(HttpResponseWriter& w);
   bool validate_chat_parameters(const minijson::Value& body, HttpResponseWriter& w);
   bool parse_max_tokens(const minijson::Value& body, HttpResponseWriter& w, int* steps, bool chat);
   // OpenAI's ignore_eos: generate to the token limit whatever is drawn.
   bool parse_ignore_eos(const minijson::Value& body, HttpResponseWriter& w, bool* ignore);
+  bool parse_sse_ping_interval(const minijson::Value& body, HttpResponseWriter& w, bool stream,
+                               int* interval);
   bool parse_stream_options(const minijson::Value& body, HttpResponseWriter& w,
                             bool stream, bool* usage, bool* obfuscation);
   void write_stream_event(StreamRecord& r, std::string event, bool usage = false);

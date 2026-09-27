@@ -28,6 +28,9 @@ SITE_KEYS = (
     # session-core families, kernels/gemm.hpp): every rank the same, or the
     # ranks' walks differ.
     "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD",
+    # The bus engine's idle-nap knob (src/net/bus_idle_policy.hpp): us to
+    # sleep when truly idle, trading request-start latency for idle power.
+    "DGPP_BUS_ENGINE_IDLE_SLEEP_US",
 )
 NODE_KEYS = ("DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES", "HF_HUB_CACHE", "DGPP_RESIDENT_CACHE_DIR",
     "DGPP_LOG_LEVEL", "DGPP_MLOCK",
@@ -35,6 +38,7 @@ NODE_KEYS = ("DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES", "HF_HUB_CACHE", "DGPP
     # with the same setting on every rank.
     "DGPP_L2_PREFETCH", "DGPP_L2_PREFETCH_MB", "DGPP_L2_PREFETCH_BOUNDARY", "DGPP_L2_PREFETCH_LAYER",
     "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD",
+    "DGPP_BUS_ENGINE_IDLE_SLEEP_US",
 )
 DEFAULTS = {
     "DGPP_HTTP_PORT": "18080", "DGPP_FABRIC_PORT": "29970",
@@ -171,8 +175,8 @@ def deployment(path):
     if not isinstance(paths, dict) or set(paths) - {"resident_cache"}:
         raise ValueError("deployment paths may only contain resident_cache; move site paths into .env")
     http = cfg.get("http", {})
-    if not isinstance(http, dict) or set(http) - {"bind_host", "port", "max_body_bytes"}:
-        raise ValueError("http may only contain bind_host, port and max_body_bytes")
+    if not isinstance(http, dict) or set(http) - {"bind_host", "port", "max_body_bytes", "sse_ping_interval"}:
+        raise ValueError("http may only contain bind_host, port, max_body_bytes and sse_ping_interval")
     if "bind_host" in http:
         http_bind({"DGPP_HTTP_BIND": http["bind_host"]})
     if "port" in http and (type(http["port"]) is not int or not 1 <= http["port"] <= 65535):
@@ -180,6 +184,10 @@ def deployment(path):
     if "max_body_bytes" in http and (type(http["max_body_bytes"]) is not int
                                    or not 1 <= http["max_body_bytes"] <= (1 << 63) - 1):
         raise ValueError("http.max_body_bytes must be a positive 64-bit integer byte count")
+    if "sse_ping_interval" in http:
+        interval = http["sse_ping_interval"]
+        if type(interval) is not int or not (interval == -1 or 1 <= interval <= 2147483647):
+            raise ValueError("http.sse_ping_interval must be -1 (disabled) or an integer in [1, 2147483647] seconds")
     return cfg
 
 

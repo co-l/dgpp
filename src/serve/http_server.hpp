@@ -69,6 +69,12 @@ class HttpResponseWriter {
   // Returns false once the client is gone (later events are dropped;
   // on_disconnect has already fired).
   bool write_event(std::string_view data);
+  // One SSE comment (no CR/LF in comment), invisible to event consumers.
+  bool write_comment(std::string_view comment);
+  // Called by the HTTP idle pass after draining events. The silence clock
+  // belongs to the connection, including when multiple choices share it.
+  // A non-positive interval disables pings; pending output suppresses them.
+  void ping_if_idle(int interval_s);
   // Ends the stream (the terminal chunk) and keeps the connection open
   // under keep-alive.
   void end_stream();
