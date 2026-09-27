@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""DeepSeek-V4.1-Flash independent reference (docs/deepseek_v41_flash_plan.md
-G4/G5): the release's OWN layer code (inference/model.py, engram.py in the
-Hub snapshot) over the real checkpoint's first layers, against the
-engine's per-layer dump (dsv41_forward_check --out states.bin --layers N).
+"""DeepSeek-V4.1-Flash and -Flash-0731 independent reference (docs/
+deepseek_v41_flash_plan.md G4/G5): the release's OWN layer code (inference/
+model.py, engram.py in the Hub snapshot) over the real checkpoint's first
+layers, against the engine's per-layer dump (dsv41_forward_check --out
+states.bin --layers N).
 The engine's other gates compare it to a python reference written from the
 same reading of the architecture; this one is the reading DeepSeek ships
 (the rule that found GLM-4.7's RoPE bug: run the reference's own layer
@@ -203,11 +204,34 @@ def make_kernel_module():
     return m
 
 
+def make_hadamard_module():
+    """The fast_hadamard_transform stand-in: the Sylvester Walsh-Hadamard in fp32, scaled, back to
+    the input dtype (the CUDA kernel's arithmetic without the SMs)."""
+
+    def hadamard_transform(x, scale):
+        n = x.shape[-1]
+        assert n & (n - 1) == 0
+        y = x.float()
+        h = 1
+        while h < n:
+            y = y.view(*y.shape[:-1], n // (2 * h), 2, h)
+            a = y[..., 0, :]
+            b = y[..., 1, :]
+            y = torch.stack((a + b, a - b), dim=-2).reshape(*y.shape[:-3], n)
+            h *= 2
+        return (y * scale).to(x.dtype)
+
+    m = types.ModuleType("fast_hadamard_transform")
+    m.hadamard_transform = hadamard_transform
+    return m
+
+
 def load_release_modules(snapshot):
     """model.py and engram.py from the snapshot's inference dir, the kernel module replaced and the
     VL modules stubbed (image_processor / vision are import-time dependencies only)."""
     inference = os.path.join(snapshot, "inference")
     sys.modules["kernel"] = make_kernel_module()
+    sys.modules["fast_hadamard_transform"] = make_hadamard_module()
     ip = types.ModuleType("image_processor")
     ip.IMAGE, ip.IMAGE_END, ip.IMAGE_NEW_LINE, ip.IMAGE_START = 0, 1, 2, 3
     sys.modules["image_processor"] = ip
@@ -222,12 +246,15 @@ def load_release_modules(snapshot):
     sys.modules["vision"] = vis
     mods = {}
     for name in ("engram", "model"):
-        spec = importlib.util.spec_from_file_location(name, os.path.join(inference, name + ".py"))
+        path = os.path.join(inference, name + ".py")
+        if name == "engram" and not os.path.exists(path):
+            continue  # the 0731 release ships without the engram stage
+        spec = importlib.util.spec_from_file_location(name, path)
         mod = importlib.util.module_from_spec(spec)
         sys.modules[name] = mod
         spec.loader.exec_module(mod)
         mods[name] = mod
-    return mods["model"], mods["engram"]
+    return mods["model"], mods.get("engram")
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +288,8 @@ class Shards:
         """A Linear's weight dequantized to bf16 (fp8 x e8m0, fp4 x e8m0) or as stored (bf16/f32)."""
         w = self.get(prefix + ".weight")
         if w.dtype == torch.float8_e4m3fn:
-            return dequant_fp8(w, self.get(prefix + ".scale"))
+            s = self.get(prefix + ".scale")
+            return dequant_fp8(w, s, block=w.shape[0] // s.shape[0])  # the release's weight scale grid (32, 128)
         if w.dtype == torch.int8:
             return dequant_fp4(w, self.get(prefix + ".scale"))
         return w
@@ -344,11 +372,24 @@ def main():
           f"expert down projections {'fp32' if args.fp32_down else 'bf16 (the release kernels)'}, "
           f"hc_fn {'bf16 (as loaded by the engine)' if args.hc_bf16 else 'fp32 (as stored)'}")
     model, engram = load_release_modules(snap)
+    has_engram = engram is not None
+    pre_mix_mode = hasattr(model, "make_identity_pre_mix")
+    fp8_block = getattr(model, "fp8_block_size", model.block_size)
+    if hasattr(model, "rotate_activation"):
+        orig_rotate = model.rotate_activation
+
+        def rotate_activation(x):
+            # the release's rotation asserts bf16 (the kernels rotate bf16 rows);
+            # an fp32 pipeline carries its value, the rotation itself stays bf16.
+            return orig_rotate(x.to(torch.bfloat16)).to(x.dtype)
+
+        model.rotate_activation = rotate_activation
     cfg = json.load(open(os.path.join(snap, "inference", "config.json")))
     cfg = {k: v for k, v in cfg.items() if k in model.ModelArgs.__dataclass_fields__}
     cfg["max_batch_size"] = 1
     cfg["max_seq_len"] = max(4096, ((T + 127) // 128) * 128)
-    cfg["vision_n_layers"] = 0  # text only: the gate's VL bias is dead code
+    if "vision_n_layers" in model.ModelArgs.__dataclass_fields__:
+        cfg["vision_n_layers"] = 0  # text only: the gate's VL bias is dead code
     margs = model.ModelArgs(**cfg)
     ref_dtype = torch.float32 if args.dtype == "float32" else torch.bfloat16
     torch.set_default_dtype(ref_dtype)
@@ -365,7 +406,7 @@ def main():
             # only the weights the checkpoint stores quantized take a quantized activation (the
             # kernels' dispatch by weight dtype); the bf16/fp32 Linears run plain
             if getattr(weight, "_dgpp_quantized", False):
-                x = act_quant_dequant(x, model.fp8_block_size, True)
+                x = act_quant_dequant(x, fp8_block, True)
             return real_linear(x, weight, bias)
 
         model.linear = quant_linear
@@ -388,20 +429,23 @@ def main():
         self.num_embeddings, self.dim = num_embeddings, dim
         self.part_num_embeddings = num_embeddings
         self.vocab_start_idx, self.vocab_end_idx = 0, num_embeddings
-        self.block_size = model.fp8_block_size
+        self.block_size = fp8_block
         self.weight = torch.nn.Parameter(torch.empty(0, dtype=torch.bfloat16))
         self.scale = torch.nn.Parameter(torch.empty(0, dtype=torch.bfloat16))
 
-    model.ParallelEngramEmbedding.__init__ = lean_engram_init
-    layout = engram.EngramLayout.from_args(margs)
-    t0 = time.time()
-    hash_state = engram.NgramHashState(margs, layout, TokenizerShim(os.path.join(snap, "tokenizer.json")))
-    print(f"engram hash state built in {time.time() - t0:.1f} s (compressed vocab {hash_state.token_map.max().item() + 1})")
+    layout, hashes = None, None
+    if has_engram:
+        model.ParallelEngramEmbedding.__init__ = lean_engram_init
+        layout = engram.EngramLayout.from_args(margs)
+        t0 = time.time()
+        hash_state = engram.NgramHashState(margs, layout, TokenizerShim(os.path.join(snap, "tokenizer.json")))
+        print(f"engram hash state built in {time.time() - t0:.1f} s (compressed vocab {hash_state.token_map.max().item() + 1})")
     input_ids = torch.tensor(ids, dtype=torch.long).unsqueeze(0)
-    hashes = hash_state(input_ids, 0)  # [1, T, n_engram_layers, n_hash_cols]
+    if has_engram:
+        hashes = hash_state(input_ids, 0)  # [1, T, n_engram_layers, n_hash_cols]
 
     def load_block(l):
-        blk = model.Block(l, margs, layout)
+        blk = model.Block(l, margs, layout) if layout is not None else model.Block(l, margs)
         with torch.no_grad():
             for name, param in list(blk.named_parameters()):
                 full = f"layers.{l}.{name}"
@@ -442,7 +486,7 @@ def main():
                 xx = weights * xx
             xx = xx.to(dtype)
             if ACT_QUANT and getattr(expert.w2.weight, "_dgpp_quantized", False):
-                xx = act_quant_dequant(xx, model.fp8_block_size, True)
+                xx = act_quant_dequant(xx, fp8_block, True)
             return F.linear(xx.float(), expert.w2.weight.float())
 
         def make_forward(i, expert):
@@ -466,11 +510,22 @@ def main():
                 expert.forward = make_forward(i, expert)
                 for lin in (expert.w1, expert.w2, expert.w3):
                     lin.weight._dgpp_quantized = True
+        idx = getattr(blk.attn, "indexer", None)
+        if idx is not None:
+            orig_idx = idx.forward
+
+            def idx_fwd(x, qr, start_pos, offset, _orig=orig_idx):
+                out = _orig(x, qr, start_pos, offset)
+                sel_log[l] = out.detach().squeeze(0).cpu().numpy()
+                return out
+
+            idx.forward = idx_fwd
         if args.fp32_down:
             shared = blk.ffn.shared_experts
             shared.forward = lambda x, weights=None, e=shared: expert_forward_fp32_down(e, x, weights)
-        if blk.engram is not None:
-            emb = blk.engram.embed
+        eng = getattr(blk, "engram", None)
+        if eng is not None:
+            emb = eng.embed
             wname = f"layers.{l}.engram.embed.weight"
             sname = f"layers.{l}.engram.embed.scale"
             wsl, ssl = shards.slice(wname), shards.slice(sname)
@@ -493,12 +548,12 @@ def main():
     # The embedding: the block 0 input is embed[ids] expanded to hc copies (bf16).
     embed = shards.get("embed.weight").to(ref_dtype)
     h0 = embed[input_ids].unsqueeze(2).repeat(1, 1, hc, 1)
-    pre0 = model.make_identity_pre_mix(h0, hc)
+    pre0 = model.make_identity_pre_mix(h0, hc) if pre_mix_mode else None
     results = {}
     kept_results = {}
     # The reference's own routing per layer (the gate's picks and the near-tie margin of the
     # sixth pick over the seventh, relative to the score range), captured by a hook.
-    gate_log = {}
+    gate_log, sel_log = {}, {}
 
     def hook_gate(blk, l):
         gate = blk.ffn.gate
@@ -507,17 +562,25 @@ def main():
         def fwd(x, image_mask=None):
             weights, indices = orig(x, image_mask)
             with torch.no_grad():
-                scores = torch.nn.functional.linear(x.float(), gate.weight.float()) / gate.gate_temp
-                scores = torch.nn.functional.softplus(scores).sqrt() + gate.bias
-                top = scores.topk(gate.topk + 1, dim=-1).values
-                rng = (scores.amax(dim=-1) - scores.amin(dim=-1)).clamp_min(1e-30)
-                margin = (top[:, gate.topk - 1] - top[:, gate.topk]) / rng
+                scores = torch.nn.functional.linear(x.float(), gate.weight.float()) / getattr(gate, "gate_temp", 1.0)
+                if gate.hash:
+                    margin = torch.zeros(indices.size(0), dtype=torch.float32)  # the hash route is fixed per token
+                else:
+                    scores = torch.nn.functional.softplus(scores).sqrt()
+                    if gate.bias is not None:
+                        scores = scores + gate.bias
+                    top = scores.topk(gate.topk + 1, dim=-1).values
+                    rng = (scores.amax(dim=-1) - scores.amin(dim=-1)).clamp_min(1e-30)
+                    margin = (top[:, gate.topk - 1] - top[:, gate.topk]) / rng
             gate_log[l] = (indices.sort(dim=-1).values.cpu().numpy(), margin.cpu().numpy())
             return weights, indices
 
         gate.forward = fwd
 
-    index_sources = [ls for ls in margs.index_source_layers]
+    if hasattr(margs, "index_source_layers"):
+        index_sources = [ls for ls in margs.index_source_layers]
+    else:
+        index_sources = [l for l in range(margs.n_layers) if margs.compress_ratios[l] == 4]
 
     saved = {}
     baseline = dict(np.load(args.baseline)) if args.baseline else None
@@ -539,15 +602,21 @@ def main():
                 b = torch.from_numpy(baseline[f"layer{l}"])
                 line += f"; the baseline run vs this one: rel l2 {rel_l2(b, got):.5f}"
         sel_flips = []
-        if sels is not None and l in index_sources and model.shared_attn.topk_idxs is not None:
+        if sels is not None and l in index_sources:
             si = index_sources.index(l)
             if si < sels.shape[0]:
-                ref_sel = model.shared_attn.topk_idxs[0].cpu().numpy().astype(np.int64)  # [T, topk], offset by T
-                for t in range(T):
-                    r = set(int(v) - T for v in ref_sel[t] if v >= 0)
-                    g = set(int(v) for v in sels[si, t] if v >= 0)
-                    if r != g:
-                        sel_flips.append((t, len(r ^ g)))
+                if getattr(model, "shared_attn", None) is not None and model.shared_attn.topk_idxs is not None:
+                    ref_sel = model.shared_attn.topk_idxs[0].cpu().numpy().astype(np.int64)  # [T, topk], offset by T
+                elif l in sel_log:
+                    ref_sel = sel_log[l]  # the prefill indexer output, offset by T
+                else:
+                    ref_sel = None
+                if ref_sel is not None:
+                    for t in range(T):
+                        r = set(int(v) - T for v in ref_sel[t] if v >= 0)
+                        g = set(int(v) for v in sels[si, t] if v >= 0)
+                        if r != g:
+                            sel_flips.append((t, len(r ^ g)))
                 line += f"; selections: {T - len(sel_flips)} rows equal"
                 if sel_flips:
                     line += ", flips" + "".join(f" t{t}(±{n})" for t, n in sel_flips[:6])
@@ -585,13 +654,18 @@ def main():
         hook_gate(blk, l)
         with torch.inference_mode():
             x = h
-            if blk.engram is not None:
-                x = blk.engram(x, hashes[:, :, blk.engram.layer_hash_index, :], None)
-            h, pre_mix = blk(x, 0, pre_mix, None)
+            eng = getattr(blk, "engram", None)
+            if eng is not None:
+                x = eng(x, hashes[:, :, eng.layer_hash_index, :], None)
+            if pre_mix_mode:
+                h, pre_mix = blk(x, 0, pre_mix, None)
+            else:
+                h = blk(x, 0, input_ids)
         report(l, "chained", h[0], blk, t0)
         del blk
     # ---- isolated: block l from the engine's layer l-1 output and coefficients ----------------
-    model.shared_attn = model.SharedAttentionRuntime()
+    if hasattr(model, "SharedAttentionRuntime"):
+        model.shared_attn = model.SharedAttentionRuntime()
     for l in layers:
         if l >= L_dump:
             print(f"layer {l}: not in the engine dump ({L_dump} layers)")
@@ -606,9 +680,13 @@ def main():
             pre_in = pre_dump[l - 1].reshape(1, T, hc)
         with torch.inference_mode():
             x = x_in
-            if blk.engram is not None:
-                x = blk.engram(x, hashes[:, :, blk.engram.layer_hash_index, :], None)
-            h_out, _ = blk(x, 0, pre_in, None)
+            eng = getattr(blk, "engram", None)
+            if eng is not None:
+                x = eng(x, hashes[:, :, eng.layer_hash_index, :], None)
+            if pre_mix_mode:
+                h_out, _ = blk(x, 0, pre_in, None)
+            else:
+                h_out = blk(x, 0, input_ids)
         report(l, "isolated", h_out[0], blk, t0)
         del blk
     if args.save_states:

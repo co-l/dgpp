@@ -38,7 +38,7 @@
 #include "text/tokenizer.hpp"
 
 int main(int argc, char** argv) {
-  std::string model_id, ckpt, out, ids_text, text_path;
+  std::string model_id, ckpt, out, ids_text, text_path, sites_out;
   int tokens = 0, layers = 0;
   uint64_t seed = 7;
   bool bos = true, bounded = false;
@@ -59,6 +59,7 @@ int main(int argc, char** argv) {
       else if (a == "--layers") layers = std::stoi(next(i));
       else if (a == "--no-bos") bos = false;
       else if (a == "--bounded") bounded = true;
+      else if (a == "--sites-out") sites_out = next(i);
       else throw std::runtime_error("unknown argument " + a);
     }
     if (ckpt.empty()) {
@@ -69,8 +70,9 @@ int main(int argc, char** argv) {
     }
     if (out.empty()) throw std::runtime_error("--out is required");
     const std::string cfg_path = (std::filesystem::path(ckpt) / "config.json").string();
-    if (dgpp::detect_architecture_file(cfg_path) != dgpp::ModelArchitecture::DeepseekV41)
-      throw std::runtime_error("not a DeepseekV41 checkpoint: " + ckpt);
+    const auto arch = dgpp::detect_architecture_file(cfg_path);
+    if (arch != dgpp::ModelArchitecture::DeepseekV41 && arch != dgpp::ModelArchitecture::DeepseekV4)
+      throw std::runtime_error("not a DeepSeek-V4.1 / 0731 checkpoint: " + ckpt);
     const dgpp::Dsv41TextConfig cfg = dgpp::Dsv41TextConfig::from_json_file(cfg_path);
     // The prompt: explicit ids, a text through the checkpoint's tokenizer
     // (BOS first unless --no-bos), or random ids.
@@ -144,6 +146,24 @@ int main(int argc, char** argv) {
     for (const auto& sel : o.dsa_selections) {
       if (sel.size() != static_cast<size_t>(T) * ms) throw std::runtime_error("selection rows");
       f.write(reinterpret_cast<const char*>(sel.data()), static_cast<std::streamsize>(sel.size() * 4));
+    }
+    if (!sites_out.empty()) {
+      const auto& sites = model.debug_sites();
+      if (static_cast<int>(sites.size()) != L) throw std::runtime_error("site captures missing");
+      std::ofstream sf(sites_out, std::ios::binary);
+      if (!sf) throw std::runtime_error("cannot write " + sites_out);
+      sf.write("DSV41SIT1", 8);
+      const int32_t shdr[3] = {L, T, cfg.hidden_size};
+      sf.write(reinterpret_cast<const char*>(shdr), 12);
+      for (const auto& s : sites) {
+        const size_t Hn = static_cast<size_t>(T) * cfg.hidden_size;
+        for (const auto* v : {&s.x_attn, &s.attn_out, &s.streams_after_attn, &s.x_ffn, &s.ffn_out}) {
+          const size_t want = (v == &s.streams_after_attn) ? 4 * Hn : Hn;
+          if (v->size() != want) throw std::runtime_error("a site capture with the wrong rows");
+          sf.write(reinterpret_cast<const char*>(v->data()), static_cast<std::streamsize>(v->size() * 2));
+        }
+      }
+      DGPP_LOG_INFO("dsv41_forward_check: {} site captures written to {}", L, sites_out);
     }
     DGPP_LOG_INFO("dsv41_forward_check: {} layers x {} rows x {} (+ routes, {} index sources) written to {} in {:.1f} s", L, T, H4,
                   Li, out, secs);
