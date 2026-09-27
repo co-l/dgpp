@@ -149,6 +149,9 @@ struct RefLayer {
   int cache_ord = -1, tail_ord = -1;
   const Fp8Host *wq_a, *wkv, *wq_b, *wo_a, *wo_b, *idx_wq_b;
   const Bf16Host *q_norm, *kv_norm, *idx_wp, *idx_wk, *idx_k_norm, *comp_wkv, *comp_wgate, *comp_norm;
+  const Bf16Host *idx_comp_wkv = nullptr, *idx_comp_wgate = nullptr, *idx_comp_norm = nullptr;
+  const float* idx_comp_ape = nullptr;  // 0731: [4, 2 * 128]
+  const float* comp_ape = nullptr;      // 0731: [4, 2 * 512] ratio 4; [128, 512] ratio 128
   std::vector<float> sink;
   std::vector<float> inv_freq;
 };
@@ -217,6 +220,141 @@ std::vector<float> fp4_e8m0_dequant(const std::vector<float>& x /*[128]*/) {
   return out;
 }
 
+// ---- 0731 (the V4-Flash release) oracle: the in-place activations, the overlap
+// compressors, the Hadamard index keys, the bf16 selection ----------------------
+std::vector<float> actquant8_host(const std::vector<float>& row) {
+  std::vector<float> out(row.size());
+  for (size_t i = 448; i < row.size(); ++i) out[i] = row[i];
+  for (int b = 0; b < 7; ++b) {
+    float amax = 0.0f;
+    for (int j = 0; j < 64; ++j) amax = std::max(amax, std::fabs(row[size_t(b * 64 + j)]));
+    const float s = std::max(amax, 1e-4f) * (1.0f / 448.0f);
+    for (int j = 0; j < 64; ++j)
+      out[size_t(b * 64 + j)] = bf(dgpp::fp8_e4m3_bits_to_float(dgpp::float_to_fp8_e4m3_bits(row[size_t(b * 64 + j)] / s)) * s);
+  }
+  return out;
+}
+std::vector<float> hadamard128_host(const std::vector<float>& x) {
+  std::vector<float> v(x);
+  for (int stage = 1; stage < 128; stage *= 2)
+    for (int i = 0; i < 128; i += 2 * stage)
+      for (int j = 0; j < stage; ++j) {
+        const float a = v[size_t(i + j)], b = v[size_t(i + j + stage)];
+        v[size_t(i + j)] = a + b;
+        v[size_t(i + j + stage)] = a - b;
+      }
+  for (auto& t : v) t = bf(t * 0.08838834764831845f);
+  return v;
+}
+void q_renorm_row(float* row, float eps) {
+  float ss = 0.0f;
+  for (int i = 0; i < 512; ++i) ss = std::fma(row[i], row[i], ss);
+  const float m = bf(ss / 512.0f);
+  const float t = bf(m + eps);
+  const float rs = bf(1.0f / std::sqrt(t));
+  for (int i = 0; i < 512; ++i) row[i] = bf(row[i] * rs);
+}
+// The ratio-4 request state (the reference's kv_state / score_state): slots
+// 0..3 the last four tokens' kv, 4..7 the current window's (kv, score + ape).
+struct C4State {
+  std::vector<float> kv[8], sc[8];  // each [2d]
+  explicit C4State(int d) {
+    for (int i = 0; i < 8; ++i) {
+      kv[i].assign(size_t(2 * d), 0.0f);
+      sc[i].assign(size_t(2 * d), -INFINITY);
+    }
+  }
+};
+std::vector<float> c4_step(C4State& st, const float* kvt, const float* sct, const float* ape, int64_t p, int d,
+                           const std::vector<float>& norm, float eps) {
+  const int c = int(p & 3);
+  for (int i = 0; i < 2 * d; ++i) {
+    st.kv[4 + c][size_t(i)] = kvt[i];
+    st.sc[4 + c][size_t(i)] = sct[i] + ape[size_t(c) * 2 * d + i];
+  }
+  std::vector<float> out;
+  if ((p + 1) % 4 == 0) {
+    std::vector<uint16_t> pooled(static_cast<size_t>(d));
+    for (int cc = 0; cc < d; ++cc) {
+      float m = -INFINITY;
+      for (int j = 0; j < 8; ++j) {
+        const int off = (j < 4) ? cc : cc + d;
+        m = std::max(m, st.sc[j][size_t(off)]);
+      }
+      float den = 0.0f;
+      for (int j = 0; j < 8; ++j) {
+        const int off = (j < 4) ? cc : cc + d;
+        den += std::exp(st.sc[j][size_t(off)] - m);
+      }
+      float sum = 0.0f;
+      for (int j = 0; j < 8; ++j) {
+        const int off = (j < 4) ? cc : cc + d;
+        sum = std::fmaf(st.kv[j][size_t(off)], std::exp(st.sc[j][size_t(off)] - m) / den, sum);
+      }
+      pooled[size_t(cc)] = float_to_bf16_bits(sum);
+    }
+    double ss = 0.0;
+    for (int cc = 0; cc < d; ++cc) {
+      const double v = bf16_bits_to_float(pooled[size_t(cc)]);
+      ss += v * v;
+    }
+    const double rs = 1.0 / std::sqrt(ss / d + double(eps));
+    out.resize(size_t(d));
+    for (int cc = 0; cc < d; ++cc) {
+      const float v = bf16_bits_to_float(pooled[size_t(cc)]);
+      out[size_t(cc)] = bf(static_cast<float>(norm[size_t(cc)] * (v * rs)));
+    }
+    for (int i = 0; i < 4; ++i) {
+      st.kv[i] = st.kv[4 + i];
+      st.sc[i] = st.sc[4 + i];
+    }
+  }
+  return out;
+}
+// The ratio-128 request state (the full window, no overlap).
+struct C128State {
+  std::vector<float> kv[128], sc[128];  // each [512]
+  C128State() {
+    for (int i = 0; i < 128; ++i) {
+      kv[i].assign(512, 0.0f);
+      sc[i].assign(512, 0.0f);
+    }
+  }
+};
+std::vector<float> c128_step(C128State& st, const float* kvt, const float* sct, const float* ape, int64_t p,
+                             const std::vector<float>& norm, float eps) {
+  const int c = int(p & 127);
+  for (int i = 0; i < 512; ++i) {
+    st.kv[c][size_t(i)] = kvt[i];
+    st.sc[c][size_t(i)] = sct[i] + ape[size_t(c) * 512 + i];
+  }
+  std::vector<float> out;
+  if ((p + 1) % 128 == 0) {
+    std::vector<uint16_t> pooled(512);
+    for (int cc = 0; cc < 512; ++cc) {
+      float m = -INFINITY;
+      for (int j = 0; j < 128; ++j) m = std::max(m, st.sc[j][size_t(cc)]);
+      float den = 0.0f;
+      for (int j = 0; j < 128; ++j) den += std::exp(st.sc[j][size_t(cc)] - m);
+      float sum = 0.0f;
+      for (int j = 0; j < 128; ++j) sum = std::fmaf(st.kv[j][size_t(cc)], std::exp(st.sc[j][size_t(cc)] - m) / den, sum);
+      pooled[size_t(cc)] = float_to_bf16_bits(sum);
+    }
+    double ss = 0.0;
+    for (int cc = 0; cc < 512; ++cc) {
+      const double v = bf16_bits_to_float(pooled[size_t(cc)]);
+      ss += v * v;
+    }
+    const double rs = 1.0 / std::sqrt(ss / 512.0 + double(eps));
+    out.resize(512);
+    for (int cc = 0; cc < 512; ++cc) {
+      const float v = bf16_bits_to_float(pooled[size_t(cc)]);
+      out[size_t(cc)] = bf(static_cast<float>(norm[size_t(cc)] * (v * rs)));
+    }
+  }
+  return out;
+}
+
 struct RefRequest {
   std::map<int64_t, std::vector<float>> window;              // per layer: position -> 512 (layer * 1e6 + pos keyed below)
   std::vector<std::vector<std::vector<float>>> main;         // [ord][entry] 512
@@ -226,6 +364,8 @@ struct RefRequest {
   std::vector<std::vector<int32_t>> cand;                    // per row of the current call: block ids
   std::vector<std::vector<int32_t>> sel;                     // per row: selected entries
   std::vector<std::vector<float>> logits;                    // per row: the logits over visible entries
+  C4State c4_main{1024}, c4_idx{256};  // 0731: the compressor states (main latent / index keys)
+  C128State c128;
 };
 
 struct RefModel {
@@ -249,6 +389,9 @@ struct RefModel {
     r.tail_kv.assign(size_t(tails), std::vector<float>(512, 0.0f));
     r.tail_score.assign(size_t(tails), std::vector<float>(512, 0.0f));
     r.tail_valid.assign(size_t(tails), false);
+    r.c4_main = C4State(1024);
+    r.c4_idx = C4State(256);
+    r.c128 = C128State();
   }
   static int64_t wkey(int layer, int64_t pos) { return int64_t(layer) * 4000000 + pos; }
 
@@ -265,16 +408,59 @@ struct RefModel {
     std::vector<float> q = matmul_bf16(qr, rows, L.wq_b->deq, int64_t(lh) * 512, ql);
     std::vector<float> kv = matmul_bf16(hidden, rows, L.wkv->deq, 512, H);
     rmsnorm_rows(kv, rows, 512, L.kv_norm->val, cfg.eps);
+    const bool release = cfg.ring_format == LatentFormat::kBf16;
+    if (release && cfg.q_renorm)
+      for (int i = 0; i < rows; ++i)
+        for (int h = 0; h < lh; ++h) q_renorm_row(&q[(size_t(i) * lh + h) * 512], cfg.eps);
     for (int i = 0; i < rows; ++i) {
       const int64_t p = p0 + i;
       for (int h = 0; h < lh; ++h) rope_tail(&q[(size_t(i) * lh + h) * 512 + 448], 64, p, L.inv_freq, false);
       rope_tail(&kv[size_t(i) * 512 + 448], 64, p, L.inv_freq, false);
       std::vector<float> row(kv.begin() + i * 512, kv.begin() + (i + 1) * 512);
-      R.window[wkey(layer, p)] = quant_dequant(LatentFormat::kFp8Block, row);
+      R.window[wkey(layer, p)] = release ? actquant8_host(row) : quant_dequant(LatentFormat::kFp8Block, row);
     }
     // the compressor (kv source) -> entries
     if (L.kv_source) {
       const int ord = L.cache_ord;
+      if (release && L.ratio == 4) {
+        const std::vector<float> ckv = matmul_f32(hidden, rows, L.comp_wkv->val, 1024, H);
+        const std::vector<float> csc = matmul_f32(hidden, rows, L.comp_wgate->val, 1024, H);
+        const std::vector<float> ikv = matmul_f32(hidden, rows, L.idx_comp_wkv->val, 256, H);
+        const std::vector<float> isc = matmul_f32(hidden, rows, L.idx_comp_wgate->val, 256, H);
+        for (int i = 0; i < rows; ++i) {
+          const int64_t p = p0 + i;
+          const std::vector<float> ml = c4_step(R.c4_main, ckv.data() + size_t(i) * 1024, csc.data() + size_t(i) * 1024,
+                                                L.comp_ape, p, 512, L.comp_norm->val, cfg.eps);
+          std::vector<float> ik = c4_step(R.c4_idx, ikv.data() + size_t(i) * 256, isc.data() + size_t(i) * 256,
+                                             L.idx_comp_ape, p, 128, L.idx_comp_norm->val, cfg.eps);
+          if ((p + 1) % 4 == 0) {
+            const int64_t e = p / 4, ep = e * 4;
+            auto& K = R.keys[size_t(ord)];
+            auto& M = R.main[size_t(ord)];
+            if (K.size() <= size_t(e)) { K.resize(size_t(e) + 1); M.resize(size_t(e) + 1); }
+            std::vector<float> lat(ml);
+            rope_tail(lat.data() + 448, 64, ep, L.inv_freq, false);
+            M[size_t(e)] = actquant8_host(lat);
+            rope_tail(ik.data() + 64, 64, ep, L.inv_freq, false);
+            K[size_t(e)] = fp4_e8m0_dequant(hadamard128_host(ik));
+          }
+        }
+      } else if (release && L.ratio == 128) {
+        const std::vector<float> ckv = matmul_f32(hidden, rows, L.comp_wkv->val, 512, H);
+        const std::vector<float> csc = matmul_f32(hidden, rows, L.comp_wgate->val, 512, H);
+        for (int i = 0; i < rows; ++i) {
+          const int64_t p = p0 + i;
+          std::vector<float> lat = c128_step(R.c128, ckv.data() + size_t(i) * 512, csc.data() + size_t(i) * 512,
+                                              L.comp_ape, p, L.comp_norm->val, cfg.eps);
+          if ((p + 1) % 128 == 0) {
+            const int64_t e = p / 128, ep = e * 128;
+            auto& M = R.main[size_t(ord)];
+            if (M.size() <= size_t(e)) M.resize(size_t(e) + 1);
+            rope_tail(lat.data() + 448, 64, ep, L.inv_freq, false);
+            M[size_t(e)] = actquant8_host(lat);
+          }
+        }
+      } else {
       std::vector<float> lat;  // [n, 512] normed, unrotated
       std::vector<int64_t> ents;
       if (L.ratio == 1) {
@@ -323,12 +509,56 @@ struct RefModel {
           M[size_t(j)] = quant_dequant(LatentFormat::kFp4Block, lrow);
         }
       }
+      }
     }
     // the selection
     std::vector<std::vector<int32_t>> sel(static_cast<size_t>(rows));
     if (L.ratio > 0) {
       const int ord = L.cache_ord;
-      if (L.index_source) {
+      if (release && !L.index_source) {
+        // The C128A sequential selection: every visible entry (no indexer).
+        for (int i = 0; i < rows; ++i) {
+          const int64_t visible = (p0 + i + 1) / L.ratio;
+          for (int64_t e = 0; e < visible && size_t(sel[size_t(i)].size()) < size_t(cfg.index_topk); ++e)
+            sel[size_t(i)].push_back(int32_t(e));
+        }
+        R.sel = sel;
+      } else if (L.index_source && release) {
+        const int heads = cfg.index_heads;
+        std::vector<float> iq = matmul_bf16(qr, rows, L.idx_wq_b->deq, int64_t(heads) * 128, ql);
+        std::vector<float> w = matmul_bf16(hidden, rows, L.idx_wp->val, heads, H);
+        R.logits.assign(size_t(rows), {});
+        for (int i = 0; i < rows; ++i) {
+          const int64_t p = p0 + i;
+          const int64_t visible = (p + 1) / L.ratio;
+          std::vector<std::vector<float>> qh(static_cast<size_t>(heads));
+          for (int h = 0; h < heads; ++h) {
+            std::vector<float> seg(iq.begin() + (size_t(i) * heads + h) * 128, iq.begin() + (size_t(i) * heads + h + 1) * 128);
+            rope_tail(&seg[64], 64, p, L.inv_freq, false);
+            qh[size_t(h)] = fp4_e8m0_dequant(hadamard128_host(seg));
+          }
+          std::vector<float> logits(size_t(visible), 0.0f);
+          for (int64_t j = 0; j < visible; ++j) {
+            require(size_t(j) < R.keys[size_t(ord)].size(), "oracle: a visible entry is missing");
+            float total = 0.0f;
+            for (int h = 0; h < heads; ++h) {
+              float d = 0.0f;
+              for (int t = 0; t < 128; ++t) d += qh[size_t(h)][size_t(t)] * R.keys[size_t(ord)][size_t(j)][size_t(t)];
+              total += (w[size_t(i) * heads + h] * cfg.fold_scale) * std::max(d, 0.0f);
+            }
+            logits[size_t(j)] = total;
+          }
+          R.logits[size_t(i)] = logits;
+          std::vector<std::pair<float, int32_t>> v;
+          for (int64_t e = 0; e < visible; ++e) v.emplace_back(logits[size_t(e)], int32_t(e));
+          std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
+            return a.first > b.first || (a.first == b.first && a.second < b.second);
+          });
+          for (size_t k = 0; k < v.size() && k < size_t(cfg.index_topk); ++k) sel[size_t(i)].push_back(v[k].second);
+          std::sort(sel[size_t(i)].begin(), sel[size_t(i)].end());
+        }
+        R.sel = sel;
+      } else if (L.index_source) {
         std::vector<float> iq = matmul_bf16(qr, rows, L.idx_wq_b->deq, 32 * 128, ql);
         std::vector<float> w = matmul_bf16(hidden, rows, L.idx_wp->val, 32, H);
         if (L.candidate_source) R.cand.assign(size_t(rows), {});
@@ -523,7 +753,8 @@ struct Scenario {
     ref = std::make_unique<RefModel>(cfg, max_requests, ratios, 1);
     for (auto& d : layers) ref->layers.push_back(d.ref);
     dgpp::Csa2PoolShape shape;
-    shape.layers = int(layers.size()); shape.cache_ratio = ratios; shape.tail_ordinals = 1; shape.max_requests = max_requests;
+    shape.layers = int(layers.size()); shape.cache_ratio = ratios; shape.tail_ordinals = 1;
+    shape.tail_floats = {2 * int(dgpp::kCsa2Latent)}; shape.tail_inf = {0}; shape.max_requests = max_requests;
     shape.token_slots = max_cache; shape.block_tokens = cfg.block_tokens; shape.ring_slots = cfg.ring_slots;
     pool.init(shape);
     const size_t sb = dgpp::Csa2Layer::scratch_bytes(cfg, max_tokens, max_cache, 16, 8);
@@ -575,13 +806,15 @@ struct Scenario {
       for (const int32_t e : r) boundary = std::min(boundary, lg[size_t(e)]);
       for (const int32_t e : d) require(e >= 0 && size_t(e) < lg.size(), "device selected an invisible entry");
       for (const int32_t e : d)
-        if (std::find(r.begin(), r.end(), e) == r.end())
+        if (std::find(r.begin(), r.end(), e) == r.end()) {
           require(std::fabs(lg[size_t(e)] - boundary) <= 2e-3f * std::max(1e-6f, hi - lo) + 1e-6f,
                   tag + " layer " + std::to_string(l) + " " + what + ": a selection flip beyond a near tie");
+        }
       for (const int32_t e : r)
-        if (std::find(d.begin(), d.end(), e) == d.end())
+        if (std::find(d.begin(), d.end(), e) == d.end()) {
           require(std::fabs(lg[size_t(e)] - boundary) <= 2e-3f * std::max(1e-6f, hi - lo) + 1e-6f,
                   tag + " layer " + std::to_string(l) + " " + what + ": a dropped entry beyond a near tie");
+        }
     }
   }
 
@@ -639,6 +872,7 @@ struct Scenario {
         topk = download<int32_t>(layer->debug_topk(), size_t(T) * cfg.index_topk);
         counts = download<int32_t>(layer->debug_counts(), size_t(T));
       }
+
       int row = 0;
       for (const auto& s : spans) {
         std::vector<float> hf(size_t(s.rows) * cfg.hidden);
@@ -743,5 +977,260 @@ DGPP_TEST(csa2_pool_shapes_the_v4_cache_ratios) {
   big.init(shape({4, 128}, (1 << 21) - 128));
   require(big.entry_slots(0) == 16383 * 32 && big.entry_slots(1) == 16383, "the last entry id fits the select keys");
 }
+
+struct Scenario0731 {
+  dgpp::Csa2Config cfg;
+  struct Dev {
+    Fp8Host wq_a, wkv, wq_b, wo_a, wo_b, idx_wq_b;
+    Bf16Host q_norm, kv_norm, idx_wp, comp_wkv, comp_wgate, comp_norm, idx_comp_wkv, idx_comp_wgate, idx_comp_norm;
+    std::vector<float> sink, inv_freq, comp_ape, idx_comp_ape;
+    DevBuf dsink, dfreq, dope, idope;
+    dgpp::Csa2LayerWeights w;
+    RefLayer ref;
+  };
+  std::vector<Dev> layers;
+  std::unique_ptr<RefModel> ref;
+  dgpp::Csa2StatePool pool;
+  dgpp::CublasLtGemm gemm;
+  DevBuf scratch, gemm_ws;
+  std::unique_ptr<dgpp::Csa2Layer> layer;
+  int max_tokens = 128, max_requests = 2;
+  int64_t max_cache = 512;
+  std::string tag;
+  int flips = 0;
+  std::vector<std::vector<float>> hidden;
+
+  explicit Scenario0731(const std::string& tag_) : tag(tag_) {
+    cfg.hidden = 256; cfg.q_lora = 64; cfg.o_lora = 32; cfg.num_heads = 16; cfg.o_groups = 4;
+    cfg.index_topk = 16; cfg.candidate_block = 8; cfg.candidate_blocks = 4; cfg.window = 32; cfg.ring_slots = 48;
+    cfg.block_tokens = 128;
+    cfg.ring_format = LatentFormat::kBf16;
+    cfg.main_format = LatentFormat::kBf16;
+    cfg.index_bf16 = true;
+    cfg.q_renorm = true;
+    cfg.fold_scale = 1.0f / std::sqrt(8192.0);
+    const int lh = cfg.local_heads(), lg = cfg.local_groups(), hpg = cfg.heads_per_group();
+    // Three layers: window; a ratio-4 kv + index source (the C4A); a ratio-128
+    // kv source (the C128A, the sequential selection).
+    struct Role { int ratio; bool kv, idx; int ord, tail, idx_tail; };
+    const std::vector<Role> roles = {{0, false, false, -1, -1, -1}, {4, true, true, 0, 0, 1}, {128, true, false, 1, 2, -1}};
+    layers.resize(roles.size());
+    for (size_t l = 0; l < roles.size(); ++l) {
+      Dev& d = layers[l];
+      const Role& r = roles[l];
+      const uint64_t s = 0x2000 * (l + 1);
+      d.wq_a = make_fp8(cfg.q_lora, cfg.hidden, s + 1, 0.08f);
+      d.wkv = make_fp8(512, cfg.hidden, s + 2, 0.08f);
+      d.wq_b = make_fp8(int64_t(lh) * 512, cfg.q_lora, s + 3, 0.15f);
+      d.wo_a = make_fp8(int64_t(lg) * cfg.o_lora, int64_t(hpg) * 512, s + 4, 0.03f);
+      d.wo_b = make_fp8(cfg.hidden, int64_t(lg) * cfg.o_lora, s + 5, 0.15f);
+      d.q_norm = make_bf16(1, cfg.q_lora, s + 6, 0.1f, 1.0f);
+      d.kv_norm = make_bf16(1, 512, s + 7, 0.1f, 1.0f);
+      d.sink.resize(size_t(lh));
+      for (int h = 0; h < lh; ++h) d.sink[size_t(h)] = 0.5f * gauss(s + 8, h);
+      d.dsink = upload(d.sink);
+      d.inv_freq.resize(32);
+      if (r.ratio == 0) dgpp::csa2_rope_inv_freq_host(64, 10000.0, 0, 16.0, 32.0, 1.0, d.inv_freq.data());
+      else dgpp::csa2_rope_inv_freq_host(64, 160000.0, 64, 16.0, 32.0, 1.0, d.inv_freq.data());
+      d.dfreq = upload(d.inv_freq);
+      if (r.idx) {
+        d.idx_wq_b = make_fp8(32 * 128, cfg.q_lora, s + 9, 0.2f);
+        d.idx_wp = make_bf16(32, cfg.hidden, s + 10, 0.3f);
+        d.idx_comp_wkv = make_bf16(256, cfg.hidden, s + 16, 0.08f);
+        d.idx_comp_wgate = make_bf16(256, cfg.hidden, s + 17, 0.3f);
+        d.idx_comp_norm = make_bf16(1, 128, s + 18, 0.1f, 1.0f);
+        d.idx_comp_ape.resize(4 * 256);
+        for (size_t i = 0; i < d.idx_comp_ape.size(); ++i) d.idx_comp_ape[i] = 0.2f * gauss(s + 19, i);
+        d.idope = upload(d.idx_comp_ape);
+      }
+      if (r.kv) {
+        const int wd = r.ratio == 4 ? 1024 : 512;
+        d.comp_wkv = make_bf16(wd, cfg.hidden, s + 13, 0.08f);
+        d.comp_wgate = make_bf16(wd, cfg.hidden, s + 15, 0.3f);
+        d.comp_norm = make_bf16(1, 512, s + 14, 0.1f, 1.0f);
+        d.comp_ape.resize(r.ratio == 4 ? 4 * 1024 : 128 * 512);
+        for (size_t i = 0; i < d.comp_ape.size(); ++i) d.comp_ape[i] = 0.2f * gauss(s + 20, i);
+        d.dope = upload(d.comp_ape);
+      }
+      dgpp::Csa2LayerWeights& w = d.w;
+      w.wq_a = d.wq_a.view(); w.wkv = d.wkv.view(); w.wq_b = d.wq_b.view(); w.wo_a = d.wo_a.view(); w.wo_b = d.wo_b.view();
+      w.q_norm = static_cast<const uint16_t*>(d.q_norm.d.p); w.kv_norm = static_cast<const uint16_t*>(d.kv_norm.d.p);
+      w.attn_sink = static_cast<const float*>(d.dsink.p); w.inv_freq = static_cast<const float*>(d.dfreq.p);
+      if (r.idx) {
+        w.idx_wq_b = d.idx_wq_b.view(); w.idx_wp = static_cast<const uint16_t*>(d.idx_wp.d.p);
+        w.idx_comp_wkv = static_cast<const uint16_t*>(d.idx_comp_wkv.d.p);
+        w.idx_comp_wgate = static_cast<const uint16_t*>(d.idx_comp_wgate.d.p);
+        w.idx_comp_norm = static_cast<const uint16_t*>(d.idx_comp_norm.d.p);
+        w.idx_comp_ape = static_cast<const float*>(d.idope.p);
+      }
+      if (r.kv) {
+        w.comp_wkv = static_cast<const uint16_t*>(d.comp_wkv.d.p);
+        w.comp_wgate = static_cast<const uint16_t*>(d.comp_wgate.d.p);
+        w.comp_norm = static_cast<const uint16_t*>(d.comp_norm.d.p);
+        w.comp_ape = static_cast<const float*>(d.dope.p);
+      }
+      w.ratio = r.ratio; w.cache_ord = r.ord; w.tail_ord = r.tail; w.idx_tail_ord = r.idx_tail;
+      w.kv_source = r.kv; w.index_source = r.idx;
+      RefLayer& R = d.ref;
+      R.ratio = r.ratio; R.kv_source = r.kv; R.index_source = r.idx;
+      R.cache_ord = r.ord; R.tail_ord = r.tail;
+      R.wq_a = &d.wq_a; R.wkv = &d.wkv; R.wq_b = &d.wq_b; R.wo_a = &d.wo_a; R.wo_b = &d.wo_b; R.idx_wq_b = &d.idx_wq_b;
+      R.q_norm = &d.q_norm; R.kv_norm = &d.kv_norm; R.idx_wp = &d.idx_wp;
+      R.comp_wkv = &d.comp_wkv; R.comp_wgate = &d.comp_wgate; R.comp_norm = &d.comp_norm;
+      R.comp_ape = r.kv ? d.comp_ape.data() : nullptr;
+      R.idx_comp_wkv = &d.idx_comp_wkv; R.idx_comp_wgate = &d.idx_comp_wgate; R.idx_comp_norm = &d.idx_comp_norm;
+      R.idx_comp_ape = r.idx ? d.idx_comp_ape.data() : nullptr;
+      R.sink = d.sink; R.inv_freq = d.inv_freq;
+    }
+    ref = std::make_unique<RefModel>(cfg, max_requests, std::vector<int>{4, 128}, 3);
+    for (auto& d : layers) ref->layers.push_back(d.ref);
+    dgpp::Csa2PoolShape shape;
+    shape.layers = int(layers.size()); shape.cache_ratio = {4, 128}; shape.tail_ordinals = 3;
+    shape.tail_floats = {16 * 2 * 512, 16 * 2 * 128, 256 * 512};
+    shape.tail_inf = {8 * 2 * 512, 8 * 2 * 128, 0};
+    shape.main_format = LatentFormat::kBf16;
+    shape.ring_format = LatentFormat::kBf16;
+    shape.index_bf16 = true;
+    shape.max_requests = max_requests;
+    shape.token_slots = max_cache; shape.block_tokens = cfg.block_tokens; shape.ring_slots = cfg.ring_slots;
+    pool.init(shape);
+    const size_t sb = dgpp::Csa2Layer::scratch_bytes(cfg, max_tokens, max_cache, 16, 8);
+    scratch = DevBuf(sb);
+    gemm_ws = DevBuf(64u << 20);
+    gemm.set_decode_rows(16);
+    layer = std::make_unique<dgpp::Csa2Layer>(gemm, cfg, max_tokens, max_cache, scratch.p, sb, gemm_ws.p, 64u << 20, 16, 8);
+    hidden.assign(size_t(max_requests), {});
+  }
+  const std::vector<float>& hidden_row(int req, int64_t pos) {
+    auto& h = hidden[size_t(req)];
+    while (h.size() < size_t(pos + 1) * cfg.hidden) {
+      const int64_t p = int64_t(h.size()) / cfg.hidden;
+      for (int i = 0; i < cfg.hidden; ++i) h.push_back(bf(0.9f * gauss(0xABC + req * 977 + p, i)));
+    }
+    return h;
+  }
+  std::vector<uint16_t> hidden_bits(int req, int64_t p0, int rows) {
+    std::vector<uint16_t> out;
+    for (int i = 0; i < rows; ++i) {
+      const auto& h = hidden_row(req, p0 + i);
+      for (int c = 0; c < cfg.hidden; ++c) out.push_back(float_to_bf16_bits(h[size_t(p0 + i) * cfg.hidden + c]));
+    }
+    return out;
+  }
+  void check(int l, const std::vector<uint16_t>& got, const std::vector<float>& want, int rows, const std::string& what,
+             const std::vector<std::vector<int32_t>>* dev_sel, RefRequest& R) {
+    std::vector<uint16_t> wb(want.size());
+    for (size_t i = 0; i < want.size(); ++i) wb[i] = float_to_bf16_bits(want[i]);
+    require_bf16(tag + " layer " + std::to_string(l) + " " + what + " output", compare_bf16(got, wb, 12), 0.03, 0.06);
+    if (dev_sel == nullptr) return;
+    for (int i = 0; i < rows; ++i) {
+      const auto& d = (*dev_sel)[size_t(i)];
+      const auto& r = R.sel[size_t(i)];
+      if (d == r) continue;
+      ++flips;
+      const auto& lg = R.logits[size_t(i)];
+      float lo = INFINITY, hi = -INFINITY;
+      for (const float v : lg) { lo = std::min(lo, v); hi = std::max(hi, v); }
+      float boundary = INFINITY;
+      for (const int32_t e : r) boundary = std::min(boundary, lg[size_t(e)]);
+      for (const int32_t e : d) require(e >= 0 && size_t(e) < lg.size(), "device selected an invisible entry");
+      for (const int32_t e : d)
+        if (std::find(r.begin(), r.end(), e) == r.end()) {
+          require(std::fabs(lg[size_t(e)] - boundary) <= 2e-3f * std::max(1e-6f, hi - lo) + 1e-6f,
+                  tag + " layer " + std::to_string(l) + " " + what + ": a selection flip beyond a near tie");
+        }
+      for (const int32_t e : r)
+        if (std::find(d.begin(), d.end(), e) == d.end()) {
+          require(std::fabs(lg[size_t(e)] - boundary) <= 2e-3f * std::max(1e-6f, hi - lo) + 1e-6f,
+                  tag + " layer " + std::to_string(l) + " " + what + ": a dropped entry beyond a near tie");
+        }
+    }
+  }
+  void prefill(int req, int64_t p0, int T) {
+    require(pool.ensure_request_blocks(req, p0 + T, 0), "blocks");
+    const auto hb = hidden_bits(req, p0, T);
+    std::vector<float> hf(hb.size());
+    for (size_t i = 0; i < hb.size(); ++i) hf[i] = bf16_bits_to_float(hb[i]);
+    DevBuf dh = upload(hb), dout(size_t(T) * cfg.hidden * 2);
+    for (size_t l = 0; l < layers.size(); ++l) {
+      layer->rebind(layers[l].w, int(l));
+      layer->enqueue_prefill(dh.p, pool, req, p0, T, dout.p, 0);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      const auto got = download<uint16_t>(dout.p, size_t(T) * cfg.hidden);
+      const auto want = ref->layer_rows(int(l), hf, p0, T, req);
+
+      std::vector<std::vector<int32_t>> dsel;
+      if (layers[l].w.ratio > 0) {
+        const auto topk = download<int32_t>(layer->debug_topk(), size_t(T) * cfg.index_topk);
+        const auto counts = download<int32_t>(layer->debug_counts(), size_t(T));
+        dsel.resize(size_t(T));
+        for (int i = 0; i < T; ++i)
+          dsel[size_t(i)].assign(topk.begin() + i * cfg.index_topk, topk.begin() + i * cfg.index_topk + counts[size_t(i)]);
+      }
+
+      check(int(l), got, want, T, "prefill req " + std::to_string(req) + " pos " + std::to_string(p0) + "+" + std::to_string(T),
+            layers[l].w.ratio > 0 ? &dsel : nullptr, ref->reqs[size_t(req)]);
+    }
+  }
+  struct Span { int req; int64_t p0; int rows; };
+  void decode(const std::vector<Span>& spans) {
+    std::vector<int32_t> req_ids, sp;
+    std::vector<int64_t> pos;
+    std::vector<uint16_t> hb;
+    for (const auto& s : spans) {
+      require(pool.ensure_request_blocks(s.req, s.p0 + s.rows, 0), "blocks");
+      sp.push_back(int(req_ids.size()));
+      sp.push_back(s.rows);
+      const auto h = hidden_bits(s.req, s.p0, s.rows);
+      hb.insert(hb.end(), h.begin(), h.end());
+      for (int i = 0; i < s.rows; ++i) { req_ids.push_back(s.req); pos.push_back(s.p0 + i); }
+    }
+    const int T = int(pos.size());
+    DevBuf dh = upload(hb), dri = upload(req_ids), dpos = upload(pos), dsp = upload(sp), dout(size_t(T) * cfg.hidden * 2);
+    for (size_t l = 0; l < layers.size(); ++l) {
+      layer->rebind(layers[l].w, int(l));
+      layer->enqueue_decode(dh.p, pool, static_cast<const int32_t*>(dri.p), static_cast<const int64_t*>(dpos.p),
+                            static_cast<const int32_t*>(dsp.p), int(spans.size()), T, dout.p, 0);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      const auto got = download<uint16_t>(dout.p, size_t(T) * cfg.hidden);
+      std::vector<int32_t> topk, counts;
+      if (layers[l].w.ratio > 0) {
+        topk = download<int32_t>(layer->debug_topk(), size_t(T) * cfg.index_topk);
+        counts = download<int32_t>(layer->debug_counts(), size_t(T));
+      }
+      int row = 0;
+      for (const auto& s : spans) {
+        std::vector<float> hf(size_t(s.rows) * cfg.hidden);
+        for (size_t i = 0; i < hf.size(); ++i) hf[i] = bf16_bits_to_float(hb[size_t(row) * cfg.hidden + i]);
+        const auto want = ref->layer_rows(int(l), hf, s.p0, s.rows, s.req);
+        const std::vector<uint16_t> g(got.begin() + size_t(row) * cfg.hidden, got.begin() + size_t(row + s.rows) * cfg.hidden);
+        std::vector<std::vector<int32_t>> dsel(size_t(s.rows));
+        for (int i = 0; i < s.rows; ++i)
+          if (layers[l].w.ratio > 0)
+            dsel[size_t(i)].assign(topk.begin() + (row + i) * cfg.index_topk, topk.begin() + (row + i) * cfg.index_topk + counts[size_t(row + i)]);
+        check(int(l), g, want, s.rows, "decode req " + std::to_string(s.req) + " pos " + std::to_string(s.p0) + "+" + std::to_string(s.rows),
+              layers[l].w.ratio > 0 ? &dsel : nullptr, ref->reqs[size_t(s.req)]);
+        row += s.rows;
+      }
+    }
+  }
+};
+
+DGPP_TEST(csa2_layer_0731_matches_the_oracle) {
+  // Two requests prefill a 128-token block each (the ratio-128 entry at the
+  // block's end, the ring filling), then decode in verify batches: the
+  // overlap-window state machine across the batch rows, the ratio-128
+  // sequential selection, the bf16 index selection.
+  Scenario0731 s("0731");
+  s.prefill(0, 0, 128);
+  s.prefill(1, 0, 128);
+  s.decode({{0, 128, 8}});
+  s.decode({{0, 136, 1}});
+  s.decode({{0, 128, 8}, {1, 128, 4}});
+  s.decode({{0, 136, 8}});
+  require(s.layer->index_violations() == 0, s.tag + ": index-key exactness violations");
+  std::printf("[INFO] 0731: %d selection flips, every one certified as a near tie\n", s.flips);
+}
+
 
 int main() { return dgpp::test::run_all(); }

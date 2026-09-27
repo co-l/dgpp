@@ -68,8 +68,17 @@ struct DevBuf {
 
   void upload(const void* host, size_t n) {
     if (n > bytes) throw std::runtime_error("upload overruns buffer");
-    if (cudaMemcpy(p, host, n, cudaMemcpyHostToDevice) != cudaSuccess)
-      throw std::runtime_error("upload failed");
+    // 1 KiB chunks: on this platform a host-to-device copy refreshes only its
+    // first 1 KiB in the kernels' loadable cache (2026-09-27), so a longer
+    // single transfer would leave the tail of a reused region stale.
+    size_t off = 0;
+    while (off < n) {
+      const size_t c = std::min(size_t(1024), n - off);
+      if (cudaMemcpy(static_cast<uint8_t*>(p) + off, static_cast<const uint8_t*>(host) + off, c,
+                     cudaMemcpyHostToDevice) != cudaSuccess)
+        throw std::runtime_error("upload failed");
+      off += c;
+    }
   }
   void download(void* host, size_t n) const {
     if (n > bytes) throw std::runtime_error("download overruns buffer");
