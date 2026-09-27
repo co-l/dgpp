@@ -970,13 +970,13 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
   // layer, then the decoder over the replay segment only — the call's last
   // `sliding_window` rows (a chunk's tail carries over to the call's last
   // chunk, where the segment is assembled). `walk_rows` is the row count
-  // the current layers walk; the head's rows land at `row_off` within the
-  // chunk so finish_run's last row is the segment's.
+  // the current layers walk; the head heads only the chunk's rows (the
+  // segment's leading tail rows are skipped), so finish_run's row T - 1 is
+  // the chunk's last row.
   const bool bounded = prefill_bounded_ && !run.decode;
   const int dec0 = cfg_.decoder_first_layer();
   const int win = cfg_.sliding_window;
   int walk_rows = T;
-  int row_off = 0;
   if (bounded) {
     if (run.capture) throw std::logic_error("run_rows: the bounded prefill is never captured");
     for (int e : cfg_.engram_layer_ids)
@@ -1072,7 +1072,6 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
         pre_cur_ = packed_pre;
         pre_nxt_ = packed_pre == pre_a_ ? pre_b_ : pre_a_;
         walk_rows = packed;
-        row_off = 0;
         rows.span_lens = dec_lens.data();
         rows.span_pos0 = dec_pos0.data();
         rows.window_floor = 0;
@@ -1121,7 +1120,7 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
       pre_cur_ = seg_pre_;
       pre_nxt_ = pre_a_;
       walk_rows = R;
-      row_off = T - R;
+      // The head skips the segment's leading tail rows (see the head view).
       rows.pos0 = run.pos0 + T - R;
       rows.window_floor = rows.pos0 > call_pos0_ ? rows.pos0 : 0;
       rows.publish = false;
@@ -1180,20 +1179,27 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
   }
   if (head) {
     // The head: the weighted collapse with the last site's pre, the final
-    // norm, the lm head on every walked row (bounded: the segment's rows,
-    // at the chunk's last rows; the rows before them read as NaN).
+    // norm, the lm head on the chunk's rows. The bounded prefill's segment
+    // starts with the previous chunk's tail rows, which are not chunk rows:
+    // they are skipped, and the head packs the rest so the chunk's last row
+    // lands at T - 1 (finish_run's row).
     if (debug_teacher_ && debug_teacher_->size() >= static_cast<size_t>(cfg_.num_hidden_layers))
       teach(cfg_.num_hidden_layers - 1);
-    if (row_off > 0 && run.all_rows) {
-      DGPP_CUDA_OK(cudaMemsetAsync(logits_, 0xFF, static_cast<size_t>(row_off) * lm_vocab_count_ * sizeof(float), stream_));
-      DGPP_CUDA_OK(cudaMemsetAsync(h_, 0xFF, static_cast<size_t>(row_off) * H * 2, stream_));
+    const bool head_view = bounded && !group;
+    const int head_skip = head_view ? std::max(0, walk_rows - T) : 0;
+    const int head_rows = head_view ? std::min(walk_rows, T) : walk_rows;
+    const int head_off = head_view ? T - head_rows : 0;
+    if (head_off > 0 && run.all_rows) {
+      DGPP_CUDA_OK(cudaMemsetAsync(logits_, 0xFF, static_cast<size_t>(head_off) * lm_vocab_count_ * sizeof(float), stream_));
+      DGPP_CUDA_OK(cudaMemsetAsync(h_, 0xFF, static_cast<size_t>(head_off) * H * 2, stream_));
     }
-    launch_mhc_collapse_normed(cur_, pre_cur_, nullptr, cfg_.rms_norm_eps, collapsed_ + static_cast<size_t>(row_off) * H,
-                               nullptr, mhc_cfg_, walk_rows, stream_);
-    csa2_rmsnorm_bf16(collapsed_ + static_cast<size_t>(row_off) * H, H, globals_.final_norm,
-                      h_ + static_cast<size_t>(row_off) * H, H, walk_rows, H, cfg_.rms_norm_eps, stream_);
-    gemm_.matmul(h_ + static_cast<size_t>(row_off) * H, globals_.lm_head,
-                 logits_ + static_cast<size_t>(row_off) * lm_vocab_count_, walk_rows, lm_vocab_count_, H, DType::BF16,
+    launch_mhc_collapse_normed(cur_ + static_cast<size_t>(head_skip) * 4 * H,
+                               pre_cur_ + static_cast<size_t>(head_skip) * 4, nullptr, cfg_.rms_norm_eps,
+                               collapsed_ + static_cast<size_t>(head_off) * H, nullptr, mhc_cfg_, head_rows, stream_);
+    csa2_rmsnorm_bf16(collapsed_ + static_cast<size_t>(head_off) * H, H, globals_.final_norm,
+                      h_ + static_cast<size_t>(head_off) * H, H, head_rows, H, cfg_.rms_norm_eps, stream_);
+    gemm_.matmul(h_ + static_cast<size_t>(head_off) * H, globals_.lm_head,
+                 logits_ + static_cast<size_t>(head_off) * lm_vocab_count_, head_rows, lm_vocab_count_, H, DType::BF16,
                  GemmOut::F32, static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
     if (group && !dec_row0.empty()) {
       // The packed decoder's last row of each span into the row the
