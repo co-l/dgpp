@@ -111,6 +111,12 @@ DGPP_TEST(dsv41_config_parses_the_release) {
   require(d.n_experts == 128 && d.top_k == 3, "draft moe_config");
 }
 
+DGPP_TEST(dsv41_config_scale_shift) {
+  const dgpp::Dsv41TextConfig c = parse(config_json());
+  require(c.fp8_block_size == 32, "the V4.1 grid");
+  require(c.scale_shift() == 5, "the 32 x 32 scale grid's shift");
+}
+
 DGPP_TEST(dsv41_config_refuses_unsupported_shapes) {
   require(has(refusal(config_json("\"model_type\": \"deepseek_v41\"", "\"model_type\": \"deepseek_v4\"")), "model_type"), "type");
   require(has(refusal(config_json("\"model_type\": \"deepseek_v41_text\"", "\"model_type\": \"deepseek_v3\"")),

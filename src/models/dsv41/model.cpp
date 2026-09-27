@@ -714,7 +714,7 @@ void Dsv41Model::draft_first(int req, const int64_t* tokens, const int64_t* d_po
     const Dsv41DraftResident& d0 = draft_stage(0);
     if (!d0.main_proj.payload || !d0.main_norm) throw std::runtime_error("mtp_run_rows: the DSpark main projection is unbound");
     launch_scale_gemm_grid_bf16(src, static_cast<size_t>(W), d0.main_proj.payload, d0.main_proj.scales, main_x_, T, H, W,
-                                stream_, 0, 5, 5, dense_mma_);
+                                stream_, 0, cfg_.scale_shift(), cfg_.scale_shift(), dense_mma_);
     csa2_rmsnorm_bf16(main_x_, H, d0.main_norm, main_x_, H, T, H, eps, stream_);
   }
   // ---- the draft rings: each stage's window latent of the real rows ------------

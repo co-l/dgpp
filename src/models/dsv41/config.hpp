@@ -185,6 +185,9 @@ struct Dsv41TextConfig {
   // coefficients (the single-pass form); the 0731 release (and the GLM
   // form) collapses with the site's own pre.
   bool single_pass_pre() const;
+  // The dense fp8 scale grid's log2 block size: 32 x 32 for the V4.1
+  // release, 128 x 128 for the 0731 release.
+  int scale_shift() const { return fp8_block_size == 128 ? 7 : 5; }
   int num_index_sources() const { return static_cast<int>(index_source_layer_ids.size()); }
   bool has_engram(int l) const;
   int engram_index(int l) const;  // ordinal among the Engram layers, -1 otherwise

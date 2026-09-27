@@ -178,7 +178,7 @@ void Dsv41EngramLayer::project(const Dsv41EngramLayerWeights& w, int rows, uint1
   if (w.wkv.payload == nullptr || w.wkv.rows != N || w.wkv.cols != K)
     throw std::invalid_argument("Dsv41EngramLayer: wkv geometry disagrees with the rank's rows");
   launch_scale_gemm_grid_bf16(e_, static_cast<size_t>(K), w.wkv.payload, w.wkv.scales, kv_dst ? kv_dst : kv_, rows, N, K,
-                              stream, 0, 5, 5, dense_mma_);
+                              stream, 0, cfg_.scale_shift(), cfg_.scale_shift(), dense_mma_);
 }
 
 void Dsv41EngramLayer::gate(const Dsv41EngramLayerWeights& w, uint16_t* x, const uint16_t* kv, int rows,
