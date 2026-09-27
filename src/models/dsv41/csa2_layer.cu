@@ -69,8 +69,10 @@ Csa2Layer::Layout Csa2Layer::layout(const Csa2Config& cfg, int max_tokens, int64
   L.q_scale = alloc(T * cfg.index_heads * 4);
   L.w = alloc(T * cfg.index_heads * 2);
   L.w_folded = alloc(T * cfg.index_heads * 4);
-  L.comp_kv = alloc(T * kCsa2Latent * 4);
-  L.comp_score = alloc(T * kCsa2Latent * 4);
+  L.comp_kv = alloc(T * 2 * kCsa2Latent * 4);
+  L.comp_score = alloc(T * 2 * kCsa2Latent * 4);
+  L.idx_comp_kv = alloc(T * 2 * kCsa2IndexDim * 4);
+  L.idx_comp_score = alloc(T * 2 * kCsa2IndexDim * 4);
   L.latent = alloc(T * kCsa2Latent * 2);
   L.ik = alloc(T * kCsa2IndexDim * 2);
   L.pos = alloc(T * 8);
@@ -87,8 +89,12 @@ Csa2Layer::Layout Csa2Layer::layout(const Csa2Config& cfg, int max_tokens, int64
   L.wcounts = alloc(T * 4);
   L.dlist = alloc(size_t(max_decode_rows) * size_t(cfg.window + kMaxDraftBlock) * 4);
   L.dcounts = alloc(size_t(max_decode_rows) * 4);
-  L.wscratch = alloc((size_t(cfg.window) - 1 + T) * latent_row_bytes(Csa2StatePool::kRingFormat, kCsa2Latent));
-  L.topk = alloc(T * cfg.index_topk * 4);
+  L.wscratch = alloc((size_t(cfg.window) - 1 + T) * latent_row_bytes(cfg.ring_format, kCsa2Latent));
+  // The C128A sequential selection lists every visible entry (up to
+    // max_cache_tokens / 128), so the selection column is wider than the
+    // indexer's topk when the context outruns it.
+    L.sel_col = std::max<int>(cfg.index_topk, int((max_cache_tokens + 127) / 128));
+  L.topk = alloc(size_t(T) * size_t(L.sel_col) * 4);
   L.counts = alloc(T * 4);
   L.cand = alloc(T * cfg.candidate_blocks * 4);
   L.cand_counts = alloc(T * 4);
@@ -100,7 +106,7 @@ Csa2Layer::Layout Csa2Layer::layout(const Csa2Config& cfg, int max_tokens, int64
   L.m_win = alloc(size_t(L.ws_slots) * lh * 4);
   L.l_win = alloc(size_t(L.ws_slots) * lh * 4);
   L.c_win = alloc(size_t(L.ws_slots) * lh * kCsa2Latent * 4);
-  L.gather_k = alloc(size_t(L.max_entries) * kCsa2IndexDim);
+  L.gather_k = alloc(size_t(L.max_entries) * kCsa2IndexDim * 2);  // bf16 rows (the fp8 form fits)
   L.gather_scale = alloc(size_t(L.max_entries) * 4);
   L.dot = alloc(size_t(tile_cap) * cfg.index_heads * size_t(L.max_entries) * 4);
   L.logits = alloc(size_t(tile_cap) * size_t(L.max_entries) * 4);
@@ -126,6 +132,7 @@ Csa2Layer::Csa2Layer(IGemm& gemm, const Csa2Config& cfg, int max_tokens, int64_t
   if (scratch == nullptr || scratch_capacity < L.total) throw std::invalid_argument("csa2 layer: scratch too small");
   scratch_ = static_cast<uint8_t*>(scratch);
   tile_cap_ = L.tile_cap;
+  sel_col_ = L.sel_col;
   max_entries_ = L.max_entries;
   ws_slots_ = L.ws_slots;
   ws_win_rows_ = L.ws_win_rows;
@@ -143,6 +150,8 @@ Csa2Layer::Csa2Layer(IGemm& gemm, const Csa2Config& cfg, int max_tokens, int64_t
   w_folded_ = reinterpret_cast<float*>(at(L.w_folded));
   comp_kv_ = reinterpret_cast<float*>(at(L.comp_kv));
   comp_score_ = reinterpret_cast<float*>(at(L.comp_score));
+  idx_comp_kv_ = reinterpret_cast<float*>(at(L.idx_comp_kv));
+  idx_comp_score_ = reinterpret_cast<float*>(at(L.idx_comp_score));
   latent_ = reinterpret_cast<uint16_t*>(at(L.latent));
   ik_ = reinterpret_cast<uint16_t*>(at(L.ik));
   pos_ = reinterpret_cast<int64_t*>(at(L.pos));
@@ -187,7 +196,7 @@ Csa2Layer::Csa2Layer(IGemm& gemm, const Csa2Config& cfg, int max_tokens, int64_t
   DGPP_CUDA_OK(cudaMemset(select_ws_, 0, dsa_select_workspace_bytes(max_decode_rows, max_entries_)));
   DGPP_CUDA_OK(cudaMemset(counter_ws_, 0, 16));
   DGPP_CUDA_OK(cudaMemset(violations_, 0, 16));
-  DGPP_CUDA_OK(cudaMemset(wscratch_, 0, (size_t(cfg.window) - 1 + size_t(max_tokens)) * latent_row_bytes(Csa2StatePool::kRingFormat, kCsa2Latent)));
+  DGPP_CUDA_OK(cudaMemset(wscratch_, 0, (size_t(cfg.window) - 1 + size_t(max_tokens)) * latent_row_bytes(cfg.ring_format, kCsa2Latent)));
 }
 
 void Csa2Layer::rebind(const Csa2LayerWeights& w, int layer) {
@@ -195,13 +204,27 @@ void Csa2Layer::rebind(const Csa2LayerWeights& w, int layer) {
       w.wo_b.payload == nullptr || w.q_norm == nullptr || w.kv_norm == nullptr || w.attn_sink == nullptr ||
       w.inv_freq == nullptr)
     throw std::invalid_argument("csa2 layer: a null projection, norm, sink or rotary table");
-  if (w.ratio != 0 && w.ratio != 1 && w.ratio != 2) throw std::invalid_argument("csa2 layer: ratio must be 0, 1 or 2");
+  if (w.ratio != 0 && w.ratio != 1 && w.ratio != 2 && w.ratio != 4 && w.ratio != 128)
+    throw std::invalid_argument("csa2 layer: ratio must be 0, 1, 2, 4 or 128");
   if (w.ratio > 0 && w.cache_ord < 0) throw std::invalid_argument("csa2 layer: a compressing layer needs its cache");
   if (w.ratio == 0 && (w.kv_source || w.index_source || w.candidate_source || w.uses_candidates))
     throw std::invalid_argument("csa2 layer: a window-only layer owns no compressor, indexer or candidates");
-  if (w.kv_source && (w.comp_wkv == nullptr || w.comp_norm == nullptr || w.idx_wk == nullptr || w.idx_k_norm == nullptr ||
-                      (w.ratio == 2 && (w.comp_wgate == nullptr || w.tail_ord < 0))))
-    throw std::invalid_argument("csa2 layer: a kv source needs its compressor and index-key weights");
+  if (w.kv_source) {
+    if (w.ratio == 1 && (w.comp_wkv == nullptr || w.comp_norm == nullptr ||
+                         (!cfg_.index_bf16 && (w.idx_wk == nullptr || w.idx_k_norm == nullptr))))
+      throw std::invalid_argument("csa2 layer: a kv source needs its compressor and index-key weights");
+    if (w.ratio == 2 && (w.comp_wkv == nullptr || w.comp_norm == nullptr || w.comp_wgate == nullptr || w.tail_ord < 0 ||
+                         w.idx_wk == nullptr || w.idx_k_norm == nullptr))
+      throw std::invalid_argument("csa2 layer: a kv source needs its compressor and index-key weights");
+    if (w.ratio == 4 && (w.comp_wkv == nullptr || w.comp_norm == nullptr || w.comp_wgate == nullptr ||
+                         w.comp_ape == nullptr || w.tail_ord < 0 || w.idx_comp_wkv == nullptr ||
+                         w.idx_comp_wgate == nullptr || w.idx_comp_norm == nullptr || w.idx_comp_ape == nullptr ||
+                         w.idx_tail_ord < 0))
+      throw std::invalid_argument("csa2 layer: a C4A source needs both compressors and the index keys");
+    if (w.ratio == 128 && (w.comp_wkv == nullptr || w.comp_norm == nullptr || w.comp_wgate == nullptr ||
+                           w.comp_ape == nullptr || w.tail_ord < 0))
+      throw std::invalid_argument("csa2 layer: a C128A source needs its block compressor");
+  }
   if (w.index_source && (w.idx_wq_b.payload == nullptr || w.idx_wp == nullptr))
     throw std::invalid_argument("csa2 layer: an index source needs its indexer weights");
   if ((w.candidate_source || w.uses_candidates) && !w.index_source)
@@ -225,6 +248,8 @@ bool Csa2Layer::prepare(int tokens) {
   bool ok = true;
   ok &= gemm_.ensure_plan(tokens, kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32, size_t(cfg_.hidden));
   ok &= gemm_.ensure_plan(tokens, kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::BF16, size_t(cfg_.hidden));
+  ok &= gemm_.ensure_plan(tokens, 2 * kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32, size_t(cfg_.hidden));
+  ok &= gemm_.ensure_plan(tokens, 2 * kCsa2IndexDim, cfg_.hidden, DType::BF16, GemmOut::F32, size_t(cfg_.hidden));
   ok &= gemm_.ensure_plan(tokens, kCsa2IndexDim, kCsa2Latent, DType::BF16, GemmOut::BF16, size_t(kCsa2Latent));
   ok &= gemm_.ensure_plan(tokens, cfg_.index_heads, cfg_.hidden, DType::BF16, GemmOut::BF16, size_t(cfg_.hidden));
   return ok;
@@ -251,8 +276,13 @@ void Csa2Layer::validate_pool(const Csa2StatePool& pool) const {
   if (layer_ < 0 || layer_ >= pool.shape().layers) throw std::invalid_argument("csa2 layer: rebind a layer first");
   if (w_.ratio > 0 && (w_.cache_ord >= pool.caches() || pool.cache_ratio(w_.cache_ord) != w_.ratio))
     throw std::invalid_argument("csa2 layer: the layer's cache ordinal / ratio disagrees with the pool");
-  if (w_.ratio == 2 && w_.kv_source && w_.tail_ord >= pool.shape().tail_ordinals)
+  if (pool.shape().main_format != cfg_.main_format || pool.shape().ring_format != cfg_.ring_format ||
+      pool.shape().index_bf16 != cfg_.index_bf16)
+    throw std::invalid_argument("csa2 layer: the pool's cache forms disagree with the config");
+  if (w_.kv_source && w_.ratio > 0 && w_.ratio != 1 && w_.tail_ord >= pool.shape().tail_ordinals)
     throw std::invalid_argument("csa2 layer: tail ordinal out of the pool's range");
+  if (w_.kv_source && w_.ratio == 4 && w_.idx_tail_ord >= pool.shape().tail_ordinals)
+    throw std::invalid_argument("csa2 layer: the indexer tail ordinal out of the pool's range");
 }
 
 // ---- the projections -------------------------------------------------------------------------
@@ -264,6 +294,7 @@ void Csa2Layer::project_kv(const void* hidden_in, int tokens, const int64_t* pos
   csa2_rmsnorm_bf16(kv_, kCsa2Latent, w_.kv_norm, kv_, kCsa2Latent, tokens, kCsa2Latent, cfg_.eps, stream);
   csa2_rope_apply(kv_ + (kCsa2Latent - kCsa2Rope), kCsa2Latent, kCsa2Latent, 1, kCsa2Rope, pos, w_.inv_freq, false,
                   tokens, stream);
+  if (cfg_.ring_format == LatentFormat::kBf16) csa2_actquant8_dequant_bf16(kv_, kv_, tokens, stream);
 }
 
 void Csa2Layer::project_q_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream) {
@@ -275,6 +306,7 @@ void Csa2Layer::project_q_kv(const void* hidden_in, int tokens, const int64_t* p
   project_kv(hidden_in, tokens, pos, stream);
   launch_scale_gemm_grid_bf16(qr_, size_t(cfg_.q_lora), w_.wq_b.payload, w_.wq_b.scales, q_, tokens,
                               lh * kCsa2Latent, cfg_.q_lora, stream, 0, 5, 5, cfg_.dense_mma);
+  if (cfg_.q_renorm) csa2_q_renorm_bf16(q_, tokens, lh, cfg_.eps, stream);
   csa2_rope_apply(q_ + (kCsa2Latent - kCsa2Rope), int64_t(lh) * kCsa2Latent, kCsa2Latent, lh, kCsa2Rope, pos,
                   w_.inv_freq, false, tokens, stream);
 }
@@ -285,30 +317,40 @@ void Csa2Layer::indexer_query(const void* hidden_in, int tokens, const int64_t* 
                               heads * kCsa2IndexDim, cfg_.q_lora, stream, 0, 5, 5, cfg_.dense_mma);
   csa2_rope_apply(idx_q_ + (kCsa2IndexDim - kCsa2Rope), int64_t(heads) * kCsa2IndexDim, kCsa2IndexDim, heads,
                   kCsa2Rope, pos, w_.inv_freq, false, tokens, stream);
-  csa2_index_q_quant(idx_q_, tokens, heads, q_fp8_, q_scale_, violations_, stream);
+  if (cfg_.index_bf16) {
+    csa2_hadamard128_bf16(idx_q_, idx_q_, int64_t(tokens) * heads, stream);
+    csa2_fp4_dequant_bf16(idx_q_, idx_q_, int64_t(tokens) * heads, stream);
+  } else {
+    csa2_index_q_quant(idx_q_, tokens, heads, q_fp8_, q_scale_, violations_, stream);
+  }
   gemm_.matmul(hidden_in, w_.idx_wp, iw_, tokens, heads, cfg_.hidden, DType::BF16, GemmOut::BF16,
                size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
-  csa2_fold_weights(iw_, q_scale_, w_folded_, int64_t(tokens) * heads, stream);
+  csa2_fold_weights(iw_, cfg_.index_bf16 ? nullptr : q_scale_, cfg_.fold_scale, w_folded_, int64_t(tokens) * heads, stream);
 }
 
 void Csa2Layer::publish_entries(Csa2StatePool& pool, const int32_t* req_ids, int n, cudaStream_t stream) {
   if (n <= 0) return;
   const int ord = w_.cache_ord;
   const int epb = pool.entries_per_block(ord);
-  // The index keys from the unrotated latents: wk -> RMSNorm -> the tail
-  // rotated at the entry's position -> the planar form.
-  gemm_.matmul(latent_, w_.idx_wk, ik_, n, kCsa2IndexDim, kCsa2Latent, DType::BF16, GemmOut::BF16,
-               size_t(kCsa2Latent), gemm_ws_, gemm_ws_bytes_, stream);
-  csa2_rmsnorm_bf16(ik_, kCsa2IndexDim, w_.idx_k_norm, ik_, kCsa2IndexDim, n, kCsa2IndexDim, cfg_.eps, stream);
-  csa2_rope_apply(ik_ + (kCsa2IndexDim - kCsa2Rope), kCsa2IndexDim, kCsa2IndexDim, 1, kCsa2Rope, ent_pos_, w_.inv_freq,
-                  false, n, stream);
-  csa2_index_k_append(ik_, req_ids, entries_, n, pool.block_tables(), int(pool.total_blocks()), epb, pool.index_k(ord),
-                      pool.index_scale(ord), violations_, stream);
-  // The main rows: the latent's tail rotated, then the fp4_block append.
+  if (!cfg_.index_bf16) {
+    // The index keys from the unrotated latents: wk -> RMSNorm -> the tail
+    // rotated at the entry's position -> the planar form.
+    gemm_.matmul(latent_, w_.idx_wk, ik_, n, kCsa2IndexDim, kCsa2Latent, DType::BF16, GemmOut::BF16,
+                 size_t(kCsa2Latent), gemm_ws_, gemm_ws_bytes_, stream);
+    csa2_rmsnorm_bf16(ik_, kCsa2IndexDim, w_.idx_k_norm, ik_, kCsa2IndexDim, n, kCsa2IndexDim, cfg_.eps, stream);
+    csa2_rope_apply(ik_ + (kCsa2IndexDim - kCsa2Rope), kCsa2IndexDim, kCsa2IndexDim, 1, kCsa2Rope, ent_pos_, w_.inv_freq,
+                    false, n, stream);
+    csa2_index_k_append(ik_, req_ids, entries_, n, pool.block_tables(), int(pool.total_blocks()), epb, pool.index_k(ord),
+                        pool.index_scale(ord), violations_, stream);
+  }
+  // The main rows: the latent's tail rotated, then the append (the pool's
+  // format: fp4_block v4.1, the dequantized bf16 0731).
   csa2_rope_apply(latent_ + (kCsa2Latent - kCsa2Rope), kCsa2Latent, kCsa2Latent, 1, kCsa2Rope, ent_pos_, w_.inv_freq,
                   false, n, stream);
+  if (w_.ratio == 4 || w_.ratio == 128)
+    csa2_actquant8_dequant_bf16(latent_, latent_, n, stream);
   dsa_latent_append(latent_, req_ids, entries_, n, pool.block_tables(), int(pool.total_blocks()), epb, pool.main(ord),
-                    kCsa2Latent, stream, Csa2StatePool::kMainFormat);
+                    kCsa2Latent, stream, pool.main_format());
 }
 
 void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, const uint8_t* win_cache,
@@ -332,7 +374,7 @@ void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, con
   const int n_split_win = split_window ? std::min(n_split_main, kWinDecodeSplit) : 1;
   dsa_attn_partial(q, win_cache, req_ids_win, list + size_t(row0) * list_stride, list_stride, counts + row0, rows,
                    n_split_win, lh, kCsa2Latent, win_block_tokens, win_table, 1, attn_scale_, m_win_, l_win_, c_win_,
-                   stream, Csa2StatePool::kRingFormat, nullptr, 0);
+                   stream, pool.ring_format(), nullptr, 0);
   int n_main = 0;
   if (w_.ratio > 0) {
     const int ord = w_.cache_ord;
@@ -341,12 +383,12 @@ void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, con
     const int32_t* counts = counts_ + sel_base + row0;
     n_main = n_split_main;
     if (!(lh >= 16 && lh % 16 == 0 &&
-          dsa_attn_listed(q, pool.main(ord), req_ids_main, topk, cfg_.index_topk, counts, rows, n_main, lh, kCsa2Latent,
+          dsa_attn_listed(q, pool.main(ord), req_ids_main, topk, sel_col_, counts, rows, n_main, lh, kCsa2Latent,
                           epb, pool.block_tables(), int(pool.total_blocks()), attn_scale_, m_main_, l_main_, c_main_,
-                          stream, Csa2StatePool::kMainFormat, nullptr, 0)))
-      dsa_attn_partial(q, pool.main(ord), req_ids_main, topk, cfg_.index_topk, counts, rows, n_main, lh, kCsa2Latent,
+                          stream, pool.main_format(), nullptr, 0)))
+      dsa_attn_partial(q, pool.main(ord), req_ids_main, topk, sel_col_, counts, rows, n_main, lh, kCsa2Latent,
                        epb, pool.block_tables(), int(pool.total_blocks()), attn_scale_, m_main_, l_main_, c_main_,
-                       stream, Csa2StatePool::kMainFormat, nullptr, 0);
+                       stream, pool.main_format(), nullptr, 0);
   }
   csa2_attn_finish(n_main ? m_main_ : nullptr, n_main ? l_main_ : nullptr, n_main ? c_main_ : nullptr, n_main, m_win_,
                    l_win_, c_win_, n_split_win, w_.attn_sink, rows, lh, pos, w_.inv_freq,
@@ -384,13 +426,45 @@ void Csa2Layer::enqueue_decode(const void* hidden_in, Csa2StatePool& pool, const
   // own queries: the ring is read after the append).
   csa2_ring_slot_positions(pos, slots_, tokens, cfg_.ring_slots, stream);
   dsa_latent_append(kv_, req_ids, slots_, tokens, pool.ring_table(), 1, cfg_.ring_slots, pool.ring(layer_), kCsa2Latent,
-                    stream, Csa2StatePool::kRingFormat);
+                    stream, pool.ring_format());
   csa2_window_slots_decode(pos, tokens, cfg_.window, cfg_.ring_slots, wlist_, wcounts_, stream);
 
   if (w_.ratio > 0) {
     const int ord = w_.cache_ord;
     if (w_.kv_source) {
-      if (w_.ratio == 2) {
+      if (w_.ratio == 4) {
+        // The C4A main latent and the indexer's own compressor, per request
+        // span; the completed windows publish into the pool.
+        gemm_.matmul(hidden_in, w_.comp_wkv, comp_kv_, tokens, 2 * kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32,
+                     size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
+        gemm_.matmul(hidden_in, w_.comp_wgate, comp_score_, tokens, 2 * kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32,
+                     size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
+        csa2_compress4_decode(comp_kv_, comp_score_, req_ids, pos, req_spans, num_requests, kCsa2Latent, w_.comp_ape,
+                              w_.comp_norm, cfg_.eps, pool.tails(w_.tail_ord), latent_, entries_, tokens,
+                              tail_snapshots, stream);
+        csa2_scaled_positions(entries_, ent_pos_, tokens, 4, 0, stream);
+        gemm_.matmul(hidden_in, w_.idx_comp_wkv, idx_comp_kv_, tokens, 2 * kCsa2IndexDim, cfg_.hidden, DType::BF16,
+                     GemmOut::F32, size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
+        gemm_.matmul(hidden_in, w_.idx_comp_wgate, idx_comp_score_, tokens, 2 * kCsa2IndexDim, cfg_.hidden, DType::BF16,
+                     GemmOut::F32, size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
+        csa2_compress4_decode(idx_comp_kv_, idx_comp_score_, req_ids, pos, req_spans, num_requests, kCsa2IndexDim,
+                              w_.idx_comp_ape, w_.idx_comp_norm, cfg_.eps, pool.tails(w_.idx_tail_ord), ik_, nullptr,
+                              tokens, nullptr, stream);
+        csa2_rope_apply(ik_ + (kCsa2IndexDim - kCsa2Rope), kCsa2IndexDim, kCsa2IndexDim, 1, kCsa2Rope, ent_pos_,
+                        w_.inv_freq, false, tokens, stream);
+        csa2_hadamard128_bf16(ik_, ik_, tokens, stream);
+        csa2_fp4_dequant_bf16(ik_, ik_, tokens, stream);
+        csa2_index_k_append_bf16(ik_, req_ids, entries_, tokens, pool.block_tables(), int(pool.total_blocks()),
+                                 pool.entries_per_block(ord), pool.index_k(ord), stream);
+      } else if (w_.ratio == 128) {
+        gemm_.matmul(hidden_in, w_.comp_wkv, comp_kv_, tokens, kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32,
+                     size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
+        gemm_.matmul(hidden_in, w_.comp_wgate, comp_score_, tokens, kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32,
+                     size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
+        csa2_compress128_decode(comp_kv_, comp_score_, req_ids, pos, req_spans, num_requests, w_.comp_ape, w_.comp_norm,
+                                cfg_.eps, pool.tails(w_.tail_ord), latent_, entries_, tokens, tail_snapshots, stream);
+        csa2_scaled_positions(entries_, ent_pos_, tokens, 128, 0, stream);
+      } else if (w_.ratio == 2) {
         gemm_.matmul(hidden_in, w_.comp_wkv, comp_kv_, tokens, kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32,
                      size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
         gemm_.matmul(hidden_in, w_.comp_wgate, comp_score_, tokens, kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32,
@@ -411,28 +485,41 @@ void Csa2Layer::enqueue_decode(const void* hidden_in, Csa2StatePool& pool, const
     if (w_.index_source) {
       indexer_query(hidden_in, tokens, pos, stream);
       const int epb = pool.entries_per_block(ord);
-      if (w_.candidate_source) {
+      if (cfg_.index_bf16) {
+        csa2_select_bf16_decode(idx_q_, w_folded_, req_ids, pos_sel_, tokens, pool.block_tables(),
+                                int(pool.total_blocks()), pool.index_k(ord), epb, cfg_.index_heads, cfg_.index_topk,
+                                static_cast<uint64_t*>(select_ws_), max_entries_, topk_, counts_, stream);
+      } else if (w_.candidate_source) {
         csa2_select_candidates_decode(
             q_fp8_, w_folded_, req_ids, pos_sel_, tokens, pool.block_tables(),
             int(pool.total_blocks()), pool.index_k(ord), pool.index_scale(ord), epb,
             cfg_.index_heads, cfg_.candidate_block, cfg_.candidate_blocks,
             static_cast<uint64_t*>(select_ws_), max_entries_, cand_, cand_counts_, stream);
         cand_at(0) = shape;
-      } else if (w_.uses_candidates) {
-        require_shape(cand_at(0), shape, "the candidate pool");
-      }
-      if (w_.candidate_source || w_.uses_candidates)
         csa2_select_listed_decode(q_fp8_, w_folded_, req_ids, pos_sel_, tokens, pool.block_tables(),
                                   int(pool.total_blocks()), pool.index_k(ord),
                                   pool.index_scale(ord), epb, cfg_.index_heads, cand_,
                                   cfg_.candidate_blocks, cand_counts_, cfg_.candidate_block,
                                   cfg_.index_topk, static_cast<uint64_t*>(select_ws_), max_entries_,
                                   topk_, counts_, stream);
-      else
+      } else if (w_.uses_candidates) {
+        require_shape(cand_at(0), shape, "the candidate pool");
+        csa2_select_listed_decode(q_fp8_, w_folded_, req_ids, pos_sel_, tokens, pool.block_tables(),
+                                  int(pool.total_blocks()), pool.index_k(ord),
+                                  pool.index_scale(ord), epb, cfg_.index_heads, cand_,
+                                  cfg_.candidate_blocks, cand_counts_, cfg_.candidate_block,
+                                  cfg_.index_topk, static_cast<uint64_t*>(select_ws_), max_entries_,
+                                  topk_, counts_, stream);
+      } else {
         dsa_select_decode(q_fp8_, w_folded_, req_ids, pos_sel_, tokens, pool.block_tables(), int(pool.total_blocks()),
                           pool.index_k(ord), pool.index_scale(ord), epb, cfg_.index_heads, kCsa2IndexDim,
                           cfg_.index_topk, 1, cfg_.index_topk, topk_, counts_, select_ws_, max_entries_, counter_ws_, 0,
                           stream, true);
+      }
+      sel_at(0) = shape;
+    } else if (w_.ratio == 128) {
+      // The C128A sequential selection: every visible entry.
+      csa2_sequential_topk(pos_sel_, topk_, counts_, tokens, sel_col_, stream);
       sel_at(0) = shape;
     } else {
       require_shape(sel_at(0), shape, "the selection");
@@ -453,7 +540,7 @@ void Csa2Layer::append_window_rows(const void* x, Csa2StatePool& pool, const int
   project_kv(x, n, pos, stream);
   csa2_ring_slot_positions(pos, slots_, n, cfg_.ring_slots, stream);
   dsa_latent_append(kv_, req_ids, slots_, n, pool.ring_table(), 1, cfg_.ring_slots, pool.ring(layer_), kCsa2Latent,
-                    stream, Csa2StatePool::kRingFormat);
+                    stream, pool.ring_format());
 }
 
 void Csa2Layer::enqueue_draft_block(const void* hidden_in, Csa2StatePool& pool, const int32_t* req_ids, const int64_t* pos,
@@ -467,7 +554,7 @@ void Csa2Layer::enqueue_draft_block(const void* hidden_in, Csa2StatePool& pool, 
   project_q_kv(hidden_in, rows, pos, stream);
   csa2_ring_slot_positions(pos, slots_, rows, cfg_.ring_slots, stream);
   dsa_latent_append(kv_, req_ids, slots_, rows, pool.ring_table(), 1, cfg_.ring_slots, pool.ring(layer_), kCsa2Latent,
-                    stream, Csa2StatePool::kRingFormat);
+                    stream, pool.ring_format());
   csa2_dspark_window_slots(pos, rows, block, cfg_.window, cfg_.ring_slots, dlist_, dcounts_, stream);
   attend_rows(pool, req_ids, pool.ring(layer_), cfg_.ring_slots, pool.ring_table(), req_ids, pos, 0, rows, 1, stream,
               dlist_, cfg_.window + block, dcounts_);  // the builder's stride
@@ -489,7 +576,47 @@ void Csa2Layer::stage_prefill_rows(int req, int64_t pos0, int tokens, cudaStream
 void Csa2Layer::publish_rows(const void* hidden_in, Csa2StatePool& pool, int req, int64_t pos0, int tokens,
                              cudaStream_t stream) {
   int n_entries = 0;
-  if (w_.ratio == 2) {
+  if (w_.ratio == 4) {
+    // The C4A main latent (the overlap window) and the indexer's own
+    // compressor (the bf16 index keys at the index dimension).
+    gemm_.matmul(hidden_in, w_.comp_wkv, comp_kv_, tokens, 2 * kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32,
+                 size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
+    gemm_.matmul(hidden_in, w_.comp_wgate, comp_score_, tokens, 2 * kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32,
+                 size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
+    csa2_compress4_prefill(comp_kv_, comp_score_, tokens, kCsa2Latent, w_.comp_ape, w_.comp_norm, cfg_.eps, latent_,
+                           pool.tails(w_.tail_ord) + size_t(req) * pool.tail_bytes_per_request(w_.tail_ord) / sizeof(float), stream);
+    n_entries = tokens / 4;
+    csa2_scaled_positions(iota_, entries_, n_entries, 1, pos0 / 4, stream);
+    csa2_scaled_positions(entries_, ent_pos_, n_entries, 4, 0, stream);
+    gemm_.matmul(hidden_in, w_.idx_comp_wkv, idx_comp_kv_, tokens, 2 * kCsa2IndexDim, cfg_.hidden, DType::BF16,
+                 GemmOut::F32, size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
+    gemm_.matmul(hidden_in, w_.idx_comp_wgate, idx_comp_score_, tokens, 2 * kCsa2IndexDim, cfg_.hidden, DType::BF16,
+                 GemmOut::F32, size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
+    csa2_compress4_prefill(idx_comp_kv_, idx_comp_score_, tokens, kCsa2IndexDim, w_.idx_comp_ape, w_.idx_comp_norm,
+                           cfg_.eps, ik_,
+                           pool.tails(w_.idx_tail_ord) + size_t(req) * pool.tail_bytes_per_request(w_.idx_tail_ord) / sizeof(float), stream);
+    csa2_rope_apply(ik_ + (kCsa2IndexDim - kCsa2Rope), kCsa2IndexDim, kCsa2IndexDim, 1, kCsa2Rope, ent_pos_,
+                    w_.inv_freq, false, n_entries, stream);
+    csa2_hadamard128_bf16(ik_, ik_, n_entries, stream);
+    csa2_fp4_dequant_bf16(ik_, ik_, n_entries, stream);
+    csa2_index_k_append_bf16(ik_, req_ids_, entries_, n_entries, pool.block_tables(), int(pool.total_blocks()),
+                             pool.entries_per_block(w_.cache_ord), pool.index_k(w_.cache_ord), stream);
+  } else if (w_.ratio == 128) {
+    // The C128A block latent (the full window; the chunk's boundary state
+    // into the tail when the chunk is not block-aligned).
+    gemm_.matmul(hidden_in, w_.comp_wkv, comp_kv_, tokens, kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32,
+                 size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
+    gemm_.matmul(hidden_in, w_.comp_wgate, comp_score_, tokens, kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32,
+                 size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
+    csa2_compress128_prefill(comp_kv_, comp_score_, tokens, w_.comp_ape, w_.comp_norm, cfg_.eps, latent_,
+                             tokens % 128 != 0
+                                 ? pool.tails(w_.tail_ord) + size_t(req) * pool.tail_bytes_per_request(w_.tail_ord) / sizeof(float)
+                                 : nullptr,
+                             stream);
+    n_entries = tokens / 128;
+    csa2_scaled_positions(iota_, entries_, n_entries, 1, pos0 / 128, stream);
+    csa2_scaled_positions(entries_, ent_pos_, n_entries, 128, 0, stream);
+  } else if (w_.ratio == 2) {
     gemm_.matmul(hidden_in, w_.comp_wkv, comp_kv_, tokens, kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32,
                  size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
     gemm_.matmul(hidden_in, w_.comp_wgate, comp_score_, tokens, kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32,
@@ -551,7 +678,7 @@ void Csa2Layer::enqueue_prefill(const void* hidden_in, Csa2StatePool& pool, int 
   csa2_window_scratch_prologue(ring, cfg_.ring_slots, pos0, cfg_.window, rb, wscratch_, stream, floor);
   csa2_scaled_positions(iota_, scratch_pos_, tokens, 1, cfg_.window - 1, stream);
   dsa_latent_append(kv_, req_zero_, scratch_pos_, tokens, one_block_, 1, win_rows, wscratch_, kCsa2Latent, stream,
-                    Csa2StatePool::kRingFormat);
+                    pool.ring_format());
   csa2_window_slots_prefill(pos0, tokens, cfg_.window, wlist_, wcounts_, stream, floor);
 
   if (w_.ratio > 0) {
@@ -567,22 +694,40 @@ void Csa2Layer::enqueue_prefill(const void* hidden_in, Csa2StatePool& pool, int 
       const int64_t padded_n = n_gather > 0 ? round_up_to(n_gather, kEntryPad) : 0;
       if (padded_n > max_entries_) throw std::invalid_argument("csa2 layer: the context exceeds max_cache_tokens");
       if (padded_n > gather_zeroed_) {
-        DGPP_CUDA_OK(cudaMemsetAsync(gather_k_ + gather_zeroed_ * kCsa2IndexDim, 0,
-                                     size_t(padded_n - gather_zeroed_) * kCsa2IndexDim, stream));
-        DGPP_CUDA_OK(cudaMemsetAsync(gather_scale_ + gather_zeroed_, 0, size_t(padded_n - gather_zeroed_) * 4, stream));
+        if (cfg_.index_bf16)
+          DGPP_CUDA_OK(cudaMemsetAsync(gather_k_ + gather_zeroed_ * kCsa2IndexDim * 2, 0,
+                                       size_t(padded_n - gather_zeroed_) * kCsa2IndexDim * 2, stream));
+        else {
+          DGPP_CUDA_OK(cudaMemsetAsync(gather_k_ + gather_zeroed_ * kCsa2IndexDim, 0,
+                                       size_t(padded_n - gather_zeroed_) * kCsa2IndexDim, stream));
+          DGPP_CUDA_OK(cudaMemsetAsync(gather_scale_ + gather_zeroed_, 0, size_t(padded_n - gather_zeroed_) * 4, stream));
+        }
         gather_zeroed_ = padded_n;
       }
-      if (n_gather > 0)
-        dsa_gather_index_pools(pool.block_tables() + size_t(req) * pool.total_blocks(), epb, pool.index_k(ord),
-                               pool.index_scale(ord), n_gather, gather_k_, gather_scale_, kCsa2IndexDim, stream);
+      if (n_gather > 0) {
+        if (cfg_.index_bf16)
+          csa2_gather_index_bf16(pool.block_tables() + size_t(req) * pool.total_blocks(), epb, pool.index_k(ord), n_gather,
+                                 gather_k_, stream);
+        else
+          dsa_gather_index_pools(pool.block_tables() + size_t(req) * pool.total_blocks(), epb, pool.index_k(ord),
+                                 pool.index_scale(ord), n_gather, gather_k_, gather_scale_, kCsa2IndexDim, stream);
+      }
       for (int row0 = 0; row0 < tokens; row0 += tile_cap_) {
         const int rows = std::min(tile_cap_, tokens - row0);
         if (padded_n > 0) {
-          gemm_.matmul(q_fp8_ + size_t(row0) * cfg_.index_heads * kCsa2IndexDim, gather_k_, dot_, rows * cfg_.index_heads,
-                       int(padded_n), kCsa2IndexDim, DType::F8_E4M3, GemmOut::F32, size_t(kCsa2IndexDim), gemm_ws_,
-                       gemm_ws_bytes_, stream);
-          csa2_logits_prefill(dot_, padded_n, w_folded_ + size_t(row0) * cfg_.index_heads, gather_scale_, pos_sel_ + row0,
-                              rows, n_gather, cfg_.index_heads, logits_, padded_n, stream);
+          if (cfg_.index_bf16) {
+            gemm_.matmul(idx_q_ + size_t(row0) * cfg_.index_heads * kCsa2IndexDim, gather_k_, dot_, rows * cfg_.index_heads,
+                         int(padded_n), kCsa2IndexDim, DType::BF16, GemmOut::F32, size_t(kCsa2IndexDim), gemm_ws_,
+                         gemm_ws_bytes_, stream);
+            csa2_logits_prefill(dot_, padded_n, w_folded_ + size_t(row0) * cfg_.index_heads, nullptr, pos_sel_ + row0,
+                                rows, n_gather, cfg_.index_heads, logits_, padded_n, stream);
+          } else {
+            gemm_.matmul(q_fp8_ + size_t(row0) * cfg_.index_heads * kCsa2IndexDim, gather_k_, dot_, rows * cfg_.index_heads,
+                         int(padded_n), kCsa2IndexDim, DType::F8_E4M3, GemmOut::F32, size_t(kCsa2IndexDim), gemm_ws_,
+                         gemm_ws_bytes_, stream);
+            csa2_logits_prefill(dot_, padded_n, w_folded_ + size_t(row0) * cfg_.index_heads, gather_scale_, pos_sel_ + row0,
+                                rows, n_gather, cfg_.index_heads, logits_, padded_n, stream);
+          }
         }
         const int64_t stride = std::max<int64_t>(padded_n, 1);
         dbg_logits_rows_ = padded_n > 0 ? rows : 0;
@@ -601,6 +746,10 @@ void Csa2Layer::enqueue_prefill(const void* hidden_in, Csa2StatePool& pool, int 
       }
       if (w_.candidate_source) cand_at(row_base) = shape;
       else if (w_.uses_candidates) require_shape(cand_at(row_base), shape, "the candidate pool");
+      sel_at(row_base) = shape;
+    } else if (w_.ratio == 128) {
+      // The C128A sequential selection: every visible entry.
+      csa2_sequential_topk(pos_sel_, topk_, counts_, tokens, sel_col_, stream);
       sel_at(row_base) = shape;
     } else {
       require_shape(sel_at(row_base), shape, "the selection");

@@ -44,12 +44,30 @@ Csa2Config Dsv41Model::csa2_config(const Dsv41TextConfig& cfg, int tp_world) {
 Csa2PoolShape Dsv41Model::pool_shape(const Dsv41TextConfig& cfg, int max_requests, int64_t cache_tokens) {
   Csa2PoolShape s;
   s.layers = cfg.max_layer();
-  int tails = 0;
+  // The compressor tails, per kv source (fp32 counts; the reference's
+  // kv_state and score_state, 2*ratio slots of coff*head_dim each): ratio 2
+  // the pair's (kv, score) [2, 512]; ratio 4 the overlap window's 16 slots x
+  // 1024 (main) and 16 x 256 (the indexer compressor); ratio 128 the full
+  // window's 256 slots x 512.
   for (const int l : cfg.kv_source_layer_ids) {
-    s.cache_ratio.push_back(cfg.compress_ratio(l));
-    if (cfg.compress_ratio(l) == 2) ++tails;
+    const int r = cfg.compress_ratio(l);
+    s.cache_ratio.push_back(r);
+    if (r == 2) {
+      s.tail_floats.push_back(2 * kCsa2Latent);
+      s.tail_inf.push_back(0);
+    }
+    if (r == 4) {
+      s.tail_floats.push_back(16 * 2 * kCsa2Latent);
+      s.tail_inf.push_back(8 * 2 * kCsa2Latent);
+      s.tail_floats.push_back(16 * 2 * kCsa2IndexDim);
+      s.tail_inf.push_back(8 * 2 * kCsa2IndexDim);
+    }
+    if (r == 128) {
+      s.tail_floats.push_back(256 * kCsa2Latent);
+      s.tail_inf.push_back(0);
+    }
   }
-  s.tail_ordinals = tails;
+  s.tail_ordinals = static_cast<int>(s.tail_floats.size());
   s.max_requests = max_requests;
   s.token_slots = cache_tokens;
   s.block_tokens = kBlockTokens;
