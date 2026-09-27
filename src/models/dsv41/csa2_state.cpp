@@ -13,8 +13,8 @@ void check_shape(const Csa2PoolShape& s) {
       s.token_slots % s.block_tokens != 0 || s.ring_slots <= 0 || s.tail_ordinals < 0)
     throw std::invalid_argument("csa2 state pool: invalid shape");
   for (const int r : s.cache_ratio)
-    if ((r != 1 && r != 2) || s.block_tokens % r != 0)
-      throw std::invalid_argument("csa2 state pool: a cache ratio must be 1 or 2 and divide the block");
+    if ((r != 1 && r != 2 && r != 4 && r != 128) || s.block_tokens % r != 0)
+      throw std::invalid_argument("csa2 state pool: a cache ratio must be 1, 2, 4 or 128 and divide the block");
   if (s.token_slots / s.block_tokens * s.block_tokens >= (int64_t(1) << 21))
     throw std::invalid_argument("csa2 state pool: entry id space exceeds 2^21 (the select keys)");
 }

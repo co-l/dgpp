@@ -25,7 +25,7 @@ namespace dgpp {
 
 struct Csa2PoolShape {
   int layers = 0;                // attention layers with a window ring (the draft stages included)
-  std::vector<int> cache_ratio;  // per cache ordinal (a kv source), its compress ratio (1 or 2)
+  std::vector<int> cache_ratio;  // per cache ordinal (a kv source), its compress ratio (1, 2, 4 or 128)
   int tail_ordinals = 0;         // ratio-2 kv sources (compressor tails)
   int max_requests = 0;
   int64_t token_slots = 0;       // pool capacity in tokens, a multiple of block_tokens

@@ -698,4 +698,50 @@ DGPP_TEST(csa2_layer_matches_the_oracle_over_prefill_decode_and_rollback) {
   }
 }
 
+DGPP_TEST(csa2_pool_shapes_the_v4_cache_ratios) {
+  // The 0731 schedule: a ratio-4 (overlapping window) and a ratio-128
+  // (block selection) kv source; the legacy 1/2 stay valid.
+  auto shape = [](std::vector<int> ratios, int64_t tokens) {
+    dgpp::Csa2PoolShape s;
+    s.layers = 1;
+    s.cache_ratio = std::move(ratios);
+    s.max_requests = 2;
+    s.token_slots = tokens;
+    s.block_tokens = 128;
+    s.ring_slots = 16;
+    return s;
+  };
+  const auto pad = [](size_t b) { return (b + 255) / 256 * 256; };
+  const size_t row = dgpp::latent_row_bytes(dgpp::Csa2StatePool::kMainFormat, dgpp::kCsa2Latent);
+  const auto triple = [&](size_t slots) {
+    return pad(slots * row) + pad(slots * dgpp::kCsa2IndexDim) + pad(slots * sizeof(float));
+  };
+  // Four 128-token blocks: 512 / 128 / 4 entries for ratios 1 / 4 / 128.
+  const dgpp::Csa2PoolShape s1 = shape({1}, 4 * 128);
+  const dgpp::Csa2PoolShape s4 = shape({4}, 4 * 128);
+  const dgpp::Csa2PoolShape s128 = shape({128}, 4 * 128);
+  const size_t b1 = dgpp::Csa2StatePool::cache_bytes(s1);
+  const size_t b4 = dgpp::Csa2StatePool::cache_bytes(s4);
+  const size_t b128 = dgpp::Csa2StatePool::cache_bytes(s128);
+  require(b1 - b4 == triple(512) - triple(128), "the ratio-4 cache is a quarter of the ratio-1 geometry");
+  require(b4 - b128 == triple(128) - triple(4), "the ratio-128 cache is one entry per block");
+  dgpp::Csa2StatePool pool;
+  pool.init(shape({4, 128}, 4 * 128));
+  require(pool.entries_per_block(0) == 32 && pool.entries_per_block(1) == 1, "entries per block");
+  require(pool.entry_slots(0) == 128 && pool.entry_slots(1) == 4, "entry slots");
+  try {
+    dgpp::Csa2StatePool::cache_bytes(shape({8}, 4 * 128));
+    require(false, "a ratio-8 cache accepted");
+  } catch (const std::invalid_argument&) {
+  }
+  try {
+    dgpp::Csa2StatePool::cache_bytes(shape({4, 128}, 1 << 21));
+    require(false, "an entry id space past the select keys accepted");
+  } catch (const std::invalid_argument&) {
+  }
+  dgpp::Csa2StatePool big;
+  big.init(shape({4, 128}, (1 << 21) - 128));
+  require(big.entry_slots(0) == 16383 * 32 && big.entry_slots(1) == 16383, "the last entry id fits the select keys");
+}
+
 int main() { return dgpp::test::run_all(); }
