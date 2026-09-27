@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -27,6 +28,7 @@
 
 #include "common/log.hpp"
 #include "common/cuda_wait.hpp"
+#include "net/bus_idle_policy.hpp"
 #include "net/bus_types.hpp"
 #include "net/tcp.hpp"
 #include "net/verbs.hpp"
@@ -2639,7 +2641,31 @@ struct CollectiveBus::Impl {
 
   void engine_loop() {
     pin_engine_thread();
+    // DGPP_BUS_ENGINE_IDLE_SLEEP_US: when set, the engine deep-naps (sleep
+    // duration = value, in us) once truly quiet for that long, even after a
+    // decode graph exists — reclaiming the idle core the hot spin holds.
+    // Unset (0) keeps the legacy hot-spin behavior. See bus_idle_policy.hpp.
+    const uint64_t idle_sleep_us = [&] {
+      const char* env = std::getenv("DGPP_BUS_ENGINE_IDLE_SLEEP_US");
+      if (!env || env[0] == '\0') return uint64_t{0};
+      uint64_t value = 0;
+      const char* end = env + std::strlen(env);
+      const auto parsed = std::from_chars(env, end, value);
+      if (parsed.ec != std::errc() || parsed.ptr != end || value == 0) {
+        DGPP_LOG_WARN(
+            "bus engine: ignoring invalid DGPP_BUS_ENGINE_IDLE_SLEEP_US "
+            "\"{}\" (expected a positive integer of microseconds)",
+            env);
+        return uint64_t{0};
+      }
+      return value;
+    }();
+    if (idle_sleep_us > 0)
+      DGPP_LOG_INFO("bus engine: rank {} idle-nap {} us "
+                    "(DGPP_BUS_ENGINE_IDLE_SLEEP_US)",
+                    opt.my_rank, idle_sleep_us);
     int idle = 0;
+    auto last_work = Clock::now();
     for (;;) {
       if (stopping.load(std::memory_order_relaxed) && drained()) break;
       const bool graph_worked = graph_pass();
@@ -2653,27 +2679,34 @@ struct CollectiveBus::Impl {
       if (graph_worked || stream_worked || coll_worked || worked || polled ||
           recycled || credited || watched) {
         idle = 0;
-      } else if (++idle > kEngineSpinIterations && !graph_window_live() &&
-                 !stream_outstanding() &&
-                 !graph.recorded.load(std::memory_order_relaxed)) {
-        // The nap is for the pre-serving idle only. Once a decode graph
-        // exists this thread never sleeps: a 50 us nap between
-        // windows made its core look idle, the scheduler parked another
-        // runnable thread there (the main thread's sync spin, a driver
-        // thread), and the wake-up waited out that thread's CFS slice —
-        // 7-10 ms, PREEMPT_NONE/HZ=250 — exactly when the next window's
-        // first generation needed the post. Every other rank then waited
-        // at gen 0; the fabric's p99 was one core-share. One core at 100%
-        // while serving is the dedicated poller's contract anyway.
-        std::this_thread::sleep_for(
-            std::chrono::microseconds(kEngineIdleSleepUs));
+        last_work = Clock::now();
+      } else if (++idle > kEngineSpinIterations) {
+        // Only past the spin threshold do we pay a clock read. The policy
+        // keeps the nap out of an active decode (see bus_idle_policy.hpp);
+        // once a decode graph exists this thread sleeps only when truly
+        // idle and only for as long as the knob says. sched_yield here was
+        // measured at ~2.2 ms of poll latency per idle stretch (the
+        // collective path idles between engine events while kernels wait
+        // on doorbells, and every yield surrendered the timeslice); the
+        // sleep phase polls strictly faster than the "spin" phase did. No
+        // syscalls on the hot path — including this one.
+        const uint64_t quiet_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                Clock::now() - last_work)
+                .count());
+        const uint64_t nap_us = bus_idle_sleep_us(BusIdlePolicyInputs{
+            .idle_count_passed = true,
+            .window_live = graph_window_live(),
+            .stream_outstanding = stream_outstanding(),
+            .graph_recorded = graph.recorded.load(std::memory_order_relaxed),
+            .quiet_us = quiet_us,
+            .idle_sleep_us = idle_sleep_us,
+            .legacy_sleep_us = kEngineIdleSleepUs,
+        });
+        if (nap_us > 0)
+          std::this_thread::sleep_for(std::chrono::microseconds(nap_us));
       }
-      // else: hot spin — the loop body is the poll. sched_yield here was
-      // measured at ~2.2 ms of poll latency per idle stretch (the collective
-      // path idles between engine events while kernels wait on doorbells,
-      // and every yield surrendered the timeslice); the sleep phase polls
-      // strictly faster than the "spin" phase did. No syscalls on the hot
-      // path — including this one.
+      // else: hot spin — the loop body is the poll.
     }
   }
 

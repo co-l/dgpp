@@ -28,6 +28,9 @@ SITE_KEYS = (
     # session-core families, kernels/gemm.hpp): every rank the same, or the
     # ranks' walks differ.
     "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD",
+    # The bus engine's idle-nap knob (src/net/bus_idle_policy.hpp): us to
+    # sleep when truly idle, trading request-start latency for idle power.
+    "DGPP_BUS_ENGINE_IDLE_SLEEP_US",
 )
 NODE_KEYS = ("DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES", "HF_HUB_CACHE", "DGPP_RESIDENT_CACHE_DIR",
     "DGPP_LOG_LEVEL", "DGPP_MLOCK",
@@ -35,6 +38,7 @@ NODE_KEYS = ("DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES", "HF_HUB_CACHE", "DGPP
     # with the same setting on every rank.
     "DGPP_L2_PREFETCH", "DGPP_L2_PREFETCH_MB", "DGPP_L2_PREFETCH_BOUNDARY", "DGPP_L2_PREFETCH_LAYER",
     "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD",
+    "DGPP_BUS_ENGINE_IDLE_SLEEP_US",
 )
 DEFAULTS = {
     "DGPP_HTTP_PORT": "18080", "DGPP_FABRIC_PORT": "29970",

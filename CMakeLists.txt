@@ -701,6 +701,7 @@ add_executable(unit_tests
   tests/unit/tool_grammar_test.cpp
   tests/unit/json_grammar_test.cpp
   tests/unit/net_test.cpp
+  tests/unit/bus_idle_policy_test.cpp
   tests/unit/cluster_config_test.cpp
   tests/unit/qwen_config_test.cpp
   tests/unit/qwen_binding_test.cpp
