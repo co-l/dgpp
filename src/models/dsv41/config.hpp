@@ -25,6 +25,13 @@
 
 namespace dgpp {
 
+// The two DeepSeek-V4 checkpoints this config parser serves: the V4.1
+// release (nested text_config, Engram, vision, fp8 32x32 grids, explicit
+// kv/index source lists) and the V4-Flash-0731 release (flat config, no
+// Engram, no vision, fp8 128x128 grids, per-layer CSA2 caches derived from
+// compress_ratios, hash routing on the first layers).
+enum class Dsv41Variant : uint8_t { V41, V4 };
+
 // How a layer's CSA2 attention obtains its main KV, index keys and top-k
 // selection (tech report §2.3.1; plan §1.3).
 enum class Dsv41LayerMode : uint8_t {
@@ -46,6 +53,10 @@ struct Dsv41VisionConfig {
 };
 
 struct Dsv41TextConfig {
+  // Which release the config describes (drives the layout, the fp8 grid and
+  // the CSA2 schedule derivation).
+  Dsv41Variant variant = Dsv41Variant::V41;
+
   // --- model shape -------------------------------------------------------
   int hidden_size = 5120;
   int vocab_size = 129280;
@@ -104,6 +115,11 @@ struct Dsv41TextConfig {
   float swiglu_limit = 10.0f;
   std::string scoring_func = "sqrtsoftplus";  // or sigmoid
   std::string topk_method = "noaux_tc";
+  // The hash-routed prefix (0731 only): the first `num_hash_layers` layers
+  // pick their expert indices from the static tid2eid table (vocab x topk,
+  // int32) instead of the top-k of the router scores; the scores still
+  // weight the expert outputs (reference Gate.forward).
+  int num_hash_layers = 0;
 
   // --- Engram (plan §1.6) -----------------------------------------------
   std::vector<int> engram_layer_ids;
@@ -167,6 +183,9 @@ struct Dsv41TextConfig {
   int engram_rows_per_layer() const { return (engram_max_ngram_size - 1) * engram_n_heads; }
   int engram_width() const { return engram_rows_per_layer() * engram_head_dim; }
   bool is_dspark_target(int l) const;
+  // The 0731 hash-routed prefix: layer l picks experts from the tid2eid table.
+  bool is_hash_layer(int l) const { return l >= 0 && l < num_hash_layers; }
+  bool has_tid2eid() const { return num_hash_layers > 0; }
   int shared_expert_inter() const { return n_shared_experts * moe_intermediate_size; }
   int qk_nope_head_dim() const { return head_dim - qk_rope_head_dim; }
   int heads_per_group() const { return num_attention_heads / o_groups; }
@@ -175,8 +194,9 @@ struct Dsv41TextConfig {
   // The routed chain's configuration (models/glm/moe.hpp) for a backbone
   // layer or a draft stage: the sqrtsoftplus router with its bias, the
   // shared expert in the chain, the clamped SwiGLU. `local_inter` is this
-  // rank's slice of moe_intermediate_size.
-  GlmMoeConfig moe_config(int local_inter, bool draft) const;
+  // rank's slice of moe_intermediate_size; `layer` sets the 0731 hash
+  // routing on the first num_hash_layers backbone layers.
+  GlmMoeConfig moe_config(int local_inter, bool draft, int layer = -1) const;
 };
 
 }  // namespace dgpp

@@ -95,13 +95,13 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
     f.K = f.w->shape[1];
     f.SR = f.s->shape[0];
     f.SC = f.s->shape[1];
-    const int b = kDsv41Fp8Block;
+    const int b = cfg.fp8_block_size;  // 32 for V4.1, 128 for V4-Flash-0731
     if (f.SR != (f.N + b - 1) / b || f.SC != (f.K + b - 1) / b)
       fail("fp8 scale geometry mismatch on " + base);
     return f;
   }
   GlmQuantMatrix alloc_fp8(int64_t rows, int64_t cols) {
-    const int b = kDsv41Fp8Block;
+    const int b = cfg.fp8_block_size;
     GlmQuantMatrix q;
     q.rows = rows;
     q.cols = cols;
@@ -122,8 +122,8 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
   // scale row is then its own block row).
   GlmQuantMatrix load_fp8_rows(const std::string& base, int64_t row_start, int64_t rows) {
     const Fp8Source f = fp8_source(base);
-    const int b = kDsv41Fp8Block;
-    if (row_start % b != 0) fail("fp8 row slice of '" + base + "' must start on a 32-row block");
+    const int b = cfg.fp8_block_size;
+    if (row_start % b != 0) fail("fp8 row slice of '" + base + "' must start on a block boundary");
     check_range(base, row_start, rows, f.N);
     GlmQuantMatrix q = alloc_fp8(rows, f.K);
     const int64_t sr = (rows + b - 1) / b;
@@ -151,11 +151,11 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
   GlmQuantMatrix load_fp8_col_ranges(const std::string& base,
                                      const std::vector<std::pair<int64_t, int64_t>>& ranges) {
     const Fp8Source f = fp8_source(base);
-    const int b = kDsv41Fp8Block;
+    const int b = cfg.fp8_block_size;
     int64_t cols = 0;
     for (const auto& [start, count] : ranges) {
       if (start % b != 0 || count % b != 0 || count <= 0)
-        fail("fp8 column slice of '" + base + "' must be whole 32-column blocks");
+        fail("fp8 column slice of '" + base + "' must be whole block columns");
       check_range(base, start, count, f.K);
       cols += count;
     }
@@ -330,12 +330,25 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
         a.idx_wk = load_bf16(ip + "wk.weight");
         a.idx_k_norm = load_bf16(ip + "k_norm.weight");
       }
+      // The V4-Flash-0731 C4A indexer's own rotated compressor (ratio 4 at
+      // the index dimension); absent in V4.1.
+      if (cfg.variant == Dsv41Variant::V4) {
+        const std::string cp = ip + "compressor.";
+        a.idx_comp_wkv = load_bf16(cp + "wkv.weight");
+        a.idx_comp_wgate = load_bf16(cp + "wgate.weight");
+        a.idx_comp_norm = load_bf16(cp + "norm.weight");
+        a.idx_comp_ape = load_f32(cp + "ape");
+      }
     }
     if (cfg.is_kv_source(layer)) {
       const std::string cp = p + "compressor.";
+      const int64_t hd = cfg.head_dim;
+      const int64_t ratio = cfg.compress_ratio(layer);
+      const int64_t cw = (cfg.variant == Dsv41Variant::V4 && ratio == 4) ? 2 * hd : hd;
       a.comp_wkv = load_bf16(cp + "wkv.weight");
-      if (cfg.compress_ratio(layer) > 1) a.comp_wgate = load_bf16(cp + "wgate.weight");
+      if (ratio > 1) a.comp_wgate = load_bf16(cp + "wgate.weight");
       a.comp_norm = load_bf16(cp + "norm.weight");
+      if (cfg.variant == Dsv41Variant::V4 && ratio > 1) a.comp_ape = load_f32(cp + "ape");
     }
   }
 
@@ -343,6 +356,10 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
     Dsv41MoeResident& m = out.moe;
     m.router = load_bf16(p + "gate.weight");
     m.router_bias = load_f32(p + "gate.bias");
+    // The V4 hash-routed prefix's static table (layers 0..num_hash_layers-1):
+    // int32 [vocab, topk], read verbatim (replicated) like the router.
+    if (cfg.is_hash_layer(layer))
+      m.tid2eid = static_cast<const int32_t*>(load_raw(p + "gate.tid2eid"));
     // gate.bias_vl (image tokens) is present and never loaded (plan D9).
     const int64_t I = geo.local_inter, S = geo.local_shared_inter, r = rank;
     m.local_inter = I;
@@ -400,8 +417,15 @@ struct Dsv41LoaderFamily::Builder : WeightBuilder<Dsv41ExpectedTensor> {
     }
     if (stage == cfg.num_nextn_predict_layers - 1) {
       d.norm = load_bf16(p + "norm.weight");
-      d.markov_embed = load_bf16(p + "markov_head.embed.weight");
-      d.markov_head = load_bf16(p + "markov_head.head.weight");
+      // The V4-Flash-0731 checkpoint names the Markov pair markov_w1.weight
+      // (embedding) / markov_w2.weight (head); V4.1 uses embed/head.
+      if (cfg.variant == Dsv41Variant::V4) {
+        d.markov_embed = load_bf16(p + "markov_head.markov_w1.weight");
+        d.markov_head = load_bf16(p + "markov_head.markov_w2.weight");
+      } else {
+        d.markov_embed = load_bf16(p + "markov_head.embed.weight");
+        d.markov_head = load_bf16(p + "markov_head.head.weight");
+      }
       d.confidence = load_bf16_as_f32(p + "confidence_head.proj.weight");
     }
   }

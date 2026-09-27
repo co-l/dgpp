@@ -68,13 +68,30 @@ void expect_attention(TensorList& out, const std::string& p, const Dsv41TextConf
       add_bf16(out, ip + "wk.weight", {id, hd}, Dsv41WeightClass::Indexer, layer);
       add_bf16(out, ip + "k_norm.weight", {id}, Dsv41WeightClass::LayerNorm, layer);
     }
+    // The V4-Flash-0731 C4A indexer scores its own cache with a rotated,
+    // gated-pooled compressor at the index dimension (reference Indexer:
+    // Compressor(args, ratio 4, head_dim 128, rotate True)).
+    if (cfg.variant == Dsv41Variant::V4) {
+      const std::string cp = ip + "compressor.";
+      add_bf16(out, cp + "wkv.weight", {2 * id, H}, Dsv41WeightClass::Indexer, layer);
+      add_bf16(out, cp + "wgate.weight", {2 * id, H}, Dsv41WeightClass::Indexer, layer);
+      add_bf16(out, cp + "norm.weight", {id}, Dsv41WeightClass::LayerNorm, layer);
+      add_f32(out, cp + "ape", {4, 2 * id}, Dsv41WeightClass::Indexer, layer);
+    }
   }
   if (cfg.is_kv_source(layer)) {
     const std::string cp = p + "compressor.";
-    add_bf16(out, cp + "wkv.weight", {hd, H}, Dsv41WeightClass::Compressor, layer);
-    if (cfg.compress_ratio(layer) > 1)
-      add_bf16(out, cp + "wgate.weight", {hd, H}, Dsv41WeightClass::Compressor, layer);
+    // The V4-Flash-0731 compressor: the C4A (ratio 4) and C128A (ratio 128)
+    // layers gate-pool with a per-position ape bias; the C4A overlap form
+    // writes a coff = 2 wide latent (reference Compressor, overlap = ratio
+    // == 4).
+    const int64_t ratio = cfg.compress_ratio(layer);
+    const int64_t cw = (cfg.variant == Dsv41Variant::V4 && ratio == 4) ? 2 * hd : hd;
+    add_bf16(out, cp + "wkv.weight", {cw, H}, Dsv41WeightClass::Compressor, layer);
+    if (ratio > 1) add_bf16(out, cp + "wgate.weight", {cw, H}, Dsv41WeightClass::Compressor, layer);
     add_bf16(out, cp + "norm.weight", {hd}, Dsv41WeightClass::LayerNorm, layer);
+    if (cfg.variant == Dsv41Variant::V4 && ratio > 1)
+      add_f32(out, cp + "ape", {ratio, cw}, Dsv41WeightClass::Compressor, layer);
   }
 }
 
@@ -86,6 +103,11 @@ void expect_moe(TensorList& out, const std::string& p, const Dsv41TextConfig& cf
   add_bf16(out, p + "gate.weight", {E, H}, Dsv41WeightClass::Router, layer);
   add_f32(out, p + "gate.bias", {E}, Dsv41WeightClass::Router, layer);
   if (cfg.vision_present) add_f32(out, p + "gate.bias_vl", {E}, Dsv41WeightClass::Router, layer);
+  // The V4-Flash-0731 hash-routed prefix: a static int32 [vocab, topk] table
+  // on the first num_hash_layers layers; the scores still gate the weights.
+  if (cfg.is_hash_layer(layer))
+    add(out, p + "gate.tid2eid", DType::I32, {cfg.vocab_size, cfg.num_experts_per_tok},
+        Dsv41WeightClass::Router, layer);
   for (int e = 0; e < E; ++e) {
     const std::string ep = p + "experts." + std::to_string(e) + ".";
     add_fp4(out, ep + "w1", I, H, Dsv41WeightClass::RoutedExpert, layer, cfg.fp4_block_size, e);
@@ -135,8 +157,16 @@ void expect_draft_extras(TensorList& out, const std::string& p, const Dsv41TextC
   }
   if (stage == cfg.num_nextn_predict_layers - 1) {
     add_bf16(out, p + "norm.weight", {H}, Dsv41WeightClass::LayerNorm, layer);
-    add_bf16(out, p + "markov_head.embed.weight", {V, R}, c, layer);
-    add_bf16(out, p + "markov_head.head.weight", {V, R}, c, layer);
+    // The V4.1 release names the Markov pair embed.weight / head.weight; the
+    // V4-Flash-0731 checkpoint names them markov_w1.weight / markov_w2.weight
+    // (reference DSparkMarkovHead).
+    if (cfg.variant == Dsv41Variant::V4) {
+      add_bf16(out, p + "markov_head.markov_w1.weight", {V, R}, c, layer);
+      add_bf16(out, p + "markov_head.markov_w2.weight", {V, R}, c, layer);
+    } else {
+      add_bf16(out, p + "markov_head.embed.weight", {V, R}, c, layer);
+      add_bf16(out, p + "markov_head.head.weight", {V, R}, c, layer);
+    }
     add_bf16(out, p + "confidence_head.proj.weight", {1, H + R}, c, layer);
   }
 }

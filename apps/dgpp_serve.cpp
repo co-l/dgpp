@@ -755,7 +755,11 @@ std::unique_ptr<ServeFamily> make_family(const std::string& ckpt, int world,
                                          bool fp8_head_mma) {
   const dgpp::ModelArchitecture arch =
       dgpp::detect_architecture_file((fs::path(ckpt) / "config.json").string());
-  if (arch == dgpp::ModelArchitecture::DeepseekV41) return std::make_unique<Dsv41Family>(ckpt);
+  // DeepSeek-V4-Flash-0731 (DeepseekV4ForCausalLM) is the same CSA2 / mHC /
+  // MoE / DSpark family as V4.1 minus Engram and vision — the Dsv41 family
+  // serves both.
+  if (arch == dgpp::ModelArchitecture::DeepseekV41 || arch == dgpp::ModelArchitecture::DeepseekV4)
+    return std::make_unique<Dsv41Family>(ckpt);
   if (arch == dgpp::ModelArchitecture::MimoV2) return std::make_unique<MimoFamily>(ckpt, kv_format);
   if (arch == dgpp::ModelArchitecture::Qwen4Exp)
     return std::make_unique<QwenFamily>(ckpt, rope_scaling, fp8_head_mma);

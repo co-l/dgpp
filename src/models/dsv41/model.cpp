@@ -874,9 +874,10 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
   if (draft)
     draft_moe_->enqueue_decode(x_, ffn_out, T, nullptr, stream_, rows.moe_table_slot);
   else if (rows.decode)
-    moe_->enqueue_decode(x_, ffn_out, T, nullptr, stream_, rows.moe_table_slot);
+    moe_->enqueue_decode(x_, ffn_out, T, nullptr, stream_, rows.moe_table_slot,
+                         rows.tokens);
   else
-    moe_->enqueue_prefill(x_, ffn_out, T, rows.trace, stream_);
+    moe_->enqueue_prefill(x_, ffn_out, T, rows.trace, stream_, rows.tokens);
   fold(ffn_out, T, H, rows.capture);  // block boundary 2: the sliced experts
   if (debug_capture_) cap.ffn_out = grab(ffn_out, static_cast<size_t>(T) * H);
   stream_update(ffn_out, T);

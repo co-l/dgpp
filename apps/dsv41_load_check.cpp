@@ -67,8 +67,9 @@ int main(int argc, char** argv) {
       if (ckpt.empty()) throw std::runtime_error("cannot resolve " + model_id + ": " + err);
     }
     const std::string cfg_path = (std::filesystem::path(ckpt) / "config.json").string();
-    if (dgpp::detect_architecture_file(cfg_path) != dgpp::ModelArchitecture::DeepseekV41)
-      throw std::runtime_error("not a DeepseekV41 checkpoint: " + ckpt);
+    const dgpp::ModelArchitecture arch = dgpp::detect_architecture_file(cfg_path);
+    if (arch != dgpp::ModelArchitecture::DeepseekV41 && arch != dgpp::ModelArchitecture::DeepseekV4)
+      throw std::runtime_error("not a DeepseekV4 family checkpoint: " + ckpt);
     const dgpp::Dsv41TextConfig cfg = dgpp::Dsv41TextConfig::from_json_file(cfg_path);
     if (!image_dir.empty()) dgpp::Dsv41LayerStream::set_resident_image_dir(image_dir == "off" ? "" : image_dir);
     const dgpp::Dsv41Residency residency = streaming ? dgpp::Dsv41Residency::Streaming : dgpp::Dsv41Residency::Resident;
