@@ -11,7 +11,6 @@
     "max_connections": 64,
     "decode_graph": true,
     "mtp": true,
-    "mtp_depth": 3,
     "mtp_schedule": true,
     "mtp_schedule_lambda": 0.045,
     "prefix_cache_gib": 1.5,

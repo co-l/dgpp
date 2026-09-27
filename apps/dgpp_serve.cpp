@@ -1452,9 +1452,9 @@ int main(int argc, char** argv) {
   if (mtp && !mtp_depth_explicit && !ckpt.empty()) {
     const dgpp::ModelArchitecture arch =
         dgpp::detect_architecture_file((fs::path(ckpt) / "config.json").string());
-    if (arch == dgpp::ModelArchitecture::DeepseekV41) {
+    if (arch == dgpp::ModelArchitecture::DeepseekV41 || arch == dgpp::ModelArchitecture::DeepseekV4) {
       mtp_depth = dgpp::Dsv41TextConfig::from_json_file((fs::path(ckpt) / "config.json").string()).dspark_block_size;
-      DGPP_LOG_INFO("serve: --mtp without --mtp-depth on DeepSeek-V4.1: the DSpark block's {} drafts", mtp_depth);
+      DGPP_LOG_INFO("serve: --mtp without --mtp-depth on DeepSeek-V4.1/0731: the DSpark block's {} drafts", mtp_depth);
     }
   }
   // ---- the fabric's first handshake: the head pushes the
