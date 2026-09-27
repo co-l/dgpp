@@ -16,6 +16,7 @@ enum class ModelArchitecture : int {
   Glm4Moe,  // Glm4MoeForCausalLM / glm4_moe (GLM-4.7, 2026-09-09)
   GlmMoeDsa, // GlmMoeDsaForCausalLM / glm_moe_dsa (full GLM-5.3, 2026-09-12)
   DeepseekV41, // DeepseekV41ForCausalLM / deepseek_v41 (DeepSeek-V4.1-Flash, 2026-09-13)
+  DeepseekV4,  // DeepseekV4ForCausalLM / deepseek_v4 (DeepSeek-V4-Flash-0731, 2026-09-27)
   MimoV2,      // MiMoV2ForCausalLM / mimo_v2 (MiMo-V2.6-Flash, 2026-09-22)
 };
 
@@ -26,6 +27,7 @@ constexpr const char* model_architecture_name(ModelArchitecture a) {
     case ModelArchitecture::GlmMoeDsa: return "glm_moe_dsa";
     case ModelArchitecture::Glm5: return "glm5";
     case ModelArchitecture::DeepseekV41: return "deepseek_v41";
+    case ModelArchitecture::DeepseekV4: return "deepseek_v4";
     case ModelArchitecture::MimoV2: return "mimo_v2";
   }
   return "glm5";

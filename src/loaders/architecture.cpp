@@ -37,6 +37,12 @@ ModelArchitecture detect_architecture(const minijson::Value& root) {
   // `deepseek_v41_text`).
   if (arch.rfind("DeepseekV41", 0) == 0 || (arch.empty() && type == "deepseek_v41"))
     return ModelArchitecture::DeepseekV41;
+  // DeepSeek-V4-Flash-0731 (2026-09-27): `DeepseekV4ForCausalLM` /
+  // `deepseek_v4`, a flat config (no text_config nesting) and the same
+  // CSA2 / mHC / MoE / DSpark family as V4.1 minus the Engram and the
+  // vision tower. Checked after DeepseekV41 (a strict prefix).
+  if (arch.rfind("DeepseekV4ForCausalLM", 0) == 0 || (arch.empty() && type == "deepseek_v4"))
+    return ModelArchitecture::DeepseekV4;
   // MiMo-V2.6-Flash (2026-09-22, docs/mimo_v26_flash_plan.md):
   // `MiMoV2ForCausalLM` / `mimo_v2`.
   if (arch.rfind("MiMoV2", 0) == 0 || (arch.empty() && type == "mimo_v2"))

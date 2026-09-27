@@ -16,10 +16,12 @@
 #include <filesystem>
 #include <format>
 #include <string>
+#include <unordered_set>
 
 #include "common/log.hpp"
 #include "loaders/architecture.hpp"
 #include "loaders/hf_cache.hpp"
+#include "models/dsv41/binding.hpp"
 #include "models/dsv41/config.hpp"
 #include "models/dsv41/engram_tables.hpp"
 #include "models/dsv41/loader.hpp"
@@ -67,8 +69,9 @@ int main(int argc, char** argv) {
       if (ckpt.empty()) throw std::runtime_error("cannot resolve " + model_id + ": " + err);
     }
     const std::string cfg_path = (std::filesystem::path(ckpt) / "config.json").string();
-    if (dgpp::detect_architecture_file(cfg_path) != dgpp::ModelArchitecture::DeepseekV41)
-      throw std::runtime_error("not a DeepseekV41 checkpoint: " + ckpt);
+    const dgpp::ModelArchitecture arch = dgpp::detect_architecture_file(cfg_path);
+    if (arch != dgpp::ModelArchitecture::DeepseekV41 && arch != dgpp::ModelArchitecture::DeepseekV4)
+      throw std::runtime_error("not a DeepseekV4 family checkpoint: " + ckpt);
     const dgpp::Dsv41TextConfig cfg = dgpp::Dsv41TextConfig::from_json_file(cfg_path);
     if (!image_dir.empty()) dgpp::Dsv41LayerStream::set_resident_image_dir(image_dir == "off" ? "" : image_dir);
     const dgpp::Dsv41Residency residency = streaming ? dgpp::Dsv41Residency::Streaming : dgpp::Dsv41Residency::Resident;
@@ -86,6 +89,19 @@ int main(int argc, char** argv) {
       const dgpp::Dsv41EngramSidecar sc = dgpp::dsv41_load_engram_sidecar_for(ckpt, cfg);
       DGPP_LOG_INFO("dsv41_load_check: Engram sidecar ok — {} layers, {} classes, pad class {}, {} primes, tokenizer {}",
                     sc.layers(), sc.compressed_vocab_size, sc.pad_class, sc.primes.size(), sc.tokenizer_sha256.substr(0, 12));
+    }
+    {
+      const std::vector<dgpp::Dsv41ExpectedTensor> globals = dgpp::dsv41_expected_global_tensors(cfg);
+      size_t entries = globals.size();
+      std::unordered_set<std::string> names;
+      for (const auto& t : globals) names.insert(t.name);
+      for (int l = 0; l < cfg.max_layer(); ++l) {
+        const auto tl = dgpp::dsv41_expected_layer_tensors(cfg, l);
+        entries += tl.size();
+        for (const auto& t : tl) names.insert(t.name);
+      }
+      DGPP_LOG_INFO("dsv41_load_check: binding inventory {} tensor entries ({} distinct names) across {} globals + {} layers",
+                    entries, names.size(), globals.size(), cfg.max_layer());
     }
     const auto t0 = std::chrono::steady_clock::now();
     dgpp::Dsv41LayerStream stream(cfg, ckpt, rank, world, residency, head, mtp);

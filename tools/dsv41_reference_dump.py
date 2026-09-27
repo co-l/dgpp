@@ -315,6 +315,16 @@ def layer_prefix(cfg, layer):
     return ("mtp.%d." % (layer - L)) if layer >= L else ("layers.%d." % layer)
 
 
+def draft_depth(cfg):
+    # The C++ parser's rule: the mtp block count is dspark_target_layer_ids'
+    # length — the file's num_nextn_predict_layers is not the source of truth
+    # (the 0731 release declares 1 while shipping three mtp.S stages).
+    t = cfg.get("dspark_target_layer_ids")
+    if t:
+        return len(t)
+    return int(cfg.get("num_nextn_predict_layers", 0))
+
+
 class Weights:
     def __init__(self, cfg, entries, layer):
         L = cfg["num_hidden_layers"]
@@ -369,7 +379,7 @@ class Weights:
             if stage == 0:
                 self.main_proj = load_fp8(entries, p + "main_proj")
                 self.main_norm = load_np(entries, p + "main_norm.weight")
-            if stage == cfg["num_nextn_predict_layers"] - 1:
+            if stage == draft_depth(cfg) - 1:
                 self.draft_norm = load_np(entries, p + "norm.weight")
                 self.markov_embed = load_np(entries, p + "markov_head.embed.weight")
                 self.markov_head = load_np(entries, p + "markov_head.head.weight")
@@ -685,7 +695,7 @@ def dspark_forward(cfg, entries, main_hidden, logits, T, seg0=0):
     the draft's norm, the greedy Markov chain and the confidence logits."""
     H, hc = cfg["hidden_size"], cfg["hc_mult"]
     L = cfg["num_hidden_layers"]
-    S = cfg["num_nextn_predict_layers"]
+    S = draft_depth(cfg)
     B = cfg["dspark_block_size"]
     heads = cfg["num_attention_heads"]
     window = cfg["sliding_window"]
@@ -815,7 +825,7 @@ def gen_pure(args):
     (layer_states, h, logits, routes, route_margins, selections, sel_margins,
      index_logits, candidates, block_margins, main_hidden, seg0) = reference_forward(cfg, entries, sc, tokens, teacher, bounded)
     dspark = None
-    if main_hidden is not None and cfg.get("num_nextn_predict_layers", 0) > 0 and cfg.get("dspark_block_size", 0) > 0:
+    if main_hidden is not None and draft_depth(cfg) > 0 and cfg.get("dspark_block_size", 0) > 0:
         dspark = dspark_forward(cfg, entries, main_hidden, logits, args.tokens, seg0)
     T, H, hc = args.tokens, cfg["hidden_size"], cfg["hc_mult"]
     L, K, topk = cfg["num_hidden_layers"], cfg["num_experts_per_tok"], 8

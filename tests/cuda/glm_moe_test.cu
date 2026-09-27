@@ -170,6 +170,127 @@ void check_router(const GlmMoeConfig& cfg, int tokens, uint64_t seed) {
               E, H, K, tokens, certified, max_rel);
 }
 
+// ---- the 0731 hash-routed prefix: static tid2eid table selection --------
+
+// The reference Gate.forward for the hash layers: the expert ids come from
+// the static I64 [vocab, top_k] table gathered by token id (NOT the biased
+// top-k), the weights are still the scores at those ids, and there is NO
+// selection bias (bias = None). The kernel must therefore tolerate a null
+// bias pointer and pick the table ids even when they are not the top
+// scoring experts.
+DGPP_TEST(check_tid2eid_router_is_table_driven_and_score_gated) {
+  const int E = 8, H = 64, K = 3, tokens = 5, vocab = 12;
+  GlmMoeConfig cfg;
+  cfg.hidden = H;
+  cfg.inter = 128;
+  cfg.n_experts = E;
+  cfg.top_k = K;
+  cfg.routed_scaling_factor = 1.0f;
+  cfg.norm_topk_prob = false;
+  cfg.hash_route = true;
+  Rng rng(0x71D2E1D);
+  std::vector<uint16_t> hidden(static_cast<size_t>(tokens) * H);
+  fill_act(rng, hidden);
+  std::vector<uint16_t> gate(static_cast<size_t>(E) * H);
+  for (auto& v : gate) v = float_to_bf16_bits(0.08f * static_cast<float>(rng.unit()));
+
+  // The table: each token maps to three fixed expert ids, deliberately a
+  // different set from the top-scoring experts (chosen after the oracle
+  // pass below) so the test proves the ids are table-driven.
+  std::vector<int64_t> table(static_cast<size_t>(vocab) * K);
+  for (int t = 0; t < vocab; ++t) {
+    const int a = (t * 2 + 1) % E, b = (t * 3 + 2) % E, c = (t + 4) % E;
+    table[static_cast<size_t>(t) * K + 0] = a;
+    table[static_cast<size_t>(t) * K + 1] = b;
+    table[static_cast<size_t>(t) * K + 2] = c;
+  }
+  std::vector<int64_t> input_ids = {0, 3, 7, 11, 5};
+
+  // CPU oracle: sigmoid(dot) per (token, expert) in double.
+  std::vector<double> score(tokens * E);
+  for (int t = 0; t < tokens; ++t)
+    for (int e = 0; e < E; ++e) {
+      double d = 0;
+      for (int k = 0; k < H; ++k)
+        d += static_cast<double>(dgpp::bf16_bits_to_float(hidden[static_cast<size_t>(t) * H + k])) *
+             static_cast<double>(dgpp::bf16_bits_to_float(gate[static_cast<size_t>(e) * H + k]));
+      score[static_cast<size_t>(t) * E + e] = 1.0 / (1.0 + std::exp(-d));
+    }
+
+  uint16_t *d_hidden = nullptr, *d_gate = nullptr;
+  int32_t* d_ids = nullptr;
+  float *d_w = nullptr, *d_scores = nullptr, *d_biased = nullptr;
+  int64_t *d_table = nullptr, *d_input_ids = nullptr;
+  DGPP_CUDA_OK(cudaMallocManaged(&d_hidden, hidden.size() * 2));
+  DGPP_CUDA_OK(cudaMallocManaged(&d_gate, gate.size() * 2));
+  DGPP_CUDA_OK(cudaMallocManaged(&d_ids, static_cast<size_t>(tokens) * K * 4));
+  DGPP_CUDA_OK(cudaMallocManaged(&d_w, static_cast<size_t>(tokens) * K * 4));
+  DGPP_CUDA_OK(cudaMallocManaged(&d_scores, static_cast<size_t>(tokens) * E * 4));
+  DGPP_CUDA_OK(cudaMallocManaged(&d_biased, static_cast<size_t>(tokens) * E * 4));
+  DGPP_CUDA_OK(cudaMallocManaged(&d_table, table.size() * 8));
+  DGPP_CUDA_OK(cudaMallocManaged(&d_input_ids, input_ids.size() * 8));
+  std::memcpy(d_hidden, hidden.data(), hidden.size() * 2);
+  std::memcpy(d_gate, gate.data(), gate.size() * 2);
+  std::memcpy(d_table, table.data(), table.size() * 8);
+  std::memcpy(d_input_ids, input_ids.data(), input_ids.size() * 8);
+
+  dgpp::launch_moe_router(d_hidden, d_gate, /*bias=*/nullptr, d_ids, d_w,
+                          d_scores, d_biased, cfg, tokens, nullptr,
+                          /*counters=*/nullptr, /*allow_tiled=*/true, d_table,
+                          d_input_ids);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+
+  std::vector<int32_t> got_ids(static_cast<size_t>(tokens) * K);
+  std::vector<float> got_w(static_cast<size_t>(tokens) * K);
+  std::memcpy(got_ids.data(), d_ids, got_ids.size() * 4);
+  std::memcpy(got_w.data(), d_w, got_w.size() * 4);
+  cudaFree(d_hidden);
+  cudaFree(d_gate);
+  cudaFree(d_ids);
+  cudaFree(d_w);
+  cudaFree(d_scores);
+  cudaFree(d_biased);
+  cudaFree(d_table);
+  cudaFree(d_input_ids);
+
+  bool table_not_topk = false;
+  double max_rel = 0;
+  int wr_t = -1, wr_i = -1;
+  double wr_got = 0, wr_or = 0;
+  for (int t = 0; t < tokens; ++t) {
+    const int64_t* row = table.data() + static_cast<size_t>(input_ids[static_cast<size_t>(t)]) * K;
+    std::vector<int32_t> expect(row, row + K);
+    std::sort(expect.begin(), expect.end());  // the kernel emits ascending ids
+    // The table ids must win even where the scores disagree.
+    std::vector<std::pair<double, int>> ranked;
+    for (int e = 0; e < E; ++e) ranked.emplace_back(score[static_cast<size_t>(t) * E + e], e);
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::vector<int32_t> top;
+    for (int i = 0; i < K; ++i) top.push_back(ranked[static_cast<size_t>(i)].second);
+    std::sort(top.begin(), top.end());
+    if (top != expect) table_not_topk = true;
+    for (int i = 0; i < K; ++i) {
+      require(got_ids[static_cast<size_t>(t) * K + i] == expect[static_cast<size_t>(i)],
+              "tid2eid router id is table-driven");
+      const double rel = std::abs(static_cast<double>(got_w[static_cast<size_t>(t) * K + i]) -
+                                  score[static_cast<size_t>(t) * E + expect[static_cast<size_t>(i)]]) /
+                         std::max(1e-30, score[static_cast<size_t>(t) * E + expect[static_cast<size_t>(i)]]);
+      if (rel > max_rel) {
+        max_rel = rel;
+        wr_t = t;
+        wr_i = i;
+        wr_got = got_w[static_cast<size_t>(t) * K + i];
+        wr_or = score[static_cast<size_t>(t) * E + expect[static_cast<size_t>(i)]];
+      }
+    }
+  }
+  std::printf("tid2eid debug: max_rel %.3g at t=%d i=%d got %.9g oracle %.9g\n", max_rel, wr_t, wr_i, wr_got, wr_or);
+  require(table_not_topk, "at least one token's table ids differ from the score top-k");
+  require(max_rel < 1e-5, "tid2eid router weights are the score-gated sigmoid scores");
+  std::printf("[ OK ] tid2eid router: %d tokens x E=%d K=%d table-driven, max weight rel err %.2g\n",
+              tokens, E, K, max_rel);
+}
+
 // ---- full expert path on small geometry ----------------------------------
 
 struct SmallCase {

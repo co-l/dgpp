@@ -1,4 +1,4 @@
-{"model": "deepseek-ai/DeepSeek-V4.1-Flash", "tokenizers": "0.23.2", "revision_hash": "66f860d9a567fdb0", "cases": 118}
+{"model": "deepseek-ai/DeepSeek-V4-Flash-0731", "tokenizers": "0.22.2", "revision_hash": "26a12b8da63e89c8", "cases": 118}
 {"text": "The capital of France is", "ids": [671, 6102, 294, 8760, 344]}
 {"text": " Paris", "ids": [11111]}
 {"text": ".", "ids": [16]}
@@ -52,16 +52,16 @@
 {"text": "<\uff5cend\u2581of\u2581sentence\uff5c>", "ids": [1]}
 {"text": "<\uff5cUser\uff5c>", "ids": [128803]}
 {"text": "<\uff5cAssistant\uff5c>", "ids": [128804]}
-{"text": "<\uff5cSystem\uff5c>", "ids": [128799]}
+{"text": "<\uff5cSystem\uff5c>", "ids": [30, 28217, 8375, 28217, 32]}
 {"text": "\uff5cDSML\uff5c", "ids": [128825]}
 {"text": "<\uff5clatest_reminder\uff5c>", "ids": [128828]}
 {"text": "<\uff5ctool\u2581calls\u2581begin\uff5c>", "ids": [128806]}
 {"text": "<\uff5cplace\u2581holder\u2581no\u25817\uff5c>", "ids": [128007]}
-{"text": "<\uff5cdeepseek_image\uff5c>", "ids": [129264]}
-{"text": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cSystem\uff5c>You are a helpful assistant.<\uff5cUser\uff5c>Hello<\uff5cAssistant\uff5c></think>Hi!<\uff5cend\u2581of\u2581sentence\uff5c>", "ids": [0, 128799, 3476, 477, 260, 11502, 22896, 16, 128803, 19923, 128804, 128822, 23166, 3, 1]}
-{"text": "<\uff5cbegin\u2581of\u2581sentence\uff5c><\uff5cSystem\uff5c>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nYou are a helpful assistant.<\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c><think>", "ids": [0, 128799, 77666, 288, 9504, 482, 28, 223, 2402, 343, 16801, 223, 19, 15, 1457, 14, 270, 4077, 270, 1990, 14, 270, 850, 15146, 270, 22805, 868, 3476, 477, 260, 11502, 22896, 16, 128803, 3085, 344, 223, 20, 13, 20, 33, 128804, 128821]}
+{"text": "<\uff5cdeepseek_image\uff5c>", "ids": [30, 28217, 60861, 121559, 41629, 28217, 32]}
+{"text": "<\uff5cbegin\u2581of\u2581sentence\uff5c>You are a helpful assistant.<\uff5cUser\uff5c>Hello<\uff5cAssistant\uff5c></think>Hi!<\uff5cend\u2581of\u2581sentence\uff5c>", "ids": [0, 3476, 477, 260, 11502, 22896, 16, 128803, 19923, 128804, 128822, 23166, 3, 1]}
+{"text": "<\uff5cbegin\u2581of\u2581sentence\uff5c>Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\nYou are a helpful assistant.<\uff5cUser\uff5c>What is 2+2?<\uff5cAssistant\uff5c><think>", "ids": [0, 77666, 288, 9504, 482, 28, 65174, 8173, 418, 1119, 102810, 23463, 603, 3476, 74366, 366, 1855, 15146, 295, 782, 6892, 305, 98919, 107029, 270, 3295, 304, 19727, 270, 4798, 4776, 14, 127468, 5505, 30181, 288, 782, 14188, 2765, 710, 3283, 20829, 14, 9449, 4599, 14, 305, 101818, 21805, 603, 2700, 19894, 367, 5085, 798, 782, 5221, 111618, 1699, 14, 76323, 1750, 20368, 3132, 14, 5083, 9235, 14, 305, 23047, 16915, 304, 5261, 16808, 1119, 20539, 344, 3001, 114867, 339, 3476, 477, 260, 11502, 22896, 16, 128803, 3085, 344, 223, 20, 13, 20, 33, 128804, 128821]}
 {"text": "Simple arithmetic.</think>2 + 2 = 4.<\uff5cend\u2581of\u2581sentence\uff5c>", "ids": [40593, 29568, 16, 128822, 20, 940, 223, 20, 438, 223, 22, 16, 1]}
-{"text": "\n\n<\uff5cDSML\uff5c calls>\n<\uff5cDSML\uff5c invoke name=\"get_weather\">\n<\uff5cDSML\uff5c parameter name=\"city\" string=\"true\">Paris</\uff5cDSML\uff5c parameter>\n<\uff5cDSML\uff5c parameter name=\"days\" string=\"false\">3</\uff5cDSML\uff5c parameter>\n</\uff5cDSML\uff5c invoke>\n</\uff5cDSML\uff5c calls><\uff5cend\u2581of\u2581sentence\uff5c>", "ids": [271, 30, 128825, 10699, 1018, 30, 128825, 34756, 2329, 1281, 1133, 65, 50219, 3816, 30, 128825, 10767, 2329, 1281, 37399, 4, 3418, 1281, 11476, 3320, 51119, 1718, 128825, 10767, 1018, 30, 128825, 10767, 2329, 1281, 28026, 4, 3418, 1281, 19836, 3320, 21, 1718, 128825, 10767, 1018, 1718, 128825, 34756, 1018, 1718, 128825, 10699, 32, 1]}
+{"text": "\n\n<\uff5cDSML\uff5ctool_calls>\n<\uff5cDSML\uff5cinvoke name=\"get_weather\">\n<\uff5cDSML\uff5cparameter name=\"city\" string=\"true\">Paris</\uff5cDSML\uff5cparameter>\n<\uff5cDSML\uff5cparameter name=\"days\" string=\"false\">3</\uff5cDSML\uff5cparameter>\n</\uff5cDSML\uff5cinvoke>\n</\uff5cDSML\uff5ctool_calls><\uff5cend\u2581of\u2581sentence\uff5c>", "ids": [271, 30, 128825, 72461, 4941, 12548, 1018, 30, 128825, 40148, 5406, 2329, 1281, 1133, 65, 50219, 3816, 30, 128825, 41523, 2329, 1281, 37399, 4, 3418, 1281, 11476, 3320, 51119, 1718, 128825, 41523, 1018, 30, 128825, 41523, 2329, 1281, 28026, 4, 3418, 1281, 19836, 3320, 21, 1718, 128825, 41523, 1018, 1718, 128825, 40148, 5406, 1018, 1718, 128825, 72461, 4941, 12548, 32, 1]}
 {"text": "<\uff5cUser\uff5c><tool_result>{\"temp\": 21}</tool_result><\uff5cAssistant\uff5c><think>", "ids": [128803, 30, 72461, 46148, 32, 24313, 26343, 3362, 223, 1602, 24568, 72461, 46148, 32, 128804, 128821]}
 {"text": "x\uff5cDSML\uff5cy", "ids": [90, 128825, 91]}
 {"text": "before <\uff5cUser\uff5c> after", "ids": [35975, 223, 128803, 1561]}

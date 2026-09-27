@@ -188,7 +188,7 @@ Run drive_qwen(const std::string& text, ToolCallParser::Options opts = {}) {
 
 // ---- the DeepSeek-V4.1 DSML format: the tag token is the only id; the
 // brackets and tag names are text, the block opens at the tag token after
-// a "<" and closes at "</｜DSML｜ calls>".
+// a "<" and closes at "</｜DSML｜tool_calls>".
 ChatMarkers dsml_markers() {
   ChatMarkers m;
   m.think_open = ChatMarker{kThinkOpen, "<think>"};
@@ -240,10 +240,10 @@ DGPP_TEST(tool_parser_dsml_format_one_call_string_and_json_values) {
   ToolCallParser::Options plain;
   plain.start_in_reasoning = false;
   const Run run = drive_dsml(
-      "Sure, let me check.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n"
-      "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n"
-      "<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n"
-      "</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+      "Sure, let me check.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n"
+      "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n"
+      "<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n"
+      "</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
       plain);
   require(run.content == "Sure, let me check.", "the content stops before the block's blank line: '" + run.content + "'");
   require(run.calls.size() == 1, "one call");
@@ -256,7 +256,7 @@ DGPP_TEST(tool_parser_content_token_provenance) {
   opts.start_in_reasoning = false;
   opts.track_tokens = true;
   for (const std::string text : {"if a < b\n\n", "x ｜DSML｜ y",
-                                 "ok\n\n<｜DSML｜ calls>broken"}) {
+                                 "ok\n\n<｜DSML｜tool_calls>broken"}) {
     const auto ids = dsml_ids_of(text);
     ToolCallParser parser(dsml_markers(), fake_decode, weather_schemas(), opts);
     std::vector<Event> events;
@@ -283,11 +283,11 @@ DGPP_TEST(tool_parser_content_token_provenance) {
 
 DGPP_TEST(tool_parser_dsml_format_two_calls_reasoning_and_namespace) {
   const Run run = drive_dsml(
-      "think first</think>\n\n<｜DSML｜ calls>\n"
-      "<｜DSML｜ invoke name=\"search::lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">a \"quoted\" value</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n"
-      "<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Rome</｜DSML｜ parameter>\n"
-      "<｜DSML｜ parameter name=\"flags\" string=\"false\">{\"metric\": true, \"n\": [1, 2]}</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n"
-      "</｜DSML｜ calls>");
+      "think first</think>\n\n<｜DSML｜tool_calls>\n"
+      "<｜DSML｜invoke name=\"search::lookup\">\n<｜DSML｜parameter name=\"query\" string=\"true\">a \"quoted\" value</｜DSML｜parameter>\n</｜DSML｜invoke>\n"
+      "<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Rome</｜DSML｜parameter>\n"
+      "<｜DSML｜parameter name=\"flags\" string=\"false\">{\"metric\": true, \"n\": [1, 2]}</｜DSML｜parameter>\n</｜DSML｜invoke>\n"
+      "</｜DSML｜tool_calls>");
   require(run.reasoning == "think first" && run.reasoning_closed == 1, "the reasoning split");
   require(run.content.empty(), "no content before the block: '" + run.content + "'");
   require(run.calls.size() == 2, "two calls");
@@ -312,9 +312,9 @@ DGPP_TEST(tool_parser_dsml_format_malformed_block_falls_back_to_content) {
   ToolCallParser::Options plain;
   plain.start_in_reasoning = false;
   for (const char* bad : {
-           "ok\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
-           "ok\n\n<｜DSML｜ calls><｜DSML｜ invoke name=\"get_weather\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
-           "ok\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n",
+           "ok\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+           "ok\n\n<｜DSML｜tool_calls><｜DSML｜invoke name=\"get_weather\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+           "ok\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n",
        }) {
     const Run run = drive_dsml(bad, plain);
     require(run.calls.empty(), std::string("no call from a malformed block: ") + bad);
@@ -324,7 +324,7 @@ DGPP_TEST(tool_parser_dsml_format_malformed_block_falls_back_to_content) {
   // the block at its closing tag; the reference's whole-completion check
   // would reject the turn, which a client sees as the trailing content).
   const Run tail = drive_dsml(
-      "ok\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n</｜DSML｜ invoke>\n</｜DSML｜ calls> trailing", plain);
+      "ok\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls> trailing", plain);
   require(tail.calls.size() == 1 && tail.calls[0].arguments == "{}", "the closed block's call stands");
   require(tail.content == "ok trailing", "the text around the block: '" + tail.content + "'");
 }
@@ -411,10 +411,10 @@ DGPP_TEST(tool_parser_rejects_aRepeatedParameterName) {
           "distinct names parse: " + ok.calls[0].arguments);
   // The DSML format's ledger, for parity: a repeat is content there too.
   const std::string dsml_dup =
-      "ok\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n"
-      "<｜DSML｜ parameter name=\"city\" string=\"true\">Rome</｜DSML｜ parameter>\n"
-      "<｜DSML｜ parameter name=\"city\" string=\"true\">Oslo</｜DSML｜ parameter>\n"
-      "</｜DSML｜ invoke>\n</｜DSML｜ calls>";
+      "ok\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n"
+      "<｜DSML｜parameter name=\"city\" string=\"true\">Rome</｜DSML｜parameter>\n"
+      "<｜DSML｜parameter name=\"city\" string=\"true\">Oslo</｜DSML｜parameter>\n"
+      "</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
   const Run dsml = drive_dsml(dsml_dup, plain);
   require(dsml.calls.empty() && dsml.content == dsml_dup,
           "a repeated DSML parameter is content: " + dsml.content);
@@ -499,9 +499,9 @@ DGPP_TEST(tool_parser_preservesNumbersAcrossSchemaBoundaries) {
                                  value + "</arg_value></tool_call>"));
     const Run qwen = drive_qwen("</think><tool_call>\n<function=flat_tool>\n<parameter=x>\n" +
                                 value + "\n</parameter>\n</function>\n</tool_call>");
-    const Run dsml = drive_dsml("</think><｜DSML｜ calls>\n<｜DSML｜ invoke name=\"flat_tool\">\n"
-                                "<｜DSML｜ parameter name=\"x\" string=\"false\">" + value +
-                                "</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>");
+    const Run dsml = drive_dsml("</think><｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"flat_tool\">\n"
+                                "<｜DSML｜parameter name=\"x\" string=\"false\">" + value +
+                                "</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>");
     for (const Run& run : {glm, qwen, dsml})
       require(run.calls.size() == 1 && run.calls[0].arguments == "{\"x\": " + value + "}",
               "tool output preserves the numeric value accepted by the grammar: " + value);

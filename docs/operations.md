@@ -815,7 +815,12 @@ the prompts. Its artifacts land under `build-ci/fabric-runs/failure_drill_*`.
   cuBLASLt's algorithm, fp8 rows above the streaming tensor-core GEMM to 256
   rows. Qwen's 17-64-token decode walks keep BF16 products kernel-only regardless
   of this bound. A value of 256 restores the pre-2026-09-14 lowering (every decode row count
-  through the chunks) for an A/B, and `DGPP_SYNC_EAGER=1` makes an eager row — a prefill chunk,
+  through the chunks) for an A/B. `DGPP_BUS_ENGINE_IDLE_SLEEP_US=n` — a site
+  setting, forwarded to every rank — lets the bus engine thread sleep n µs
+  when the world is truly idle (no armed window, no outstanding collective,
+  and n µs of straight quiet), trading a bit of request-start latency for the
+  idle core the hot spin otherwise holds; unset keeps the legacy hot-spin
+  exactly. `DGPP_SYNC_EAGER=1` makes an eager row — a prefill chunk,
   the sampled fallback's verify and re-draft — synchronize after every
   stage and validate its selection list before the attention, naming the
   stage a fault came from; the fault hunt's knob, not for serving) — the one-hour soak had written 307,000

@@ -528,7 +528,8 @@ int GlmMoeLayer::routed_seg_max_rows(const MoeSegment* d_segs, int n_segs,
 
 void GlmMoeLayer::enqueue_prefill(const uint16_t* hidden, uint16_t* out,
                                   int tokens, MoeTraceStaging* trace,
-                                  cudaStream_t stream) {
+                                  cudaStream_t stream,
+                                  const int64_t* input_ids) {
   step_timing::Scope tick(step_timing::kMoe);
   if (tokens <= 0) return;
   if (!has_shared())
@@ -544,9 +545,12 @@ void GlmMoeLayer::enqueue_prefill(const uint16_t* hidden, uint16_t* out,
   const size_t tk = static_cast<size_t>(tokens) * K;
 
   // 1. Router; the traces ride async copies into the caller's pinned
-  //    staging (no round trip).
+  //    staging (no round trip). The 0731 hash layers read the tid2eid
+  //    table with the token ids (input_ids); the scores still gate the
+  //    weights.
   launch_moe_router(hidden, w_.router_gate, w_.router_bias, d_ids_,
-                    d_weights_, d_scores_, d_biased_, cfg_, tokens, stream);
+                    d_weights_, d_scores_, d_biased_, cfg_, tokens, stream,
+                    nullptr, true, w_.tid2eid, input_ids);
   if (trace) {
     // ids and weights ride async copies into the pinned staging; the biased
     // scores only when the caller stages them (GLM-5.3 does, GLM-4.7 not).
@@ -894,24 +898,28 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
 
 void GlmMoeLayer::enqueue_decode(const uint16_t* hidden, uint16_t* out,
                                  int tokens, MoeTraceStaging* trace,
-                                 cudaStream_t stream, int table_slot) {
+                                 cudaStream_t stream, int table_slot,
+                                 const int64_t* input_ids) {
   if (!has_shared())
     throw std::logic_error(
         "GlmMoeLayer: enqueue_decode needs the shared expert in the chain "
         "(enqueue_decode_f32 runs the routed chain alone)");
-  enqueue_decode_impl(hidden, out, nullptr, tokens, trace, stream, table_slot);
+  enqueue_decode_impl(hidden, out, nullptr, tokens, trace, stream, table_slot,
+                      input_ids);
 }
 
 void GlmMoeLayer::enqueue_decode_f32(const uint16_t* hidden, float* out,
                                      int tokens, MoeTraceStaging* trace,
-                                     cudaStream_t stream, int table_slot) {
-  enqueue_decode_impl(hidden, nullptr, out, tokens, trace, stream, table_slot);
+                                     cudaStream_t stream, int table_slot,
+                                     const int64_t* input_ids) {
+  enqueue_decode_impl(hidden, nullptr, out, tokens, trace, stream, table_slot,
+                      input_ids);
 }
 
 void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16,
                                       float* out_f32, int tokens,
                                       MoeTraceStaging* trace, cudaStream_t stream,
-                                      int table_slot) {
+                                      int table_slot, const int64_t* input_ids) {
   step_timing::Scope tick(step_timing::kMoe);
   if (tokens <= 0) return;
   const bool with_shared = out_bf16 != nullptr;
@@ -935,7 +943,8 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
   //    on device.
   launch_moe_router(hidden, w_.router_gate, w_.router_bias, d_ids_,
                     d_weights_, d_scores_, d_biased_, cfg_, tokens, stream,
-                    d_router_counters_);
+                    d_router_counters_, /*allow_tiled=*/true, w_.tid2eid,
+                    input_ids);
   // 2. Route traces ride ASYNC copies into the caller's pinned staging;
   //    the caller materializes them after its next stream sync (the
   //    decode step's final sync). No round-trip on the hot path.

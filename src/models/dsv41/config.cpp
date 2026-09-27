@@ -132,16 +132,22 @@ void parse_quantization(const minijson::Value& root, Dsv41TextConfig& c) {
     reject("quantization_config.activation_scheme", "only dynamic is implemented, got '" + a + "'");
   if (const std::string s = optional_string(*qc, "scale_fmt", ""); s != "ue8m0")
     reject("quantization_config.scale_fmt", "the loader reads e8m0 (power-of-two) scales, got '" + s + "'");
-  if (const std::string e = optional_string(*qc, "expert_dtype", ""); e != "fp4")
+  // The V4.1 release declares expert_dtype inside quantization_config; the
+  // V4-Flash-0731 config carries it at the root.
+  const std::string e = optional_string(*qc, "expert_dtype", optional_string(root, "expert_dtype", ""));
+  if (e != "fp4")
     reject("quantization_config.expert_dtype",
            "the routed experts must be the release's MXFP4 (e2m1 + e8m0 per 32), got '" + e + "'");
   const minijson::Value& wb = require(*qc, "weight_block_size");
   if (!wb.is_array() || wb.items().size() != 2 || !wb.items()[0].is_number() || !wb.items()[1].is_number())
     reject("quantization_config.weight_block_size", "must be [rows, cols]");
   const int br = static_cast<int>(wb.items()[0].as_int()), bc = static_cast<int>(wb.items()[1].as_int());
-  if (br != 32 || bc != 32)
+  if (c.variant == Dsv41Variant::V41 && (br != 32 || bc != 32))
     reject("quantization_config.weight_block_size",
-           std::format("the fp8 kernels take the release's 32x32 grid, got [{}, {}]", br, bc));
+           std::format("the V4.1 fp8 kernels take the release's 32x32 grid, got [{}, {}]", br, bc));
+  if (c.variant == Dsv41Variant::V4 && (br != 128 || bc != 128))
+    reject("quantization_config.weight_block_size",
+           std::format("the V4-Flash-0731 dense projections use the release's 128x128 grid, got [{}, {}]", br, bc));
   c.fp8_block_size = br;
   c.fp4_block_size = 32;  // the release's MXFP4 block (convert.py fp4_block_size)
   // A re-packed checkpoint (the community NVFP4 casts) declares its
@@ -178,13 +184,25 @@ Dsv41TextConfig Dsv41TextConfig::parse(const minijson::Value& root) {
   if (!root.is_object()) reject("", "root is not an object");
   Dsv41TextConfig c;
   const std::string model_type = optional_string(root, "model_type", "deepseek_v41");
-  if (model_type != "deepseek_v41") reject("model_type", "expected deepseek_v41, got " + model_type);
   const minijson::Value* tcp = root.find("text_config");
-  if (!tcp || !tcp->is_object())
-    reject("text_config", "missing — the DeepSeek-V4.1 layout nests the text model under text_config");
-  const minijson::Value& t = *tcp;
-  if (const std::string tt = optional_string(t, "model_type", "deepseek_v41_text"); tt != "deepseek_v41_text")
-    reject("text_config.model_type", "expected deepseek_v41_text, got " + tt);
+  const minijson::Value* tptr = nullptr;
+  if (model_type == "deepseek_v4") {
+    // The V4-Flash-0731 release is flat: the text model fields live at the
+    // root, no nested text_config, no vision tower (quantization still
+    // root-level, as in V4.1).
+    c.variant = Dsv41Variant::V4;
+    tptr = &root;
+    if (tcp && tcp->is_object())
+      reject("model_type", "the DeepSeek-V4 release is flat — a nested text_config is not expected with model_type deepseek_v4");
+  } else {
+    if (model_type != "deepseek_v41") reject("model_type", "expected deepseek_v41 or deepseek_v4, got " + model_type);
+    if (!tcp || !tcp->is_object())
+      reject("text_config", "missing — the DeepSeek-V4.1 layout nests the text model under text_config");
+    if (const std::string tt = optional_string(*tcp, "model_type", "deepseek_v41_text"); tt != "deepseek_v41_text")
+      reject("text_config.model_type", "expected deepseek_v41_text, got " + tt);
+    tptr = tcp;
+  }
+  const minijson::Value& t = *tptr;
 
   // --- tokens (root) ----------------------------------------------------------
   c.bos_token_id = optional_int64(root, "bos_token_id", 0);
@@ -244,7 +262,10 @@ Dsv41TextConfig Dsv41TextConfig::parse(const minijson::Value& root) {
   {
     const minijson::Value& rs = require(t, "rope_scaling");
     if (!rs.is_object()) reject("text_config.rope_scaling", "not an object");
-    if (const std::string rt = optional_string(rs, "rope_type", "default"); rt != "yarn")
+    // The V4.1 release writes `rope_type`; the V4-Flash-0731 config writes
+    // `type` for the same YaRN scaling.
+    const std::string rt = optional_string(rs, "rope_type", optional_string(rs, "type", "default"));
+    if (rt != "yarn")
       reject("text_config.rope_scaling.rope_type", "the compressed layers' rope is YaRN, got '" + rt + "'");
     c.rope_factor = require_double(rs, "factor");
     c.original_max_position_embeddings = require_int(rs, "original_max_position_embeddings");
@@ -258,9 +279,40 @@ Dsv41TextConfig Dsv41TextConfig::parse(const minijson::Value& root) {
     require_absent(rs, "mscale_all_dim", "a YaRN attention mscale is not part of the release");
   }
 
-  // --- CSA2 schedule ------------------------------------------------------------
-  c.num_nextn_predict_layers = optional_int(t, "num_nextn_predict_layers", 0);
+  // --- DSpark (plan §1.7): the draft depth is the checkpoint's mtp block
+  // count ----------------------------------------------------------------
+  // The V4.1 release declares the MTP count in `num_nextn_predict_layers`;
+  // the V4-Flash-0731 config carries `num_nextn_predict_layers: 1` while
+  // shipping three mtp.S stages. The authoritative depth is the length of
+  // `dspark_target_layer_ids` (one target per draft stage) — the file's
+  // count is not the source of truth (criterion: derive from the mtp
+  // blocks, not the file field).
+  c.dspark_block_size = optional_int(t, "dspark_block_size", 0);
+  c.dspark_noise_token_id = optional_int64(t, "dspark_noise_token_id", -1);
+  c.dspark_target_layer_ids = t.find("dspark_target_layer_ids") ? require_int_list(t, "dspark_target_layer_ids") : std::vector<int>{};
+  c.dspark_markov_rank = optional_int(t, "dspark_markov_rank", 0);
+  // NOTE: dspark_n_routed_experts / dspark_num_experts_per_tok default to
+  // the main MoE's counts and are read after the MoE section below (the
+  // draft stages of V4-Flash-0731 carry the full expert set).
+  if (!c.dspark_target_layer_ids.empty()) {
+    c.num_nextn_predict_layers = static_cast<int>(c.dspark_target_layer_ids.size());
+  } else {
+    c.num_nextn_predict_layers = optional_int(t, "num_nextn_predict_layers", 0);
+  }
   if (c.num_nextn_predict_layers < 0) reject("text_config.num_nextn_predict_layers", "must be >= 0");
+  if (c.num_nextn_predict_layers > 0) {
+    if (c.dspark_block_size <= 0) reject("text_config.dspark_block_size", "must be positive with draft stages");
+    if (c.dspark_noise_token_id < 0 || c.dspark_noise_token_id >= c.vocab_size)
+      reject("text_config.dspark_noise_token_id", "id outside [0, vocab_size)");
+    if (c.dspark_target_layer_ids.empty()) reject("text_config.dspark_target_layer_ids", "DSpark needs target layers");
+    if (!strictly_increasing(c.dspark_target_layer_ids)) reject("text_config.dspark_target_layer_ids", "must be strictly increasing");
+    for (const int l : c.dspark_target_layer_ids)
+      if (l < 0 || l >= c.num_hidden_layers) reject("text_config.dspark_target_layer_ids", std::format("layer {} outside the backbone", l));
+    if (c.dspark_markov_rank <= 0 || c.dspark_markov_rank % 32 != 0)
+      reject("text_config.dspark_markov_rank", "must be a positive multiple of 32");
+  }
+
+  // --- CSA2 schedule ------------------------------------------------------------
   c.compress_ratios = require_int_list(t, "compress_ratios");
   if (static_cast<int>(c.compress_ratios.size()) != c.max_layer())
     reject("text_config.compress_ratios",
@@ -268,51 +320,71 @@ Dsv41TextConfig Dsv41TextConfig::parse(const minijson::Value& root) {
                        c.compress_ratios.size()));
   for (int l = 0; l < c.max_layer(); ++l) {
     const int r = c.compress_ratios[static_cast<size_t>(l)];
-    if (r != 0 && r != 1 && r != 2)
-      reject("text_config.compress_ratios", std::format("layer {}: the compressor implements ratios 0, 1 and 2, got {}", l, r));
+    const bool ok = (c.variant == Dsv41Variant::V4) ? (r == 0 || r == 4 || r == 128)
+                                                    : (r == 0 || r == 1 || r == 2);
+    if (!ok)
+      reject("text_config.compress_ratios",
+             std::format("layer {}: the compressor implements ratios {} for this variant, got {}", l,
+                         c.variant == Dsv41Variant::V4 ? "0, 4 and 128" : "0, 1 and 2", r));
     if (c.is_draft(l) && r != 0)
       reject("text_config.compress_ratios", std::format("draft stage {} must be window-only (ratio 0)", c.draft_stage(l)));
   }
-  c.kv_source_layer_ids = require_int_list(t, "kv_source_layer_ids");
-  c.index_source_layer_ids = require_int_list(t, "index_source_layer_ids");
-  if (!strictly_increasing(c.kv_source_layer_ids)) reject("text_config.kv_source_layer_ids", "must be strictly increasing");
-  if (!strictly_increasing(c.index_source_layer_ids)) reject("text_config.index_source_layer_ids", "must be strictly increasing");
-  for (const int l : c.kv_source_layer_ids) {
-    if (l < 0 || l >= c.num_hidden_layers) reject("text_config.kv_source_layer_ids", std::format("layer {} outside the backbone", l));
-    if (c.compress_ratio(l) == 0) reject("text_config.kv_source_layer_ids", std::format("layer {} is window-only (ratio 0)", l));
-    if (!contains(c.index_source_layer_ids, l))
-      reject("text_config.kv_source_layer_ids", std::format("layer {} compresses its KV but is not an index source (it must own the index keys)", l));
-  }
-  for (const int l : c.index_source_layer_ids) {
-    if (l < 0 || l >= c.num_hidden_layers) reject("text_config.index_source_layer_ids", std::format("layer {} outside the backbone", l));
-    if (c.compress_ratio(l) == 0) reject("text_config.index_source_layer_ids", std::format("layer {} is window-only (ratio 0)", l));
-  }
-  for (int l = 0; l < c.num_hidden_layers; ++l) {
-    if (c.compress_ratio(l) == 0) continue;
-    const int kv = c.kv_source_of(l);
-    if (kv < 0) reject("text_config.compress_ratios", std::format("layer {} compresses but no kv source precedes it", l));
-    if (c.compress_ratio(kv) != c.compress_ratio(l))
-      reject("text_config.compress_ratios",
-             std::format("layer {} (ratio {}) reads kv source {} (ratio {}); a cache is read at its own ratio", l,
-                         c.compress_ratio(l), kv, c.compress_ratio(kv)));
-    const int is = c.index_source_of(l);
-    if (is < 0 || c.kv_source_of(is) != kv)
-      reject("text_config.index_source_layer_ids",
-             std::format("layer {} attends with a selection made over a different cache than the one it reads", l));
-  }
-  c.candidate_source_layer_id = optional_int(t, "candidate_source_layer_id", -1);
-  c.candidate_topk_blocks = optional_int(t, "candidate_topk_blocks", 0);
-  c.candidate_block_size = optional_int(t, "candidate_block_size", 0);
-  if (c.candidate_source_layer_id >= 0) {
-    const int cs = c.candidate_source_layer_id;
-    if (!contains(c.index_source_layer_ids, cs))
-      reject("text_config.candidate_source_layer_id", "must be an index source");
-    if (c.candidate_topk_blocks <= 0 || c.candidate_block_size <= 0)
-      reject("text_config.candidate_topk_blocks", "must be positive with a candidate source");
-    for (const int l : c.index_source_layer_ids)
-      if (l > cs && c.kv_source_of(l) != c.kv_source_of(cs))
-        reject("text_config.candidate_source_layer_id",
-               std::format("index source {} scores inside the candidate pool but reads a different cache", l));
+  if (c.variant == Dsv41Variant::V4) {
+    // The V4-Flash-0731 release has no kv_source / index_source lists: the
+    // CSA2 caches are per-layer (each compressed layer owns its own cache
+    // and its own index keys when it has an indexer). The C4A layers
+    // (ratio 4) carry the indexer and score their own cache; the C128A
+    // layers (ratio 128) have no indexer and select their compressed
+    // blocks sequentially (reference Attention.forward / get_compress_topk_idxs).
+    for (int l = 0; l < c.num_hidden_layers; ++l) {
+      if (c.compress_ratio(l) > 0) c.kv_source_layer_ids.push_back(l);
+      if (c.compress_ratio(l) == 4) c.index_source_layer_ids.push_back(l);
+    }
+    c.candidate_source_layer_id = -1;
+    c.candidate_topk_blocks = 0;
+    c.candidate_block_size = 0;
+  } else {
+    c.kv_source_layer_ids = require_int_list(t, "kv_source_layer_ids");
+    c.index_source_layer_ids = require_int_list(t, "index_source_layer_ids");
+    if (!strictly_increasing(c.kv_source_layer_ids)) reject("text_config.kv_source_layer_ids", "must be strictly increasing");
+    if (!strictly_increasing(c.index_source_layer_ids)) reject("text_config.index_source_layer_ids", "must be strictly increasing");
+    for (const int l : c.kv_source_layer_ids) {
+      if (l < 0 || l >= c.num_hidden_layers) reject("text_config.kv_source_layer_ids", std::format("layer {} outside the backbone", l));
+      if (c.compress_ratio(l) == 0) reject("text_config.kv_source_layer_ids", std::format("layer {} is window-only (ratio 0)", l));
+      if (!contains(c.index_source_layer_ids, l))
+        reject("text_config.kv_source_layer_ids", std::format("layer {} compresses its KV but is not an index source (it must own the index keys)", l));
+    }
+    for (const int l : c.index_source_layer_ids) {
+      if (l < 0 || l >= c.num_hidden_layers) reject("text_config.index_source_layer_ids", std::format("layer {} outside the backbone", l));
+      if (c.compress_ratio(l) == 0) reject("text_config.index_source_layer_ids", std::format("layer {} is window-only (ratio 0)", l));
+    }
+    for (int l = 0; l < c.num_hidden_layers; ++l) {
+      if (c.compress_ratio(l) == 0) continue;
+      const int kv = c.kv_source_of(l);
+      if (kv < 0) reject("text_config.compress_ratios", std::format("layer {} compresses but no kv source precedes it", l));
+      if (c.compress_ratio(kv) != c.compress_ratio(l))
+        reject("text_config.compress_ratios",
+               std::format("layer {} (ratio {}) reads kv source {} (ratio {}); a cache is read at its own ratio", l,
+                           c.compress_ratio(l), kv, c.compress_ratio(kv)));
+      const int is = c.index_source_of(l);
+      if (is < 0 || c.kv_source_of(is) != kv)
+        reject("text_config.index_source_layer_ids",
+               std::format("layer {} attends with a selection made over a different cache than the one it reads", l));
+    }
+    c.candidate_source_layer_id = optional_int(t, "candidate_source_layer_id", -1);
+    c.candidate_topk_blocks = optional_int(t, "candidate_topk_blocks", 0);
+    c.candidate_block_size = optional_int(t, "candidate_block_size", 0);
+    if (c.candidate_source_layer_id >= 0) {
+      const int cs = c.candidate_source_layer_id;
+      if (!contains(c.index_source_layer_ids, cs))
+        reject("text_config.candidate_source_layer_id", "must be an index source");
+      if (c.candidate_topk_blocks <= 0 || c.candidate_block_size <= 0)
+        reject("text_config.candidate_topk_blocks", "must be positive with a candidate source");
+      for (const int l : c.index_source_layer_ids)
+        if (l > cs && c.kv_source_of(l) != c.kv_source_of(cs))
+          reject("text_config.candidate_source_layer_id",
+                 std::format("index source {} scores inside the candidate pool but reads a different cache", l));
+    }
   }
   c.index_n_heads = require_int(t, "index_n_heads");
   c.index_head_dim = require_int(t, "index_head_dim");
@@ -338,6 +410,15 @@ Dsv41TextConfig Dsv41TextConfig::parse(const minijson::Value& root) {
   c.n_routed_experts = require_int(t, "n_routed_experts");
   c.n_shared_experts = optional_int(t, "n_shared_experts", 0);
   c.num_experts_per_tok = require_int(t, "num_experts_per_tok");
+  // The DSpark draft's expert counts default to the main MoE's (the 0731
+  // draft stages carry the full 256-expert set; V4.1 overrides them).
+  c.dspark_n_routed_experts = optional_int(t, "dspark_n_routed_experts", c.n_routed_experts);
+  c.dspark_num_experts_per_tok = optional_int(t, "dspark_num_experts_per_tok", c.num_experts_per_tok);
+  if (c.dspark_n_routed_experts <= 0 || c.dspark_n_routed_experts > 4096)
+    reject("text_config.dspark_n_routed_experts", "must be in [1, 4096]");
+  if (c.dspark_num_experts_per_tok <= 0 || c.dspark_num_experts_per_tok > 16 ||
+      c.dspark_num_experts_per_tok > c.dspark_n_routed_experts)
+    reject("text_config.dspark_num_experts_per_tok", "must be in [1, min(dspark_n_routed_experts, 16)]");
   c.norm_topk_prob = optional_bool(t, "norm_topk_prob", true);
   c.routed_scaling_factor = static_cast<float>(optional_double(t, "routed_scaling_factor", 1.0));
   c.swiglu_limit = static_cast<float>(optional_double(t, "swiglu_limit", 0.0));
@@ -356,16 +437,21 @@ Dsv41TextConfig Dsv41TextConfig::parse(const minijson::Value& root) {
   if (c.topk_method != "noaux_tc") reject("text_config.topk_method", "only noaux_tc is implemented");
   if (const int ng = optional_int(t, "n_group", 1); ng != 1) reject("text_config.n_group", "group-limited routing is not implemented");
   if (const int tg = optional_int(t, "topk_group", 1); tg != 1) reject("text_config.topk_group", "group-limited routing is not implemented");
+  // The 0731 hash-routed prefix: layers [0, num_hash_layers) pick their
+  // expert indices from the tid2eid table; absent in V4.1.
+  c.num_hash_layers = optional_int(t, "num_hash_layers", 0);
+  if (c.num_hash_layers < 0 || c.num_hash_layers > c.num_hidden_layers)
+    reject("text_config.num_hash_layers", "must be in [0, num_hidden_layers]");
 
-  // --- Engram -----------------------------------------------------------------------
-  c.engram_layer_ids = require_int_list(t, "engram_layer_ids");
-  c.engram_num_embeddings = require_int64_list(t, "engram_num_embeddings");
-  c.engram_max_ngram_size = require_int(t, "engram_max_ngram_size");
-  c.engram_vocab_size = require_int64(t, "engram_vocab_size");
-  c.engram_n_heads = require_int(t, "engram_n_heads");
-  c.engram_head_dim = require_int(t, "engram_head_dim");
+  // --- Engram (optional: the V4-Flash-0731 release has no tables) -------------------
+  c.engram_layer_ids = t.find("engram_layer_ids") ? require_int_list(t, "engram_layer_ids") : std::vector<int>{};
+  c.engram_num_embeddings = t.find("engram_num_embeddings") ? require_int64_list(t, "engram_num_embeddings") : std::vector<int64_t>{};
+  c.engram_max_ngram_size = optional_int(t, "engram_max_ngram_size", 4);
+  c.engram_vocab_size = optional_int64(t, "engram_vocab_size", 16000000);
+  c.engram_n_heads = optional_int(t, "engram_n_heads", 8);
+  c.engram_head_dim = optional_int(t, "engram_head_dim", 256);
   c.engram_pad_token_id = optional_int64(t, "engram_pad_token_id", c.pad_token_id);
-  c.engram_compressed_vocab_size = require_int(t, "engram_compressed_vocab_size");
+  c.engram_compressed_vocab_size = optional_int(t, "engram_compressed_vocab_size", 0);
   if (!strictly_increasing(c.engram_layer_ids)) reject("text_config.engram_layer_ids", "must be strictly increasing");
   if (c.engram_num_embeddings.size() != c.engram_layer_ids.size())
     reject("text_config.engram_num_embeddings", "one table size per Engram layer");
@@ -382,30 +468,6 @@ Dsv41TextConfig Dsv41TextConfig::parse(const minijson::Value& root) {
       reject("text_config.engram_pad_token_id", "id outside [0, vocab_size)");
     if (c.engram_compressed_vocab_size <= 0 || c.engram_compressed_vocab_size > c.vocab_size)
       reject("text_config.engram_compressed_vocab_size", "must be in [1, vocab_size]");
-  }
-
-  // --- DSpark ----------------------------------------------------------------------
-  c.dspark_block_size = optional_int(t, "dspark_block_size", 0);
-  c.dspark_noise_token_id = optional_int64(t, "dspark_noise_token_id", -1);
-  c.dspark_target_layer_ids = t.find("dspark_target_layer_ids") ? require_int_list(t, "dspark_target_layer_ids") : std::vector<int>{};
-  c.dspark_markov_rank = optional_int(t, "dspark_markov_rank", 0);
-  c.dspark_n_routed_experts = optional_int(t, "dspark_n_routed_experts", c.n_routed_experts);
-  c.dspark_num_experts_per_tok = optional_int(t, "dspark_num_experts_per_tok", c.num_experts_per_tok);
-  if (c.num_nextn_predict_layers > 0) {
-    if (c.dspark_block_size <= 0) reject("text_config.dspark_block_size", "must be positive with draft stages");
-    if (c.dspark_noise_token_id < 0 || c.dspark_noise_token_id >= c.vocab_size)
-      reject("text_config.dspark_noise_token_id", "id outside [0, vocab_size)");
-    if (c.dspark_target_layer_ids.empty()) reject("text_config.dspark_target_layer_ids", "DSpark needs target layers");
-    if (!strictly_increasing(c.dspark_target_layer_ids)) reject("text_config.dspark_target_layer_ids", "must be strictly increasing");
-    for (const int l : c.dspark_target_layer_ids)
-      if (l < 0 || l >= c.num_hidden_layers) reject("text_config.dspark_target_layer_ids", std::format("layer {} outside the backbone", l));
-    if (c.dspark_markov_rank <= 0 || c.dspark_markov_rank % 32 != 0)
-      reject("text_config.dspark_markov_rank", "must be a positive multiple of 32");
-    if (c.dspark_n_routed_experts <= 0 || c.dspark_n_routed_experts > 4096)
-      reject("text_config.dspark_n_routed_experts", "must be in [1, 4096]");
-    if (c.dspark_num_experts_per_tok <= 0 || c.dspark_num_experts_per_tok > 16 ||
-        c.dspark_num_experts_per_tok > c.dspark_n_routed_experts)
-      reject("text_config.dspark_num_experts_per_tok", "must be in [1, min(dspark_n_routed_experts, 16)]");
   }
 
   parse_quantization(root, c);
@@ -456,7 +518,7 @@ int Dsv41TextConfig::engram_index(int l) const {
 
 bool Dsv41TextConfig::is_dspark_target(int l) const { return contains(dspark_target_layer_ids, l); }
 
-GlmMoeConfig Dsv41TextConfig::moe_config(int local_inter, bool draft) const {
+GlmMoeConfig Dsv41TextConfig::moe_config(int local_inter, bool draft, int layer) const {
   GlmMoeConfig m;
   m.hidden = hidden_size;
   m.inter = local_inter;
@@ -467,6 +529,7 @@ GlmMoeConfig Dsv41TextConfig::moe_config(int local_inter, bool draft) const {
   m.norm_topk_prob = norm_topk_prob;
   m.swiglu_limit = swiglu_limit;
   m.router_mode = scoring_func == "sigmoid" ? MoeRouterMode::SigmoidBias : MoeRouterMode::SqrtSoftplusBias;
+  m.hash_route = !draft && is_hash_layer(layer);
   GlmMoeConfig::validate_config(m);
   return m;
 }

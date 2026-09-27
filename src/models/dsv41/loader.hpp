@@ -70,10 +70,17 @@ struct Dsv41AttnResident {
   const uint16_t* idx_wp = nullptr;     // bf16 [index_heads, hidden]
   const uint16_t* idx_wk = nullptr;     // bf16 [128, head_dim] (kv sources)
   const uint16_t* idx_k_norm = nullptr; // bf16 [128] (kv sources)
+  // The V4-Flash-0731 C4A indexer's own rotated compressor (ratio 4, at the
+  // index dimension: wkv / wgate [2 * 128, hidden], norm [128], ape [4, 256]).
+  const uint16_t* idx_comp_wkv = nullptr;
+  const uint16_t* idx_comp_wgate = nullptr;
+  const uint16_t* idx_comp_norm = nullptr;
+  const float* idx_comp_ape = nullptr;
   // The compressor (kv sources; wgate at ratio > 1).
-  const uint16_t* comp_wkv = nullptr;   // bf16 [head_dim, hidden]
-  const uint16_t* comp_wgate = nullptr; // bf16 [head_dim, hidden]
+  const uint16_t* comp_wkv = nullptr;   // bf16 [coff * head_dim, hidden]
+  const uint16_t* comp_wgate = nullptr; // bf16 [coff * head_dim, hidden]
   const uint16_t* comp_norm = nullptr;  // bf16 [head_dim]
+  const float* comp_ape = nullptr;      // f32 [ratio, coff * head_dim] (V4 only)
   int local_heads = 0;
   int head_begin = 0;
   int local_groups = 0;
@@ -84,7 +91,8 @@ struct Dsv41AttnResident {
 
 struct Dsv41MoeResident {
   const uint16_t* router = nullptr;     // bf16 [E, hidden]
-  const float* router_bias = nullptr;   // f32 [E]
+  const float* router_bias = nullptr;   // f32 [E] (null on the V4 hash layers)
+  const int64_t* tid2eid = nullptr;     // I64 [vocab, topk] (V4 hash layers)
   GlmQuantMatrix shared[3];             // fp8: w1, w3 [S/W, hidden]; w2 [hidden, S/W]
   std::vector<GlmFp4Matrix> experts;    // [E * 3]: w1, w3, w2 per expert (MXFP4, inter-sliced)
   int n_experts = 0;
@@ -118,6 +126,10 @@ struct Dsv41DraftResident {
   const uint16_t* markov_embed = nullptr;   // last stage: bf16 [vocab, rank], replicated
   const uint16_t* markov_head = nullptr;    // last stage: bf16 [vocab, rank], replicated
   const float* confidence = nullptr;        // last stage: f32 [hidden + rank]
+  // The V4-Flash-0731 last-stage head collapse (hc_head over the streams).
+  const uint16_t* hc_head_fn = nullptr;     // bf16 [hc_mult, 4 * hidden] (f32 in file, rounded)
+  const float* hc_head_base = nullptr;      // f32 [hc_mult]
+  const float* hc_head_scale = nullptr;     // f32 [1]
 };
 
 struct Dsv41LayerResident {
@@ -140,6 +152,10 @@ struct Dsv41GlobalsResident {
   const uint16_t* lm_head = nullptr;     // bf16 [lm_vocab_count, hidden]
   int lm_vocab_begin = 0;
   int lm_vocab_count = 0;
+  // The V4-Flash-0731 head collapse (hc_head over the streams).
+  const uint16_t* hc_head_fn = nullptr;  // bf16 [hc_mult, 4 * hidden] (f32 in file, rounded)
+  const float* hc_head_base = nullptr;   // f32 [hc_mult]
+  const float* hc_head_scale = nullptr;  // f32 [1]
   size_t bytes = 0;
 };
 

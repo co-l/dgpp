@@ -24,7 +24,9 @@ void launch_moe_router(const uint16_t* hidden, const uint16_t* gate,
                        float* scores, float* biased, const GlmMoeConfig& cfg,
                        int tokens, cudaStream_t stream,
                        int* counters = nullptr,
-                       bool allow_tiled = true);
+                       bool allow_tiled = true,
+                       const int64_t* tid2eid = nullptr,
+                       const int64_t* input_ids = nullptr);
 
 // swiglu with asymmetric clamps: gate clamp_max only, up clamp both; two
 // bf16 rounding points (silu result, then the product). n = rows*inter.

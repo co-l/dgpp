@@ -4,6 +4,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <format>
 #include <map>
@@ -496,6 +498,8 @@ void CublasLtGemm::matmul(const void* act, const void* weight, void* out,
       (impl_->decode_mma_max_rows == 0 || m <= impl_->decode_mma_max_rows) &&
       mma_gemv_shape_ok(static_cast<const uint16_t*>(weight), static_cast<const uint16_t*>(act),
                         act_row_stride, m, k)) {
+    if (std::getenv("DGPP_GEMM_DISPATCH") && m == 1 && n == 512 && k == 256)
+      std::fprintf(stderr, "[GEMM] mma path (w=%p act=%p)\n", weight, act);
     const auto* x = static_cast<const uint16_t*>(act);
     const auto* w = static_cast<const uint16_t*>(weight);
     auto* y = static_cast<uint8_t*>(out);
@@ -520,6 +524,8 @@ void CublasLtGemm::matmul(const void* act, const void* weight, void* out,
   if (io_dtype == DType::BF16 && m >= 1 &&
       (kernel_only || m <= impl_->gemv_rows(packed) || (released && impl_->bf12_wide)) &&
       bf16_gemv_accepts(weight, /*m=*/1, k)) {
+    if (std::getenv("DGPP_GEMM_DISPATCH") && m == 1 && n == 512 && k == 256)
+      std::fprintf(stderr, "[GEMM] gemv path (w=%p act=%p packed=%d)\n", weight, act, packed != nullptr);
     const auto* x = static_cast<const uint16_t*>(act);
     const auto* w = static_cast<const uint16_t*>(weight);
     const size_t out_elem = out_dtype == GemmOut::F32 ? sizeof(float)

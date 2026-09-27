@@ -369,12 +369,12 @@ bool ToolCallParser::parse_qwen_block(const std::string& text) {
 
 namespace {
 constexpr const char* kDsmlText = "｜DSML｜";
-constexpr const char* kDsmlCallsOpen = "<｜DSML｜ calls";
-constexpr const char* kDsmlCallsClose = "</｜DSML｜ calls>";
-constexpr const char* kDsmlInvokeOpen = "<｜DSML｜ invoke";
-constexpr const char* kDsmlInvokeClose = "</｜DSML｜ invoke";
-constexpr const char* kDsmlParamOpen = "<｜DSML｜ parameter";
-constexpr const char* kDsmlParamClose = "/｜DSML｜ parameter";  // the reference's end token (the value ends with "<")
+constexpr const char* kDsmlCallsOpen = "<｜DSML｜tool_calls";
+constexpr const char* kDsmlCallsClose = "</｜DSML｜tool_calls>";
+constexpr const char* kDsmlInvokeOpen = "<｜DSML｜invoke";
+constexpr const char* kDsmlInvokeClose = "</｜DSML｜invoke";
+constexpr const char* kDsmlParamOpen = "<｜DSML｜parameter";
+constexpr const char* kDsmlParamClose = "/｜DSML｜parameter";  // the reference's end token (the value ends with "<")
 
 // The longest suffix of `text` that could begin a block: "\n\n<", "\n\n",
 // "\n" (the reference writes the block after a blank line) or "<".
@@ -509,12 +509,13 @@ bool ToolCallParser::dsml_block_closed(const std::string& text) const {
 }
 
 // The reference's parse_tool_calls over the closed block: after
-// "<｜DSML｜ calls" exactly ">\n", then invokes — each ` name="NAME">\n`,
-// parameters ` name="K" string="true|false">V<` closed by
-// "/｜DSML｜ parameter" and followed by ">\n", the invoke closed by
-// "</｜DSML｜ invoke" and ">\n" — up to "</｜DSML｜ calls>" with nothing
-// after it. A string value is JSON-encoded; a JSON value that parses is
-// kept as written (normalized), one that does not becomes a string.
+// "<｜DSML｜tool_calls" exactly ">\n", then invokes — each
+// ` name="NAME">\n`, parameters ` name="K" string="true|false">V<`
+// closed by "/｜DSML｜parameter" and followed by ">\n", the invoke
+// closed by "</｜DSML｜invoke" and ">\n" — up to "</｜DSML｜tool_calls>"
+// with nothing after it. A string value is JSON-encoded; a JSON value
+// that parses is kept as written (normalized), one that does not
+// becomes a string.
 bool ToolCallParser::parse_dsml_block(const std::string& text) {
   dsml_calls_.clear();
   size_t index = text.find(kDsmlCallsOpen);

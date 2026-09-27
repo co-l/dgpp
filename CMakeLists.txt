@@ -535,13 +535,6 @@ add_executable(glm_stream_check apps/glm_stream_check.cpp)
 target_link_libraries(glm_stream_check PRIVATE dgpp_models_glm_loader)
 dgpp_set_common(glm_stream_check)
 
-  # The small-collective stall repro (engine hunt instrument, not a CI gate
-  # until the fix lands — see the file comment).
-  add_executable(bus_small_repro apps/bus_small_repro.cu)
-  target_link_libraries(bus_small_repro PRIVATE dgpp_bus CUDA::cudart
-                                                Threads::Threads)
-  dgpp_set_common(bus_small_repro)
-
   # The in-process two-rank graph scheduling model that root-caused the
   # batched-MTP loopback stall (docs/batched_mtp_graph_stall.md): kernels-only
   # graphs never deadlock; one memset node per collective does at
@@ -579,6 +572,13 @@ if(DGPP_ENABLE_IBV)
     PUBLIC dgpp_net CUDA::cudart ${IBVERBS_LIBRARY})
   target_include_directories(dgpp_bus PUBLIC ${IBVERBS_INCLUDE_DIR})
   dgpp_set_common(dgpp_bus)
+
+  # The small-collective stall repro (engine hunt instrument, not a CI gate
+  # until the fix lands — see the file comment).
+  add_executable(bus_small_repro apps/bus_small_repro.cu)
+  target_link_libraries(bus_small_repro PRIVATE dgpp_bus CUDA::cudart
+                                                Threads::Threads)
+  dgpp_set_common(bus_small_repro)
 
   add_executable(bus_check apps/bus_check.cpp)
   target_link_libraries(bus_check PRIVATE dgpp_bus)
@@ -721,6 +721,7 @@ add_executable(unit_tests
   tests/unit/glm_dsa_binding_test.cpp
   tests/unit/dsv41_config_test.cpp
   tests/unit/dsv41_binding_test.cpp
+  tests/unit/dsv4_config_test.cpp
   tests/unit/mimo_config_test.cpp
   tests/unit/mimo_binding_test.cpp
   tests/unit/nvfp4_quant_test.cpp

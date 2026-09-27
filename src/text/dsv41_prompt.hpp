@@ -1,14 +1,14 @@
 #pragma once
-// The DeepSeek-V4.1 prompt renderer (docs/deepseek_v41_flash_plan.md G6):
-// the checkpoint ships no chat_template.jinja — `encoding/encoding.py`
+// The DeepSeek-V4 prompt renderer (docs/deepseek_v41_flash_plan.md G6):
+// the checkpoint ships no chat_template.jinja — `encoding/encoding_dsv4.py`
 // (its `encode_messages`, text-only) is the reference, and this is that
 // function over the service's template globals. The prompt format
-// (encoding/README.md):
-//   <｜begin▁of▁sentence｜>[<｜System｜>[effort prefix]{system}]
-//   <｜User｜>{user}<｜Assistant｜><think>{reasoning}</think>{content}[\n\n<｜DSML｜ calls>...]<｜end▁of▁sentence｜>
-//   ... the generation header after the last user (or mid-conversation
-//   system) message: <｜Assistant｜> then <think> (thinking mode) or
-//   </think> (chat mode).
+// (0731 encoder: no system marker, `system_msg_template` is bare content):
+//   <｜begin▁of▁sentence｜>[effort prefix]{system}
+//   <｜User｜>{user}<｜Assistant｜><think>{reasoning}</think>{content}[\n\n<｜DSML｜tool_calls>...]<｜end▁of▁sentence｜>
+//   ... the generation header after a user message only (never after a
+//   mid-conversation system): <｜Assistant｜> then <think> (thinking mode)
+//   or </think> (chat mode).
 // Tool results are <tool_result>...</tool_result> blocks inside the user
 // turn (a `tool` message merges into the preceding user turn or opens
 // one; consecutive user messages merge likewise), ordered by the previous
@@ -17,11 +17,10 @@
 // system message, or to an empty one inserted at the front); earlier
 // turns' reasoning is dropped in thinking mode unless the conversation
 // carries tools (`clear_thinking`, default true); `enable_thinking` false
-// is the reference's chat mode; `reasoning_effort` renders the numeric
-// budget at the conversation's start in thinking mode (low 50, high 75
-// as the reference maps them; minimal 25 and medium 62 interpolate; an
-// integer in [1, 100] passes through; absent: the reference's default,
-// high).
+// is the reference's chat mode; `reasoning_effort` renders the reference's
+// text prefix at the conversation's start in thinking mode (exactly
+// low / high / max; the service's scale folds onto them — minimal/low,
+// medium/high, xhigh/max; low and the absent default add nothing).
 //
 // Validation: tests/host/dsv41_prompt_test.cpp renders
 // tests/data/dsv41_prompt_goldens.jsonl (tools/gen_dsv41_prompt_goldens.py:
@@ -45,9 +44,8 @@ class Dsv41Prompt {
   // image content, a namespace conflict).
   static std::string render(const minijson::Value& globals);
   // One OpenAI tool entry's name as the schema lists it and the model
-  // writes it in a DSML invoke: "namespace::name" when a namespace is
-  // present (the entry's or the function's; a "ns::name" in the name
-  // itself must agree), else the bare name. Throws std::invalid_argument
+  // writes it in a DSML invoke: the function's name, verbatim (the 0731
+  // reference ignores the entry's namespace). Throws std::invalid_argument
   // on a malformed entry (the renderer's own refusals).
   static std::string qualified_tool_name(const minijson::Value& tool);
   // The knobs this renderer reads (the service's chat_template_kwargs gate).

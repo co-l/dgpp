@@ -87,7 +87,8 @@ class GlmMoeLayer {
   // takes the kernel as an argument — kGemv by default (the decode pin),
   // kMma to serve as the prefill path's bitwise reference.
   void enqueue_prefill(const uint16_t* hidden, uint16_t* out, int tokens,
-                       MoeTraceStaging* trace, cudaStream_t stream);
+                       MoeTraceStaging* trace, cudaStream_t stream,
+                       const int64_t* input_ids = nullptr);
   void enqueue(const uint16_t* hidden, uint16_t* out, int tokens,
                cudaStream_t stream,
                MoeExpertKernel kernel = MoeExpertKernel::kGemv);
@@ -123,14 +124,14 @@ class GlmMoeLayer {
   // upload node is recorded, so a replay moves no table bytes at all.
   void enqueue_decode(const uint16_t* hidden, uint16_t* out, int tokens,
                       MoeTraceStaging* trace, cudaStream_t stream,
-                      int table_slot = -1);
+                      int table_slot = -1, const int64_t* input_ids = nullptr);
   // The decode fast path's ROUTED chain alone, handed back unrounded in
   // fp32 (out [tokens, hidden]) — the Qwen decode (its BF16 shared expert
   // continues the chain, models/qwen/moe_layer.cpp). Bitwise enqueue_f32
   // at the same routing. Works without a shared expert.
   void enqueue_decode_f32(const uint16_t* hidden, float* out, int tokens,
                           MoeTraceStaging* trace, cudaStream_t stream,
-                          int table_slot = -1);
+                          int table_slot = -1, const int64_t* input_ids = nullptr);
 
   // Fills graph slot `table_slot`'s device expert-view table from the
   // CURRENT binding (an async H2D on `stream`; the caller syncs before
@@ -179,7 +180,8 @@ class GlmMoeLayer {
   // full chain with the shared expert) / out_f32 (the routed chain) is set.
   void enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16,
                            float* out_f32, int tokens, MoeTraceStaging* trace,
-                           cudaStream_t stream, int table_slot);
+                           cudaStream_t stream, int table_slot,
+                           const int64_t* input_ids = nullptr);
   // The eager paths' expert-table upload: fills the ring's next pinned
   // entry with every routed expert's three views (and the shared expert's
   // three after them when with_shared) and copies it to d_dst on stream —

@@ -60,6 +60,14 @@ struct GlmMoeConfig {
   bool norm_topk_prob = true;
   float swiglu_limit = 10.0f;  // +inf: no clamps (the Qwen experts)
   MoeRouterMode router_mode = MoeRouterMode::SigmoidBias;
+  // The 0731 hash-routed prefix (layers 0..num_hash_layers-1): the expert
+  // indices come from the static tid2eid table (vocab x top_k, int32)
+  // gathered by token id, NOT the top-k of the biased scores; the weights
+  // are still the scores gathered at those ids (reference Gate.forward).
+  bool hash_route = false;
+  // The router needs the token ids for the hash table lookup; the MoE layer
+  // passes them through when hash_route is set.
+  bool needs_token_ids() const { return hash_route; }
 
   // Weight bytes of one routed expert (payload + block scales): the number
   // the traffic model charges per selected expert.
@@ -111,6 +119,7 @@ struct GlmMoeConfig {
 struct GlmMoeWeights {
   const uint16_t* router_gate = nullptr;  // bf16 [n_experts, hidden]
   const float* router_bias = nullptr;     // f32 [n_experts] (null: SoftmaxTopk)
+  const int64_t* tid2eid = nullptr;       // I64 [vocab, top_k] (the 0731 hash layers)
   GlmQuantMatrix shared[3];               // gate, up, down (FP8; unset when n_shared_experts == 0)
   // The shared expert in NVFP4 (2026-09-09, GLM-4.7, docs/glm47_plan.md
   // D3): the routed experts' shapes exactly (one expert wide), so the

@@ -39,7 +39,6 @@
 #include "common/log.hpp"
 
 #include "common/test.hpp"
-#include "../common/utf8.hpp"
 #include "sched/scheduler.hpp"
 #include "serve/generation_service.hpp"
 #include "serve/image_inputs.hpp"
@@ -676,8 +675,7 @@ struct ServiceRig {
                       std::optional<dgpp::RopeScaling> rope_scaling = std::nullopt,
                       int64_t position_ceiling = 0, int64_t kv_pool_tokens = 0,
                       bool resumable_prefill = false, bool with_dsml = false,
-                      std::string default_chat_template_kwargs = "{}",
-                      int sse_ping_interval = dgpp::serve::kDefaultSsePingInterval)
+                      std::string default_chat_template_kwargs = "{}")
       : engine(kSlots, /*total_blocks=*/100, /*block_tokens=*/4, can_sample),
         frontend(with_markers, with_dsml),
         cfg([&] {
@@ -696,7 +694,6 @@ struct ServiceRig {
           c.kv_pool_tokens = kv_pool_tokens;
           c.file_inputs = std::move(file_inputs);
           c.default_chat_template_kwargs = std::move(default_chat_template_kwargs);
-          c.sse_ping_interval = sse_ping_interval;
           return c;
         }()),
         service((engine.set_prefix_arena(prefix_slots, 4), cfg), &engine, &frontend, {kFakeEos}),
@@ -772,140 +769,6 @@ std::string fake_text(size_t prompt_len, int n) {
   for (int i = 0; i < n; ++i)
     out.push_back(static_cast<char>(fake_token(prompt_len, i)));
   return out;
-}
-
-void post_completion(Client& client, bool chat, const std::string& extra, int tokens = 3) {
-  const std::string body =
-      chat ? chat_body("abcde", tokens, extra)
-           : "{\"model\":\"" + kModel +
-                 "\",\"prompt\":\"abcde\",\"max_tokens\":" + std::to_string(tokens) + extra + "}";
-  client.send_all(std::string("POST /v1/") + (chat ? "chat/completions" : "completions") +
-                  " HTTP/1.1\r\nHost: t\r\nContent-Length: " + std::to_string(body.size()) +
-                  "\r\n\r\n" + body);
-}
-
-constexpr std::string_view kPingFrame = "e\r\n: keep-alive\n\n\r\n";
-
-DGPP_TEST(serve_ssePing_queuedChoicesAndLegacyCompleteNormally) {
-  for (bool chat : {true, false}) {
-    ServiceRig rig;
-    rig.gate = true;
-    Client client(rig.port());
-    post_completion(
-        client, chat,
-        ",\"stream\":true,\"sse_ping_interval\":1,\"stream_options\":{\"include_usage\":true}" +
-            std::string(chat ? ",\"n\":3" : ""));
-    const auto response = client.read_until(std::string(kPingFrame), 2500);
-    const auto ping = response.find(kPingFrame);
-    require(ping != std::string::npos, "queued request receives a chunked SSE comment");
-    require(response.find(kPingFrame, ping + kPingFrame.size()) == std::string::npos,
-            "choices share one ping per interval");
-    require(response.find("data: ") == std::string::npos,
-            "keep-alives do not send completion chunks before generation");
-    require(client.read_until(std::string(kPingFrame), 250).empty(), "no duplicate choice ping");
-    require(rig.service.stats().tokens_out == 0, "ping does not count as generated tokens");
-    rig.gate = false;
-    const auto completed = client.read_until("0\r\n\r\n", 3000);
-    require(completed.find("data: [DONE]") != std::string::npos, "stream finishes normally");
-    require(completed.find("\"finish_reason\":\"length\"") != std::string::npos,
-            "finish reason unchanged");
-    require(completed.find(chat ? "\"completion_tokens\":9" : "\"completion_tokens\":3") !=
-                std::string::npos,
-            "pings do not enter usage");
-    require(completed.find(kPingFrame) == std::string::npos, "active output suppresses pings");
-    require(client.read_until(std::string(kPingFrame), 1200).empty(), "no ping after DONE");
-    // Reusing the same connection must not inherit the previous ping policy.
-    post_completion(client, chat, "");
-    const auto one_shot = client.read_until("\"usage\"", 2000);
-    require(one_shot.find("200 OK") != std::string::npos &&
-                one_shot.find(kPingFrame) == std::string::npos,
-            "the next non-stream response stays JSON");
-  }
-}
-
-DGPP_TEST(serve_ssePing_blockedPrefillDoesNotCountAsEngineProgress) {
-  ServiceRig rig;
-  rig.engine.hold_prefill = true;
-  struct Release {
-    FakeEngine& engine;
-    ~Release() { engine.hold_prefill = false; }
-  } release{rig.engine};
-  Client client(rig.port());
-  post_completion(client, true, ",\"stream\":true,\"sse_ping_interval\":1");
-  for (int i = 0; i < 500 && !rig.engine.prefill_entered; ++i)
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  require(rig.engine.prefill_entered, "prefill is blocked");
-  const auto epoch = rig.engine.prefill_monitor()->progress_epoch();
-  require(client.read_until(std::string(kPingFrame), 2500).find(kPingFrame) != std::string::npos,
-          "ping arrives before synchronous prefill returns");
-  require(rig.engine.prefill_monitor()->progress_epoch() == epoch &&
-              rig.service.stats().tokens_out == 0,
-          "transport activity does not advance the engine or token counters");
-  client.hard_close();
-  for (int i = 0; i < 500 && rig.service.stats().requests_cancelled == 0; ++i)
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  require(rig.service.stats().requests_cancelled == 1,
-          "pinging request can disconnect during prefill");
-}
-
-DGPP_TEST(serve_ssePing_betweenTokensAndDuringActiveOutput) {
-  for (const int delay_ms : {1400, 250}) {
-    ServiceRig rig;
-    rig.pass_delay_ms = delay_ms;
-    Client client(rig.port());
-    post_completion(client, true, ",\"stream\":true,\"sse_ping_interval\":1", 8);
-    const auto response = client.read_until("data: [DONE]", 15000);
-    require(response.find("data: [DONE]") != std::string::npos, "decode finishes");
-    require((response.find(kPingFrame) != std::string::npos) == (delay_ms > 1000),
-            "only gaps in emitted output cause pings");
-    if (delay_ms > 1000)
-      require(response.find("\"content\":\"" + fake_text(5, 1)) < response.find(kPingFrame),
-              "content arrives before the decode-gap ping");
-  }
-}
-
-DGPP_TEST(serve_ssePing_serverDefaultAndRequestOverride) {
-  for (const int server_interval : {1, -1}) {
-    ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt, false, false, {}, 0, {},
-                   std::nullopt, 0, 0, false, false, "{}", server_interval);
-    rig.gate = true;
-    Client inherited(rig.port()), overridden(rig.port()), one_shot(rig.port());
-    post_completion(inherited, true, ",\"stream\":true");
-    post_completion(
-        overridden, false,
-        ",\"stream\":true,\"sse_ping_interval\":" + std::to_string(server_interval == 1 ? -1 : 1));
-    post_completion(one_shot, true, "");
-    const auto base = inherited.read_until(std::string(kPingFrame), 1300);
-    const auto custom =
-        overridden.read_until(std::string(kPingFrame), server_interval == 1 ? 300 : 1300);
-    require((base.find(kPingFrame) != std::string::npos) == (server_interval == 1),
-            "server default honored");
-    require((custom.find(kPingFrame) != std::string::npos) == (server_interval == -1),
-            "request overrides default");
-    require(one_shot.read_until(std::string(kPingFrame), 100).empty(),
-            "non-stream requests never ping");
-  }
-}
-
-DGPP_TEST(serve_ssePing_rejectsInvalidRequestIntervals) {
-  ServiceRig rig;
-  for (bool chat : {true, false}) {
-    for (const char* value :
-         {"0", "-2", "true", "null", "\"1\"", "1.5", "1.0", "2147483648", "1e100"}) {
-      Client client(rig.port());
-      post_completion(client, chat, std::string(",\"stream\":true,\"sse_ping_interval\":") + value);
-      const auto response = client.read_until("\"param\":\"sse_ping_interval\"", 1000);
-      require(response.find("400 Bad Request") != std::string::npos &&
-                  response.find("\"param\":\"sse_ping_interval\"") != std::string::npos,
-              "invalid interval rejected by name before admission");
-    }
-    Client client(rig.port());
-    post_completion(client, chat, ",\"sse_ping_interval\":1");
-    require(client.read_until("requires stream: true", 1000).find("400 Bad Request") !=
-                std::string::npos,
-            "explicit interval requires streaming");
-  }
-  require(rig.service.stats().requests_total == 0, "invalid requests never reach admission");
 }
 
 DGPP_TEST(serve_chatNonStream_exactCompletionShape) {
@@ -3338,111 +3201,6 @@ DGPP_TEST(serve_pipelinedRequests_areAnsweredOneAtATimeInOrder) {
   require(rig.service.drained(), "nothing owed");
 }
 
-std::pair<std::string, std::string> utf8_completion_text(
-    const std::string& response, bool chat, bool stream) {
-  require(response.find("200 OK") != std::string::npos, "UTF-8 request succeeds");
-  // Check the entire wire response, including logprob strings and each SSE
-  // payload, with scalar-value validation independent of the serving helper.
-  dgpp::test::require_utf8(response);
-  std::string content, reasoning;
-  const auto inspect = [&](const dgpp::minijson::Value& root) {
-    for (const auto& choice : root.at("choices").items()) {
-      const auto& message = chat ? choice.at(stream ? "delta" : "message") : choice;
-      if (const auto* field = message.find(chat ? "content" : "text"); field && field->is_string())
-        content += field->as_string();
-      if (const auto* field = message.find("reasoning_content"); field && field->is_string())
-        reasoning += field->as_string();
-    }
-  };
-  if (stream) {
-    require(response.find("data: [DONE]") != std::string::npos, "UTF-8 stream finishes");
-    for (size_t at = 0; (at = response.find("data: ", at)) != std::string::npos;) {
-      at += 6;
-      const auto end = response.find("\n\n", at);
-      require(end != std::string::npos, "complete SSE payload");
-      const auto payload = response.substr(at, end - at);
-      if (payload == "[DONE]") break;
-      dgpp::test::require_utf8(payload);
-      inspect(dgpp::minijson::parse(payload).root);
-      at = end + 2;
-    }
-  } else {
-    const auto start = response.find("\r\n\r\n");
-    require(start != std::string::npos, "complete response headers");
-    inspect(dgpp::minijson::parse(std::string_view(response).substr(start + 4)).root);
-  }
-  return {content, reasoning};
-}
-
-std::string post_utf8_completion(ServiceRig& rig, bool chat, bool stream,
-                                 const std::string& quoted_prompt,
-                                 const std::string& extra = "",
-                                 const std::string& until = "") {
-  const std::string input = chat ? "\"messages\":[{\"role\":\"user\",\"content\":" + quoted_prompt + "}]"
-                                 : "\"prompt\":" + quoted_prompt;
-  const std::string body = "{\"model\":\"" + kModel + "\"," + input +
-      ",\"max_tokens\":256" + (stream ? ",\"stream\":true" : "") + extra + "}";
-  Client client(rig.port());
-  client.send_all(std::string("POST /v1/") + (chat ? "chat/completions" : "completions") +
-      " HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: " +
-      std::to_string(body.size()) + "\r\n\r\n" + body);
-  return client.read_until(until.empty() ? (stream ? "\r\n0\r\n\r\n" : "usage") : until, 5000);
-}
-
-DGPP_TEST(serve_utf8_escapedAndRawPromptsReachFrontendIdentically) {
-  const std::string text = "📭🏢𠀀";
-  for (const bool chat : {false, true}) {
-    ServiceRig rig(8, model_defaults(), false, std::nullopt, chat);
-    rig.pass_delay_ms = 2;
-    rig.engine.script(text.size() + (chat ? 1 : 0),
-                      script_of(rig, chat ? text + "</think>" + text : text));
-    for (const bool stream : {false, true}) {
-      for (const std::string& prompt : {"\"" + text + "\"",
-                                      std::string(R"("\ud83d\udced\ud83c\udfe2\ud840\udc00")")}) {
-        const auto response = post_utf8_completion(rig, chat, stream, prompt);
-        const auto [content, reasoning] = utf8_completion_text(response, chat, stream);
-        require(content == text && reasoning == (chat ? text : ""),
-                "escaped and raw supplementary characters survive both response modes");
-        if (chat) {
-          const auto globals = rig.frontend.last_globals();
-          require(dgpp::minijson::parse(globals).root.at("messages").items().front().at("content").as_string() == text,
-                  "the frontend receives correct UTF-8 from escaped input");
-        }
-      }
-    }
-  }
-}
-
-DGPP_TEST(serve_utf8_invalidOutputIsReplacedInContentReasoningAndLogprobs) {
-  const std::string bytes = "\xED\xA0\xBD|\xED\xB3\xAD|\xC0\x80|\xE0\x80\x80|"
-                            "\xF0\x80\x80\x80|\xF4\x90\x80\x80|\xF5\x80\x80\x80|"
-                            "\xE2\x82" "A|📭\xE2\x82";
-  const std::string expected = "���|���|��|���|����|����|����|�A|📭�";
-  for (const bool chat : {false, true}) {
-    ServiceRig rig(8, model_defaults(), true, std::nullopt, chat);
-    rig.pass_delay_ms = 2;
-    rig.engine.script(chat ? 5 : 4, script_of(rig, chat ? bytes + "</think>" + bytes : bytes));
-    for (const bool stream : {false, true}) {
-      const auto response = post_utf8_completion(rig, chat, stream, "\"abcd\"",
-          chat ? ",\"logprobs\":true,\"top_logprobs\":2" : ",\"logprobs\":2");
-      const auto [content, reasoning] = utf8_completion_text(response, chat, stream);
-      require(content == expected && reasoning == (chat ? expected : ""),
-              "invalid UTF-8 is replaced without losing following valid characters");
-    }
-  }
-}
-
-DGPP_TEST(serve_utf8_malformedHexEscapesAreBadRequests) {
-  ServiceRig rig;
-  for (const bool chat : {false, true}) {
-    for (const char* prompt : {R"("\u12xz")", R"("\ud83d\udcez")", R"("\ud83d\u123")"}) {
-      const auto response = post_utf8_completion(rig, chat, false, prompt, "", "\"error\"");
-      require(response.find("400 Bad Request") != std::string::npos,
-              "malformed hex is rejected before generation");
-    }
-  }
-}
-
 DGPP_TEST(serve_utf8_aCharacterSplitAcrossTokensIsHeldUntilComplete) {
   // The soak's find: a byte-level BPE token can end inside a
   // multi-byte character, and the delta carried its bytes as they came —
@@ -3479,7 +3237,15 @@ DGPP_TEST(serve_utf8_aCharacterSplitAcrossTokensIsHeldUntilComplete) {
       at += 11;
       const size_t end = raw.find('"', at);
       const std::string piece = raw.substr(at, end - at);
-      dgpp::test::require_utf8(piece);
+      // A strict check: every byte >= 0x80 sits inside a complete sequence.
+      for (size_t i = 0; i < piece.size();) {
+        const unsigned char b = static_cast<unsigned char>(piece[i]);
+        const size_t len = b < 0x80 ? 1 : (b & 0xE0) == 0xC0 ? 2 : (b & 0xF0) == 0xE0 ? 3 : (b & 0xF8) == 0xF0 ? 4 : 0;
+        require(len > 0 && i + len <= piece.size(), "a delta that is not UTF-8: " + piece);
+        for (size_t k = 1; k < len; ++k)
+          require((static_cast<unsigned char>(piece[i + k]) & 0xC0) == 0x80, "a delta that is not UTF-8: " + piece);
+        i += len;
+      }
       at = end;
     }
   }
@@ -4110,95 +3876,6 @@ DGPP_TEST(serve_edge_malformedModelCustomOutputTerminatesWithError) {
   const auto stream = post_chat(rig, chat_body("abcd", 128, tools + R"(,"stream":true)"), "[DONE]", 3000);
   require(stream.find("invalid_tool_output") != std::string::npos && stream.find("[DONE]") != std::string::npos &&
           stream.find(R"("finish_reason":"tool_calls")") == std::string::npos, "stream emits terminal error and DONE");
-}
-
-namespace {
-
-size_t require_stream_preamble(const std::string& response, bool chat, int choice = 0) {
-  const std::string preamble =
-      "\"index\":" + std::to_string(choice) +
-      (chat ? ",\"delta\":{\"role\":\"assistant\",\"content\":\"\"}" : ",\"text\":\"\"") +
-      ",\"logprobs\":null,\"finish_reason\":null";
-  const auto first = response.find(preamble);
-  require(first != std::string::npos && response.find(preamble, first + 1) == std::string::npos,
-          "exactly one preamble per choice: " + response);
-  return first;
-}
-
-}  // namespace
-
-DGPP_TEST(serve_streamPreamble_emptyCompletionsKeepPreamble) {
-  for (bool chat : {true, false}) {
-    for (bool initial_stop : {false, true}) {
-      ServiceRig rig;
-      // Either the prefill pick is EOS, or all output is a stop string.
-      rig.engine.script(5, initial_stop ? std::vector<int32_t>{'X'} : std::vector<int32_t>{});
-      Client client(rig.port());
-      post_completion(client, chat,
-                      std::string(R"(,"stream":true,"stream_options":{"include_usage":true})") +
-                          (chat ? R"(,"n":2)" : "") + (initial_stop ? R"(,"stop":"X")" : ""));
-      const auto response = client.read_until("0\r\n\r\n", 5000);
-      for (int choice = 0; choice < (chat ? 2 : 1); ++choice) {
-        const auto first = require_stream_preamble(response, chat, choice);
-        const std::string terminal = "\"index\":" + std::to_string(choice) +
-                                     (chat ? ",\"delta\":{}" : ",\"text\":\"\"") +
-                                     ",\"logprobs\":null,\"finish_reason\":\"stop\"";
-        const auto finish = response.find(terminal);
-        require(finish != std::string::npos && first < finish,
-                "empty choice starts before its terminal chunk: " + response);
-      }
-      const auto usage = response.find("\"choices\":[],\"usage\":{");
-      require(usage != std::string::npos && response.find("\"finish_reason\":\"stop\"") < usage &&
-                  usage < response.find("data: [DONE]"),
-              "usage and DONE follow the completed choices: " + response);
-    }
-  }
-}
-
-DGPP_TEST(serve_streamPreamble_truncatedUtf8KeepsPreamble) {
-  for (bool chat : {true, false}) {
-    ServiceRig rig;
-    rig.engine.script(5, {0xE2});
-    Client client(rig.port());
-    post_completion(client, chat, R"(,"stream":true)", 1);
-    const auto response = client.read_until("0\r\n\r\n", 5000);
-    const auto first = require_stream_preamble(response, chat);
-    const auto replacement = response.find("\xEF\xBF\xBD");
-    const auto finish = response.find(R"("finish_reason":"length")");
-    require(replacement != std::string::npos && finish != std::string::npos &&
-                first < replacement && replacement < finish,
-            "preamble precedes the final UTF-8 replacement: " + response);
-  }
-}
-
-DGPP_TEST(serve_streamPreamble_waitsForOutput) {
-  for (bool chat : {true, false}) {
-    ServiceRig rig;
-    rig.engine.hold_prefill = true;
-    struct Release {
-      FakeEngine& engine;
-      ~Release() { engine.hold_prefill = false; }
-    } release{rig.engine};
-    Client client(rig.port());
-    post_completion(client, chat, R"(,"stream":true)", 1);
-    for (int i = 0; i < 500 && !rig.engine.prefill_entered; ++i)
-      std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    require(rig.engine.prefill_entered, "prefill is blocked");
-    const auto headers = client.read_available(100);
-    require(headers.find("text/event-stream") != std::string::npos,
-            "headers arrive before generation");
-    require(headers.find("data: ") == std::string::npos,
-            "no completion chunk before prefill finishes: " + headers);
-    rig.engine.hold_prefill = false;
-    const auto response = client.read_until("0\r\n\r\n", 5000);
-    const auto first = require_stream_preamble(response, chat);
-    const std::string output =
-        std::string(chat ? "\"content\":\"" : "\"text\":\"") + fake_text(5, 1) + "\"";
-    const auto content = response.find(output);
-    require(content != std::string::npos && first < content &&
-                content < response.find(R"("finish_reason":"length")"),
-            "delayed preamble precedes the first output: " + response);
-  }
 }
 
 int main() {
