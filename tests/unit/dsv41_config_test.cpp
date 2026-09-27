@@ -168,6 +168,19 @@ DGPP_TEST(dsv41_config_refuses_unsupported_shapes) {
               "quantization_config"), "missing quantization");
 }
 
+DGPP_TEST(dsv41_config_single_pass_pre) {
+  const dgpp::Dsv41TextConfig c = parse(config_json());
+  require(c.single_pass_pre(), "the V4.1 release collapses each site with the previous site's pre");
+}
+
+DGPP_TEST(dsv41_config_decoder_invariant) {
+  const dgpp::Dsv41TextConfig c = parse(config_json());
+  // The CED split: from the last kv source (layer 20) on, the decoder reads
+  // that source's cache at ratio 1. A decoder layer at ratio > 1 is already
+  // refused by the parser's cache-ratio rule; this is the model-side backstop.
+  c.check_decoder_invariant();
+}
+
 DGPP_TEST(dsv41_architecture_registry_dispatches) {
   const auto d = dgpp::minijson::parse(R"({"architectures": ["DeepseekV41ForCausalLM"], "model_type": "deepseek_v41"})");
   require(dgpp::detect_architecture(d.root) == dgpp::ModelArchitecture::DeepseekV41, "deepseek_v41");

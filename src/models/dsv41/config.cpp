@@ -484,6 +484,18 @@ Dsv41TextConfig Dsv41TextConfig::from_json_file(const std::string& path) {
 bool Dsv41TextConfig::is_kv_source(int l) const { return contains(kv_source_layer_ids, l); }
 bool Dsv41TextConfig::is_index_source(int l) const { return contains(index_source_layer_ids, l); }
 
+bool Dsv41TextConfig::single_pass_pre() const {
+  return variant == Dsv41Variant::V41;
+}
+
+void Dsv41TextConfig::check_decoder_invariant() const {
+  if (variant != Dsv41Variant::V41) return;  // V4: CSA2 throughout, no ratio-1 decoder
+  const int dec0 = decoder_first_layer();
+  for (int l = dec0; l < num_hidden_layers; ++l)
+    if (compress_ratio(l) > 1 || (is_kv_source(l) && l != dec0))
+      throw std::invalid_argument("Dsv41Model: the decoder (from the last kv source on) must read that source at ratio 1");
+}
+
 Dsv41LayerMode Dsv41TextConfig::layer_mode(int l) const {
   if (l < 0 || l >= max_layer()) throw std::out_of_range("Dsv41TextConfig::layer_mode: layer out of range");
   if (compress_ratio(l) == 0) return Dsv41LayerMode::Window;

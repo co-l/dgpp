@@ -244,8 +244,10 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   void build_layer_objects(const Dsv41LayerResident& r);
   Csa2LayerWeights csa2_view(const Dsv41LayerResident& r, int layer) const;
   static GlmMoeWeights moe_view(const Dsv41MoeResident& m);
+  GlmMoeLayer& moe_for(int layer);  // the hash-routed prefix's chain, or the routed one
   Dsv41EngramLayerWeights engram_view(const Dsv41EngramResident& e) const;
   int tail_ordinal(int layer) const;
+  int idx_tail_ordinal(int layer) const;
   int cache_ordinal(int layer) const;
   // The layer over the streams (cur -> next, swapped), the two folds.
   void enqueue_layer(const Dsv41LayerResident& r, int layer, int T, const WalkRows& rows);
@@ -274,6 +276,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   size_t gemm_ws_bytes_ = 0;
   Dsv41GlobalsResident globals_;
   GlmMoeConfig moe_cfg_;
+  GlmMoeConfig moe_hash_cfg_;  // the 0731 hash-routed prefix (layers 0..num_hash_layers-1)
   GlmMhcConfig mhc_cfg_;
   Csa2Config csa2_cfg_;
   bool embed_sharded_ = false;
@@ -281,6 +284,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
 
   std::unique_ptr<Csa2Layer> csa2_;
   std::unique_ptr<GlmMoeLayer> moe_;
+  std::unique_ptr<GlmMoeLayer> moe_hash_;  // the 0731 hash-routed prefix's routed chain
   std::unique_ptr<GlmMoeLayer> draft_moe_;  // the draft stages' routed chain (mtp)
   GlmMoeConfig draft_moe_cfg_;
   std::unique_ptr<Dsv41EngramLayer> engram_;
@@ -292,6 +296,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   float* inv_freq_compressed_ = nullptr;  // device [32]
   std::vector<int> cache_ord_;            // per layer (-1: window only)
   std::vector<int> tail_ord_;             // per layer (-1: none)
+  std::vector<int> idx_tail_ord_;         // per layer, the 0731 indexer compressor tail (-1: none)
   int tails_ = 0;
 
   // Activations [M rows].

@@ -588,11 +588,12 @@ void Dsv41LoaderFamily::build_globals(const Dsv41TextConfig& cfg, const Dsv41Loc
     const TensorInfo& hf = lookup("hc_head_fn");
     const float* hsrc = static_cast<const float*>(hf.data);
     uint16_t* hfdst = static_cast<uint16_t*>(bump.alloc(hf.nbytes() / 2));
+    uint16_t* hfhost = bump.host(hfdst);
     const size_t nfn = hf.nbytes() / 4;
     for (size_t i = 0; i < nfn; ++i) {
       float v;
       std::memcpy(&v, hsrc + i, 4);
-      hfdst[i] = float_to_bf16_bits(v);
+      hfhost[i] = float_to_bf16_bits(v);
     }
     source_bytes += hf.nbytes();
     verbatim_bytes += hf.nbytes();

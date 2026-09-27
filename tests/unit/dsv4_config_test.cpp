@@ -45,6 +45,7 @@ DGPP_TEST(dsv4_config_parses_the_release) {
   using dgpp::Dsv41Variant;
   const dgpp::Dsv41TextConfig c = parse(config_json());
   require(c.variant == Dsv41Variant::V4, "variant");
+  require(!c.single_pass_pre(), "the 0731 release collapses each site with its own pre (the GLM form)");
   require(c.hidden_size == 4096 && c.vocab_size == 129280 && c.num_hidden_layers == 43, "shape");
   // The draft depth is the mtp block count (three stages), not the file's
   // `num_nextn_predict_layers: 1`.
@@ -97,8 +98,15 @@ DGPP_TEST(dsv4_config_parses_the_release) {
   require(m.inter == 512 && m.n_experts == 256 && m.top_k == 6 && m.n_shared_experts == 1 && m.swiglu_limit == 10.0f,
           "moe_config");
   require(m.router_mode == dgpp::MoeRouterMode::SqrtSoftplusBias && m.routed_scaling_factor == 1.5f, "moe_config router");
+  // The 0731 hash-routed prefix: the first num_hash_layers backbone layers
+  // select their experts from the tid2eid table; the rest, and the draft,
+  // route from the scores.
+  require(c.moe_config(512, false, 0).hash_route && c.moe_config(512, false, 2).hash_route &&
+              !c.moe_config(512, false, 3).hash_route,
+          "moe_config hash_route on the prefix");
   const dgpp::GlmMoeConfig d = c.moe_config(512, true);
   require(d.n_experts == 256 && d.top_k == 6, "draft moe_config");
+  require(!m.hash_route && !d.hash_route, "moe_config hash_route off elsewhere");
 }
 
 DGPP_TEST(dsv4_config_refuses_unsupported_shapes) {
@@ -131,6 +139,13 @@ DGPP_TEST(dsv4_config_refuses_unsupported_shapes) {
   require(has(refusal(config_json("\"quant_method\": \"fp8\"", "\"quant_method\": \"modelopt\"")), "quant_method"), "method");
   require(has(refusal(config_json("\"scale_fmt\": \"ue8m0\"", "\"scale_fmt\": null")), "scale_fmt"), "scale fmt");
   require(has(refusal(config_json("\"expert_dtype\": \"fp4\"", "\"expert_dtype\": \"nvfp4\"")), "expert_dtype"), "nvfp4 cast");
+}
+
+DGPP_TEST(dsv4_config_decoder_invariant) {
+  const dgpp::Dsv41TextConfig c = parse(config_json());
+  // V4 has no ratio-1 decoder: the CSA2 compressors run at their 4/128
+  // ratios throughout, so the V4.1 CED-split rule must not fire here.
+  c.check_decoder_invariant();
 }
 
 DGPP_TEST(dsv4_architecture_registry_dispatches) {

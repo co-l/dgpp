@@ -4,6 +4,7 @@
 #include "kernels/scale_gemm.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -35,8 +36,16 @@ Csa2Config Dsv41Model::csa2_config(const Dsv41TextConfig& cfg, int tp_world) {
   c.window = cfg.sliding_window;
   c.ring_slots = std::max(kRingSlots, cfg.sliding_window + 32);
   c.block_tokens = kBlockTokens;
+  c.fp8_block = cfg.fp8_block_size;
   c.eps = cfg.rms_norm_eps;
   c.tp = tp_world;
+  if (cfg.variant == Dsv41Variant::V4) {
+    c.ring_format = LatentFormat::kBf16;
+    c.main_format = LatentFormat::kBf16;
+    c.index_bf16 = true;
+    c.q_renorm = true;
+    c.fold_scale = 1.0f / std::sqrt(8192.0f);
+  }
   Csa2Config::validate(c);
   return c;
 }
@@ -44,12 +53,35 @@ Csa2Config Dsv41Model::csa2_config(const Dsv41TextConfig& cfg, int tp_world) {
 Csa2PoolShape Dsv41Model::pool_shape(const Dsv41TextConfig& cfg, int max_requests, int64_t cache_tokens) {
   Csa2PoolShape s;
   s.layers = cfg.max_layer();
-  int tails = 0;
-  for (const int l : cfg.kv_source_layer_ids) {
-    s.cache_ratio.push_back(cfg.compress_ratio(l));
-    if (cfg.compress_ratio(l) == 2) ++tails;
+  if (cfg.variant == Dsv41Variant::V4) {
+    s.main_format = LatentFormat::kBf16;
+    s.ring_format = LatentFormat::kBf16;
+    s.index_bf16 = true;
   }
-  s.tail_ordinals = tails;
+  // The compressor tails, per kv source (fp32 counts; the reference's
+  // kv_state and score_state, 2*ratio slots of coff*head_dim each): ratio 2
+  // the pair's (kv, score) [2, 512]; ratio 4 the overlap window's 16 slots x
+  // 1024 (main) and 16 x 256 (the indexer compressor); ratio 128 the full
+  // window's 256 slots x 512.
+  for (const int l : cfg.kv_source_layer_ids) {
+    const int r = cfg.compress_ratio(l);
+    s.cache_ratio.push_back(r);
+    if (r == 2) {
+      s.tail_floats.push_back(2 * kCsa2Latent);
+      s.tail_inf.push_back(0);
+    }
+    if (r == 4) {
+      s.tail_floats.push_back(16 * 2 * kCsa2Latent);
+      s.tail_inf.push_back(8 * 2 * kCsa2Latent);
+      s.tail_floats.push_back(16 * 2 * kCsa2IndexDim);
+      s.tail_inf.push_back(8 * 2 * kCsa2IndexDim);
+    }
+    if (r == 128) {
+      s.tail_floats.push_back(256 * kCsa2Latent);
+      s.tail_inf.push_back(0);
+    }
+  }
+  s.tail_ordinals = static_cast<int>(s.tail_floats.size());
   s.max_requests = max_requests;
   s.token_slots = cache_tokens;
   s.block_tokens = kBlockTokens;
@@ -59,6 +91,7 @@ Csa2PoolShape Dsv41Model::pool_shape(const Dsv41TextConfig& cfg, int max_request
 
 int Dsv41Model::cache_ordinal(int layer) const { return cache_ord_[static_cast<size_t>(layer)]; }
 int Dsv41Model::tail_ordinal(int layer) const { return tail_ord_[static_cast<size_t>(layer)]; }
+int Dsv41Model::idx_tail_ordinal(int layer) const { return idx_tail_ord_[static_cast<size_t>(layer)]; }
 
 // ---------------------------------------------------------------------------
 // Construction.
@@ -147,6 +180,7 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
   gemm_.set_decode_rows(max_decode_rows_);
   const Dsv41LocalGeometry& geo = loader_.geometry();
   moe_cfg_ = cfg_.moe_config(static_cast<int>(geo.local_inter), /*draft=*/false);
+  if (cfg_.num_hash_layers > 0) moe_hash_cfg_ = cfg_.moe_config(static_cast<int>(geo.local_inter), /*draft=*/false, 0);
   if (mtp) draft_moe_cfg_ = cfg_.moe_config(static_cast<int>(geo.local_inter), /*draft=*/true);
   mhc_cfg_.hc_mult = cfg_.hc_mult;
   mhc_cfg_.hidden = H;
@@ -172,11 +206,21 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
   // The layer -> cache / tail ordinals.
   cache_ord_.assign(static_cast<size_t>(cfg_.max_layer()), -1);
   tail_ord_.assign(static_cast<size_t>(cfg_.max_layer()), -1);
+  idx_tail_ord_.assign(static_cast<size_t>(cfg_.max_layer()), -1);
   {
-    std::vector<int> tail_of_source(cfg_.kv_source_layer_ids.size(), -1);
+    // The tail ordinals mirror pool_shape's push order: a ratio-2 source owns
+    // one (kv, score) tail; a ratio-4 source the main 16-slot and the indexer
+    // 16-slot tails; a ratio-128 source the full 256-slot; a ratio-1 source
+    // (the V4.1 decoder) owns none.
+    std::vector<int> main_tail(cfg_.kv_source_layer_ids.size(), -1);
+    std::vector<int> idx_tail(cfg_.kv_source_layer_ids.size(), -1);
     int t = 0;
-    for (size_t i = 0; i < cfg_.kv_source_layer_ids.size(); ++i)
-      if (cfg_.compress_ratio(cfg_.kv_source_layer_ids[i]) == 2) tail_of_source[i] = t++;
+    for (size_t i = 0; i < cfg_.kv_source_layer_ids.size(); ++i) {
+      const int r = cfg_.compress_ratio(cfg_.kv_source_layer_ids[i]);
+      if (r == 2) main_tail[i] = t++;
+      else if (r == 4) { main_tail[i] = t++; idx_tail[i] = t++; }
+      else if (r == 128) main_tail[i] = t++;
+    }
     tails_ = t;
     for (int l = 0; l < cfg_.max_layer(); ++l) {
       const int kv = cfg_.kv_source_of(l);
@@ -184,7 +228,10 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
       for (size_t i = 0; i < cfg_.kv_source_layer_ids.size(); ++i)
         if (cfg_.kv_source_layer_ids[i] == kv) {
           cache_ord_[static_cast<size_t>(l)] = static_cast<int>(i);
-          if (cfg_.is_kv_source(l)) tail_ord_[static_cast<size_t>(l)] = tail_of_source[i];
+          if (cfg_.is_kv_source(l)) {
+            tail_ord_[static_cast<size_t>(l)] = main_tail[i];
+            idx_tail_ord_[static_cast<size_t>(l)] = idx_tail[i];
+          }
         }
     }
   }
@@ -246,10 +293,7 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
     seg_pre_ = dev_alloc<float>(win * 4);
     if (cfg_.sliding_window > max_tokens_)
       throw std::invalid_argument("Dsv41Model: max_tokens must cover the sliding window (the bounded prefill's segment)");
-    const int dec0 = cfg_.decoder_first_layer();
-    for (int l = dec0; l < cfg_.num_hidden_layers; ++l)
-      if (cfg_.compress_ratio(l) > 1 || (cfg_.is_kv_source(l) && l != dec0))
-        throw std::invalid_argument("Dsv41Model: the decoder (from the last kv source on) must read that source at ratio 1");
+    cfg_.check_decoder_invariant();
   }
   if (mtp) {
     const size_t W = static_cast<size_t>(targets_) * H;
@@ -445,10 +489,16 @@ Csa2LayerWeights Dsv41Model::csa2_view(const Dsv41LayerResident& r, int layer) c
   w.comp_wkv = a.comp_wkv;
   w.comp_wgate = a.comp_wgate;
   w.comp_norm = a.comp_norm;
+  w.comp_ape = a.comp_ape;
+  w.idx_comp_wkv = a.idx_comp_wkv;
+  w.idx_comp_wgate = a.idx_comp_wgate;
+  w.idx_comp_norm = a.idx_comp_norm;
+  w.idx_comp_ape = a.idx_comp_ape;
   w.ratio = cfg_.compress_ratio(layer);
   w.inv_freq = w.ratio > 0 ? inv_freq_compressed_ : inv_freq_window_;
   w.cache_ord = cache_ordinal(layer);
   w.tail_ord = tail_ordinal(layer);
+  w.idx_tail_ord = idx_tail_ordinal(layer);
   w.kv_source = cfg_.is_kv_source(layer);
   w.index_source = cfg_.is_index_source(layer);
   w.candidate_source = layer == cfg_.candidate_source_layer_id;
@@ -460,9 +510,14 @@ GlmMoeWeights Dsv41Model::moe_view(const Dsv41MoeResident& m) {
   GlmMoeWeights w;
   w.router_gate = m.router;
   w.router_bias = m.router_bias;
+  w.tid2eid = m.tid2eid;
   for (int i = 0; i < 3; ++i) w.shared[i] = m.shared[i];
   w.experts_fp4 = m.experts.data();
   return w;
+}
+
+GlmMoeLayer& Dsv41Model::moe_for(int layer) {
+  return cfg_.is_hash_layer(layer) ? *moe_hash_ : *moe_;
 }
 
 Dsv41EngramLayerWeights Dsv41Model::engram_view(const Dsv41EngramResident& e) const {
@@ -489,7 +544,14 @@ void Dsv41Model::build_layer_objects(const Dsv41LayerResident& r) {
     }
     return;
   }
-  if (!moe_) {
+  if (cfg_.is_hash_layer(r.layer)) {
+    if (!moe_hash_) {
+      const int slots = loader_.residency() == Dsv41Residency::Resident ? cfg_.num_hidden_layers : 0;
+      moe_hash_ = std::make_unique<GlmMoeLayer>(moe_view(r.moe), moe_hash_cfg_, max_tokens_, max_decode_rows_, slots);
+    } else {
+      moe_hash_->rebind(moe_view(r.moe));
+    }
+  } else if (!moe_) {
     const int slots = loader_.residency() == Dsv41Residency::Resident ? cfg_.num_hidden_layers : 0;
     moe_ = std::make_unique<GlmMoeLayer>(moe_view(r.moe), moe_cfg_, max_tokens_, max_decode_rows_, slots);
   } else {
@@ -576,7 +638,7 @@ void Dsv41Model::graph_prepare() {
     for (int rows = 1; rows <= max_decode_rows_; ++rows)
       if (!csa2_->prepare(rows)) throw std::runtime_error("session_graph_prepare: CSA2 GEMM plans unavailable");
     if (cfg_.is_draft(layer)) draft_moe_->prepare_graph_table(cfg_.draft_stage(layer), stream_);
-    else moe_->prepare_graph_table(layer, stream_);
+    else moe_for(layer).prepare_graph_table(layer, stream_);
   }
 }
 
@@ -784,7 +846,9 @@ void Dsv41Model::gather_embedding(const int64_t* tokens, int T, bool capture) {
 // sublayer's one-rounding norm into x_.
 void Dsv41Model::mhc_site(const uint16_t* streams, const GlmMhcWeights& w, const uint16_t* ln, int T, bool decode) {
   MhcSinglePass sp;
-  sp.pre_in = pre_cur_;
+  // The 0731 release (and the GLM form) collapses with the site's own pre:
+  // the single-pass pre hand-off is the V4.1 release's formulation.
+  sp.pre_in = cfg_.single_pass_pre() ? pre_cur_ : nullptr;
   sp.pre_out = pre_nxt_;
   sp.post_f32 = post_f32_;
   sp.comb_f32 = comb_f32_;
@@ -874,10 +938,10 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
   if (draft)
     draft_moe_->enqueue_decode(x_, ffn_out, T, nullptr, stream_, rows.moe_table_slot);
   else if (rows.decode)
-    moe_->enqueue_decode(x_, ffn_out, T, nullptr, stream_, rows.moe_table_slot,
-                         rows.tokens);
+    moe_for(layer).enqueue_decode(x_, ffn_out, T, nullptr, stream_, rows.moe_table_slot,
+                                  rows.tokens);
   else
-    moe_->enqueue_prefill(x_, ffn_out, T, rows.trace, stream_, rows.tokens);
+    moe_for(layer).enqueue_prefill(x_, ffn_out, T, rows.trace, stream_, rows.tokens);
   fold(ffn_out, T, H, rows.capture);  // block boundary 2: the sliced experts
   if (debug_capture_) cap.ffn_out = grab(ffn_out, static_cast<size_t>(T) * H);
   stream_update(ffn_out, T);

@@ -177,6 +177,14 @@ struct Dsv41TextConfig {
   // (layer 20: its cache is the decoder's global KV, a projection of the
   // encoder output); every layer from it on reads that cache at ratio 1.
   int decoder_first_layer() const { return kv_source_layer_ids.empty() ? num_hidden_layers : kv_source_layer_ids.back(); }
+  // The model-side backstop on the decoder structure: the V4.1 CED split
+  // reads the last kv source's cache at ratio 1 from that source on; V4 has
+  // no ratio-1 decoder — its CSA2 compressors run at their ratios throughout.
+  void check_decoder_invariant() const;
+  // The V4.1 release collapses each site with the previous site's pre
+  // coefficients (the single-pass form); the 0731 release (and the GLM
+  // form) collapses with the site's own pre.
+  bool single_pass_pre() const;
   int num_index_sources() const { return static_cast<int>(index_source_layer_ids.size()); }
   bool has_engram(int l) const;
   int engram_index(int l) const;  // ordinal among the Engram layers, -1 otherwise
