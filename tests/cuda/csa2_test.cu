@@ -1596,4 +1596,93 @@ DGPP_TEST(csa2_sequential_topk_lists_every_visible_entry) {
   require(got_topk == want_topk, "sequential topk");
 }
 
+DGPP_TEST(csa2_0731_bf16_decode_scores_select_the_topk_beyond_the_select_bound) {
+  // 64 heads (0731), the 512 select bound, and a 3416-entry pool: the rows
+  // past the bound run the warp-score loop, and every warp's per-iteration
+  // scratch must stay inside its own quarter of the shared rows buffer.
+  // 0/1 bf16 data keeps every logit integral, so the host top-k is exact.
+  const int heads = 64, dim = 128, select_k = 512, epb = 128;
+  const int n = 3416, blocks = 27, slots = blocks * epb;
+  const std::vector<int64_t> ps{511, 512, 513, 3415, 3415, 3415, 3415, 3415};
+  const int rows = int(ps.size());
+  std::vector<int32_t> table(blocks);
+  for (int b = 0; b < blocks; ++b) table[size_t(b)] = (b * 7 + 3) % blocks;
+  std::vector<int> slot_of(n);
+  for (int e = 0; e < n; ++e) slot_of[size_t(e)] = table[size_t(e / epb)] * epb + e % epb;
+  std::vector<uint16_t> k(size_t(slots) * dim), q(size_t(rows) * heads * dim);
+  std::vector<uint8_t> kb(size_t(slots) * dim), qb(size_t(rows) * heads * dim);
+  std::vector<float> w(size_t(rows) * heads);
+  uint64_t s = 0x9E3779B97F4A7C15ull;
+  auto bit = [&]() {
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    return uint8_t(s & 1);
+  };
+  for (size_t i = 0; i < kb.size(); ++i) {
+    kb[i] = bit();
+    k[i] = float_to_bf16_bits(float(kb[i]));
+  }
+  for (size_t i = 0; i < qb.size(); ++i) {
+    qb[i] = bit();
+    q[i] = float_to_bf16_bits(float(qb[i]));
+  }
+  for (auto& v : w) v = float(bit());
+  std::vector<int64_t> logits(size_t(rows) * n, 0);
+  for (int r = 0; r < rows; ++r)
+    for (int e = 0; e < n; ++e)
+      for (int h = 0; h < heads; ++h) {
+        if (w[size_t(r) * heads + h] == 0.f) continue;
+        int64_t d = 0;
+        for (int j = 0; j < dim; ++j)
+          d += int64_t(qb[(size_t(r) * heads + h) * dim + size_t(j)] &
+                       kb[size_t(slot_of[size_t(e)]) * dim + size_t(j)]);
+        logits[size_t(r) * n + size_t(e)] += d;
+      }
+  std::vector<int32_t> want(size_t(rows) * select_k, -1), want_cnt(rows, 0);
+  for (int r = 0; r < rows; ++r) {
+    const int visible = int(ps[size_t(r)] + 1);
+    if (visible <= select_k) {
+      want_cnt[size_t(r)] = visible;
+      for (int i = 0; i < visible; ++i) want[size_t(r) * select_k + i] = i;
+      continue;
+    }
+    struct K {
+      int64_t logit;
+      int32_t id;
+    };
+    std::vector<K> v(visible);
+    for (int e = 0; e < visible; ++e) v[size_t(e)] = {logits[size_t(r) * n + size_t(e)], e};
+    std::partial_sort(v.begin(), v.begin() + select_k, v.end(),
+                      [](const K& a, const K& b) {
+                        return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
+                      });
+    std::vector<int32_t> ids(select_k);
+    for (int i = 0; i < select_k; ++i) ids[size_t(i)] = v[size_t(i)].id;
+    std::sort(ids.begin(), ids.end());
+    want_cnt[size_t(r)] = select_k;
+    for (int i = 0; i < select_k; ++i) want[size_t(r) * select_k + i] = ids[size_t(i)];
+  }
+  DevBuf dk = upload(k), dq = upload(q), dwf = upload(w), dt = upload(table), dpos = upload(ps),
+      dri = upload(std::vector<int32_t>(size_t(rows), 0)),
+      work(dgpp::csa2_select_workspace_bytes(rows, n)), top(size_t(rows) * select_k * 4),
+      cnt(rows * 4);
+  cudaStream_t stream;
+  DGPP_CUDA_OK(cudaStreamCreate(&stream));
+  for (int pass = 0; pass < 3; ++pass) {
+    dgpp::csa2_select_bf16_decode(dq.p, static_cast<const float*>(dwf.p),
+                                  static_cast<const int32_t*>(dri.p),
+                                  static_cast<const int64_t*>(dpos.p), rows,
+                                  static_cast<const int32_t*>(dt.p), blocks, dk.p, epb, heads,
+                                  select_k, static_cast<uint64_t*>(work.p), n,
+                                  static_cast<int32_t*>(top.p), static_cast<int32_t*>(cnt.p), stream);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    const auto got = download<int32_t>(top, size_t(rows) * select_k),
+        gotc = download<int32_t>(cnt, rows);
+    require(gotc == want_cnt, "bf16 decode select counts/pass " + std::to_string(pass));
+    require(got == want, "bf16 decode select IDs/pass " + std::to_string(pass));
+  }
+  DGPP_CUDA_OK(cudaStreamDestroy(stream));
+}
+
 int main() { return dgpp::test::run_all(); }

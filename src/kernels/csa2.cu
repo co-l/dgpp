@@ -1043,7 +1043,7 @@ __global__ void csa_decode_scores_bf16_kernel(
     int entries_per_block, int select_k, uint64_t* keys, int64_t keys_stride) {
   __shared__ uint4 qb[16 * 64];
   __shared__ float w[64];
-  __shared__ uint2 krows[8 * 32];
+  __shared__ uint2 krows[8 * 4 * 32];
   const int r = blockIdx.y;
   const int64_t p = pos_sel[r];
   if (p < 0) return;
@@ -1062,7 +1062,7 @@ __global__ void csa_decode_scores_bf16_kernel(
   }
   __syncthreads();
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  uint2* staged = krows + warp * 32;
+  uint2* staged = krows + warp * 4 * 32;
   const int64_t stripe = (n + gridDim.x - 1) / gridDim.x;
   const int64_t lo = min(n, int64_t(blockIdx.x) * stripe), hi = min(n, lo + stripe);
   const int64_t sub = (hi - lo + 7) / 8;
