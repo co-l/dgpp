@@ -225,11 +225,16 @@ class Csa2Layer {
     const int64_t* pos = nullptr;
   };
   void require_shape(const SelShape& have, const SelShape& want, const char* what) const;
+  // The decode rows the multi-problem dense form groups (1..32, the mma's
+  // decode rows; wider rows keep the per-site launches).
+  bool dense_mma_grouped(int tokens) const { return cfg_.dense_mma && tokens >= 1 && tokens <= 32; }
 
   // The projections and the window row of `tokens` rows at `pos` (device).
   void project_q_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream);
-  void project_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream);
-  void indexer_query(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream);
+  void project_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream,
+                  bool gemm_done = false);
+  void indexer_query(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream,
+                     bool idx_q_done = false);
   // The index keys and the main rows of `n` entries (entries_ / ent_pos_
   // set; latent_ holds the normed, unrotated latents).
   void publish_entries(Csa2StatePool& pool, const int32_t* req_ids, int n, cudaStream_t stream);

@@ -8,6 +8,7 @@
 
 #include "common/cuda_check.hpp"
 #include "kernels/dsa.hpp"
+#include "kernels/mma_gemv.hpp"
 #include "kernels/scale_gemm.hpp"
 
 namespace dgpp {
@@ -294,11 +295,13 @@ void Csa2Layer::validate_pool(const Csa2StatePool& pool) const {
 
 // ---- the projections -------------------------------------------------------------------------
 
-void Csa2Layer::project_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream) {
+void Csa2Layer::project_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream,
+                           bool gemm_done) {
   const uint16_t* h = static_cast<const uint16_t*>(hidden_in);
-  launch_scale_gemm_grid_bf16(h, size_t(cfg_.hidden), w_.wkv.payload, w_.wkv.scales, kv_, tokens, kCsa2Latent,
-                              cfg_.hidden, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(), cfg_.dense_mma,
-                              gemm_ws_, gemm_ws_bytes_);
+  if (!gemm_done)
+    launch_scale_gemm_grid_bf16(h, size_t(cfg_.hidden), w_.wkv.payload, w_.wkv.scales, kv_, tokens, kCsa2Latent,
+                                cfg_.hidden, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(), cfg_.dense_mma,
+                                gemm_ws_, gemm_ws_bytes_);
   csa2_rmsnorm_bf16(kv_, kCsa2Latent, w_.kv_norm, kv_, kCsa2Latent, tokens, kCsa2Latent, cfg_.eps, stream);
   csa2_rope_apply(kv_ + (kCsa2Latent - kCsa2Rope), kCsa2Latent, kCsa2Latent, 1, kCsa2Rope, pos, w_.inv_freq, false,
                   tokens, stream);
@@ -308,24 +311,48 @@ void Csa2Layer::project_kv(const void* hidden_in, int tokens, const int64_t* pos
 void Csa2Layer::project_q_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream) {
   const uint16_t* h = static_cast<const uint16_t*>(hidden_in);
   const int lh = cfg_.local_heads();
-  launch_scale_gemm_grid_bf16(h, size_t(cfg_.hidden), w_.wq_a.payload, w_.wq_a.scales, qr_, tokens, cfg_.q_lora,
-                              cfg_.hidden, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(), cfg_.dense_mma,
-                              gemm_ws_, gemm_ws_bytes_);
+  // The decode's grouped projections (2026-09-28): the hidden's wq_a + wkv in
+  // one launch and the q_lora's wq_b + index q in the next — each site's
+  // chain is the single launch's (the width the rows' chains do not depend
+  // on, the split per site), the decode's tolerance class unchanged.
+  const bool grouped = dense_mma_grouped(tokens);
+  if (grouped) {
+    MmaGemvMultiProblem qa[2] = {{h, size_t(cfg_.hidden), w_.wq_a.payload, w_.wq_a.scales, qr_, cfg_.q_lora, 0},
+                                 {h, size_t(cfg_.hidden), w_.wkv.payload, w_.wkv.scales, kv_, kCsa2Latent, 0}};
+    launch_mma_gemv_multi_fp8_bf16(qa, 2, tokens, cfg_.hidden, cfg_.scale_shift(), cfg_.scale_shift(), stream,
+                                   gemm_ws_, gemm_ws_bytes_);
+    project_kv(hidden_in, tokens, pos, stream, true);
+  } else {
+    launch_scale_gemm_grid_bf16(h, size_t(cfg_.hidden), w_.wq_a.payload, w_.wq_a.scales, qr_, tokens, cfg_.q_lora,
+                                cfg_.hidden, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(), cfg_.dense_mma,
+                                gemm_ws_, gemm_ws_bytes_);
+    project_kv(hidden_in, tokens, pos, stream);
+  }
   csa2_rmsnorm_bf16(qr_, cfg_.q_lora, w_.q_norm, qr_, cfg_.q_lora, tokens, cfg_.q_lora, cfg_.eps, stream);
-  project_kv(hidden_in, tokens, pos, stream);
-  launch_scale_gemm_grid_bf16(qr_, size_t(cfg_.q_lora), w_.wq_b.payload, w_.wq_b.scales, q_, tokens,
-                              lh * kCsa2Latent, cfg_.q_lora, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(),
-                              cfg_.dense_mma, gemm_ws_, gemm_ws_bytes_);
+  if (grouped && w_.index_source) {
+    MmaGemvMultiProblem qb[2] = {{qr_, size_t(cfg_.q_lora), w_.wq_b.payload, w_.wq_b.scales, q_,
+                                  lh * kCsa2Latent, 0},
+                                 {qr_, size_t(cfg_.q_lora), w_.idx_wq_b.payload, w_.idx_wq_b.scales, idx_q_,
+                                  cfg_.index_heads * kCsa2IndexDim, 0}};
+    launch_mma_gemv_multi_fp8_bf16(qb, 2, tokens, cfg_.q_lora, cfg_.scale_shift(), cfg_.scale_shift(), stream,
+                                   gemm_ws_, gemm_ws_bytes_);
+  } else {
+    launch_scale_gemm_grid_bf16(qr_, size_t(cfg_.q_lora), w_.wq_b.payload, w_.wq_b.scales, q_, tokens,
+                                lh * kCsa2Latent, cfg_.q_lora, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(),
+                                cfg_.dense_mma, gemm_ws_, gemm_ws_bytes_);
+  }
   if (cfg_.q_renorm) csa2_q_renorm_bf16(q_, tokens, lh, cfg_.eps, stream);
   csa2_rope_apply(q_ + (kCsa2Latent - kCsa2Rope), int64_t(lh) * kCsa2Latent, kCsa2Latent, lh, kCsa2Rope, pos,
                   w_.inv_freq, false, tokens, stream);
 }
 
-void Csa2Layer::indexer_query(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream) {
+void Csa2Layer::indexer_query(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream,
+                              bool idx_q_done) {
   const int heads = cfg_.index_heads;
-  launch_scale_gemm_grid_bf16(qr_, size_t(cfg_.q_lora), w_.idx_wq_b.payload, w_.idx_wq_b.scales, idx_q_, tokens,
-                              heads * kCsa2IndexDim, cfg_.q_lora, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(),
-                              cfg_.dense_mma, gemm_ws_, gemm_ws_bytes_);
+  if (!idx_q_done)
+    launch_scale_gemm_grid_bf16(qr_, size_t(cfg_.q_lora), w_.idx_wq_b.payload, w_.idx_wq_b.scales, idx_q_, tokens,
+                                heads * kCsa2IndexDim, cfg_.q_lora, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(),
+                                cfg_.dense_mma, gemm_ws_, gemm_ws_bytes_);
   csa2_rope_apply(idx_q_ + (kCsa2IndexDim - kCsa2Rope), int64_t(heads) * kCsa2IndexDim, kCsa2IndexDim, heads,
                   kCsa2Rope, pos, w_.inv_freq, false, tokens, stream);
   if (cfg_.index_bf16) {
@@ -410,11 +437,28 @@ void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream) {
   const int lh = cfg_.local_heads(), lg = cfg_.local_groups(), hpg = cfg_.heads_per_group();
   const int K = hpg * kCsa2Latent;
   // wo_a is block-diagonal over the groups: group g projects its own heads.
-  for (int g = 0; g < lg; ++g) {
-    const size_t row_off = size_t(g) * cfg_.o_lora;
-    launch_scale_gemm_grid_bf16(o_ + size_t(g) * K, size_t(lh) * kCsa2Latent, w_.wo_a.payload + row_off * K,
-                                w_.wo_a.scales + (row_off / cfg_.fp8_block) * (size_t(K) / cfg_.fp8_block), oa_ + row_off, tokens, cfg_.o_lora, K,
-                                stream, size_t(lg) * cfg_.o_lora, cfg_.scale_shift(), cfg_.scale_shift(), cfg_.dense_mma);
+  // At the decode rows the lg groups share the mma's multi-problem launch
+  // (same act stride and k per group, the per-group chain the single
+  // launch's).
+  if (dense_mma_grouped(tokens) && lg == kMmaGemvMaxProblems) {
+    MmaGemvMultiProblem probs[kMmaGemvMaxProblems];
+    for (int g = 0; g < lg; ++g) {
+      const size_t row_off = size_t(g) * cfg_.o_lora;
+      probs[g] = {o_ + size_t(g) * K, size_t(lh) * kCsa2Latent, w_.wo_a.payload + row_off * K,
+                  w_.wo_a.scales + (row_off / cfg_.fp8_block) * (size_t(K) / cfg_.fp8_block), oa_ + row_off,
+                  cfg_.o_lora, size_t(lg) * cfg_.o_lora};
+    }
+    launch_mma_gemv_multi_fp8_bf16(probs, lg, tokens, K, cfg_.scale_shift(), cfg_.scale_shift(), stream, gemm_ws_,
+                                   gemm_ws_bytes_);
+  } else {
+    for (int g = 0; g < lg; ++g) {
+      const size_t row_off = size_t(g) * cfg_.o_lora;
+      launch_scale_gemm_grid_bf16(o_ + size_t(g) * K, size_t(lh) * kCsa2Latent, w_.wo_a.payload + row_off * K,
+                                  w_.wo_a.scales + (row_off / cfg_.fp8_block) * (size_t(K) / cfg_.fp8_block),
+                                  oa_ + row_off, tokens, cfg_.o_lora, K,
+                                  stream, size_t(lg) * cfg_.o_lora, cfg_.scale_shift(), cfg_.scale_shift(),
+                                  cfg_.dense_mma);
+    }
   }
   launch_scale_gemm_grid_bf16(oa_, size_t(lg) * cfg_.o_lora, w_.wo_b.payload, w_.wo_b.scales,
                               static_cast<uint16_t*>(out), tokens, cfg_.hidden, lg * cfg_.o_lora, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(), cfg_.dense_mma);
@@ -495,7 +539,7 @@ void Csa2Layer::enqueue_decode(const void* hidden_in, Csa2StatePool& pool, const
     }
     csa2_entry_positions(pos, pos_sel_, tokens, w_.ratio, stream);
     if (w_.index_source) {
-      indexer_query(hidden_in, tokens, pos, stream);
+      indexer_query(hidden_in, tokens, pos, stream, dense_mma_grouped(tokens));
       const int epb = pool.entries_per_block(ord);
       if (cfg_.index_bf16) {
         csa2_select_bf16_decode(idx_q_, w_folded_, req_ids, pos_sel_, tokens, pool.block_tables(),
@@ -699,7 +743,7 @@ void Csa2Layer::enqueue_prefill(const void* hidden_in, Csa2StatePool& pool, int 
     if (w_.kv_source && publish) publish_rows(hidden_in, pool, req, pos0, tokens, stream);
     csa2_entry_positions(pos_, pos_sel_, tokens, w_.ratio, stream);
     if (w_.index_source) {
-      indexer_query(hidden_in, tokens, pos_, stream);
+      indexer_query(hidden_in, tokens, pos_, stream, dense_mma_grouped(tokens));
       // The visible entries of the chunk's last row, gathered contiguous
       // for the dot GEMM (the padded tail zeroed once for the sanitizer).
       const int64_t n_gather = (pos0 + tokens) / w_.ratio;

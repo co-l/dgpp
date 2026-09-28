@@ -16,6 +16,7 @@ namespace {
 
 constexpr int kWideWarps = 8;          // the wide forms' block: 8 warps x 8 weight rows
 constexpr int kRowsPerWarp = 8;        // the mma's n
+constexpr int kMaxSplit = kMmaGemvMaxSplit;   // the split-K's block cap
 constexpr int kBatch = 8;              // 16-byte vectors in flight per lane
 // A lane's run: kVecs consecutive 16-byte vectors of its weight row, so a
 // quad's loads cover 4 x kVecs x 16 B contiguous of a row per group: fp8
@@ -114,6 +115,27 @@ __device__ __forceinline__ void cp_async_16(void* smem_dst, const void* gmem_src
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 template <int kPending>
 __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(kPending)); }
+// The A windows' 16-byte stores and loads as explicit shared-space
+// instructions (2026-09-28): the double-buffer pointers sA[2] index at
+// runtime, the array spills to local memory, and ptxas then loses the
+// shared provenance of sA_raw + offset (the wring's __cvta'd addresses
+// keep it: the ring loads are LDS, the window ones come out as global
+// LD.E / ST.E on the smem address — a bar.sync does not order the global
+// path, so the mma read zero windows on GB10 at kTiles = 2, m = 32, the
+// first shape that spills the pointer).
+__device__ __forceinline__ void st_shared_v4(uint16_t* p, const uint4& x) {
+  const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(p));
+  asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};\n"
+               ::"r"(d), "r"(x.x), "r"(x.y), "r"(x.z), "r"(x.w));
+}
+__device__ __forceinline__ uint4 ld_shared_v4(const uint16_t* p) {
+  const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(p));
+  uint4 x;
+  asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(x.x), "=r"(x.y), "=r"(x.z), "=r"(x.w)
+               : "r"(d));
+  return x;
+}
 
 // Stage rows [0, min(m, tiles*16)) x [base, base + W::kK) of act into sA
 // (columns past k read as zero); the whole block participates, the caller
@@ -131,7 +153,7 @@ __device__ __forceinline__ void stage_a(const uint16_t* __restrict__ act, size_t
     uint4 x = make_uint4(0u, 0u, 0u, 0u);
     if (col + 8 <= k)
       x = *reinterpret_cast<const uint4*>(act + static_cast<size_t>(row) * act_stride + col);
-    *reinterpret_cast<uint4*>(sA + static_cast<size_t>(row) * W::kStride + swz<kLaneUnits>(u) * 8) = x;
+    st_shared_v4(sA + static_cast<size_t>(row) * W::kStride + swz<kLaneUnits>(u) * 8, x);
   }
 }
 template <int kTiles, bool kFp8, int kLaneUnits, int kW>
@@ -141,8 +163,8 @@ __device__ __forceinline__ void zero_rows(int m, uint16_t* __restrict__ sA) {
   const int rows = m < W::kRows ? m : W::kRows;
   for (int i = rows * kUnits + static_cast<int>(threadIdx.x); i < W::kRows * kUnits; i += kW * 32) {
     const int row = i / kUnits, u = i - row * kUnits;
-    *reinterpret_cast<uint4*>(sA + static_cast<size_t>(row) * W::kStride + swz<kLaneUnits>(u) * 8) =
-        make_uint4(0u, 0u, 0u, 0u);
+    st_shared_v4(sA + static_cast<size_t>(row) * W::kStride + swz<kLaneUnits>(u) * 8,
+                 make_uint4(0u, 0u, 0u, 0u));
   }
 }
 
@@ -190,17 +212,19 @@ __device__ __forceinline__ void chunk_to_bf16x8(const uint4& c, float s, uint32_
 // forms narrow to 4 / 2 / 1 on a small n so the grid still fills the SMs
 // (a [576 x 6144] site is 9 wide blocks: 46 us against the GEMV's 16 at one
 // row, 2026-09-14); the rows' chains do not depend on the width.
+// The block body (the single-problem kernel and the multi-problem form
+// share it): n0 the block's first weight row, win0 / win1 its window range,
+// part the fp32 partials (nullptr: the output stored directly).
 template <int kTiles, bool kFp8, int kW, typename OutT>
-__global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __restrict__ act,
-                                                            size_t act_stride,
-                                                            const void* __restrict__ wv,
-                                                            const float* __restrict__ scales,
-                                                            OutT* __restrict__ out, int m, int n,
-                                                            int k, size_t out_stride, int rs,
-                                                            int cs, float* __restrict__ part) {
+__device__ __forceinline__ void mma_gemv_block_body(const uint16_t* __restrict__ act,
+                                                    size_t act_stride,
+                                                    const void* __restrict__ wv,
+                                                    const float* __restrict__ scales,
+                                                    OutT* __restrict__ out, int m, int n, int k,
+                                                    size_t out_stride, int rs, int cs, int n0,
+                                                    int win0, int win1, float* __restrict__ part) {
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int r = lane / 4, t = lane % 4;
-  const int n0 = (blockIdx.x * kW + warp) * kRowsPerWarp;  // this warp's first weight row
   const int row = n0 + r;                                        // this lane's weight row
   const bool row_live = row < n;
   const int scale_cols = (k + (1 << cs) - 1) >> cs;
@@ -223,14 +247,6 @@ __global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __
   // The warp's weight ring (past the A windows): stage s at s * kWarpBytes, row b's slice at b * kRowBytes.
   uint8_t* wring = reinterpret_cast<uint8_t*>(sA_raw) + W::kSmemBytes +
                    static_cast<size_t>(warp) * L::kStages * L::kWarpBytes;
-  const int nwin = (k + W::kK - 1) / W::kK;
-  // Split-K (the decode forms at a small n, grid.y > 1): this block folds
-  // windows [win0, win1) of the k range and stores fp32 partials to
-  // part[blockIdx.y][m][n]; mma_gemv_split_reduce_kernel sums the splits in
-  // split order. grid.y == 1: the whole range, the output stored directly.
-  const int wper = (nwin + static_cast<int>(gridDim.y) - 1) / static_cast<int>(gridDim.y);
-  const int win0 = static_cast<int>(blockIdx.y) * wper;
-  const int win1 = nwin < win0 + wper ? nwin : win0 + wper;
   // Window `win` of the warp's eight rows into its ring stage, as one
   // asynchronous group (an empty group past the last window keeps the
   // group accounting uniform). Instruction i covers rows i*kRowsPerInstr..
@@ -333,8 +349,8 @@ __global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __
 #pragma unroll
           for (int j = 0; j < kUnitsPerVec; ++j) {
             const int u = swz<F::kLaneUnits>(u0 + v * kUnitsPerVec + j) * 8;
-            const uint4 a0 = *reinterpret_cast<const uint4*>(row0 + u);
-            const uint4 a8 = *reinterpret_cast<const uint4*>(row8 + u);
+            const uint4 a0 = ld_shared_v4(row0 + u);
+            const uint4 a8 = ld_shared_v4(row8 + u);
             mma_bf16(c[tt], a0.x, a8.x, a0.y, a8.y, w[4 * j], w[4 * j + 1]);
             mma_bf16(c[tt], a0.z, a8.z, a0.w, a8.w, w[4 * j + 2], w[4 * j + 3]);
           }
@@ -376,6 +392,214 @@ __global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __
   }
 }
 
+template <int kTiles, bool kFp8, int kW, typename OutT>
+__global__ __launch_bounds__(kW * 32, 2) void mma_gemv_kernel(const uint16_t* __restrict__ act,
+                                                            size_t act_stride,
+                                                            const void* __restrict__ wv,
+                                                            const float* __restrict__ scales,
+                                                            OutT* __restrict__ out, int m, int n,
+                                                            int k, size_t out_stride, int rs,
+                                                            int cs, float* __restrict__ part) {
+  const int warp = threadIdx.x / 32;
+  const int n0 = (blockIdx.x * kW + warp) * kRowsPerWarp;  // this warp's first weight row
+  using W = Win<kTiles, kFp8>;
+  const int nwin = (k + W::kK - 1) / W::kK;
+  // Split-K (the decode forms at a small n, grid.y > 1): this block folds
+  // windows [win0, win1) of the k range and stores fp32 partials to
+  // part[blockIdx.y][m][n]; mma_gemv_split_reduce_kernel sums the splits in
+  // split order. grid.y == 1: the whole range, the output stored directly.
+  const int wper = (nwin + static_cast<int>(gridDim.y) - 1) / static_cast<int>(gridDim.y);
+  const int win0 = static_cast<int>(blockIdx.y) * wper;
+  const int win1 = nwin < win0 + wper ? nwin : win0 + wper;
+  mma_gemv_block_body<kTiles, kFp8, kW, OutT>(
+      act, act_stride, wv, scales, out, m, n, k, out_stride, rs, cs, n0, win0, win1, part);
+}
+// The multi-problem decode form (2026-09-28): up to kMmaGemvMaxProblems
+// problems, one launch. Block `bid` finds its problem by the block prefix
+// (field-wise selects, as scale_gemv_multi_kernel); its local index splits
+// into the problem's block (weight rows) and split (k window range). Each
+// problem runs the body with exactly the parameters the single launch
+// would choose for its (n, k) — same width, same split count, same window
+// partition — so a problem's chain is the single launch's (the decode
+// forms' tolerance contract; the only freedom the multi form takes is the
+// shared width, from the max n).
+struct MmaGemvMultiParams {
+  struct Prob {
+    const void* wv;
+    const float* scales;
+    const uint16_t* act;
+    size_t act_stride;
+    float* out;  // f32 or bf16 per the form
+    int n;
+    size_t out_stride;
+    float* part;  // the problem's partials region (splits > 1)
+    int blocks;
+    int wper;
+    int splits;
+  } p[kMmaGemvMaxProblems];
+  int block_end[kMmaGemvMaxProblems];  // exclusive block-count prefix
+  int n_prob;
+};
+
+template <int kTiles, bool kFp8, int kW, typename OutT>
+__global__ __launch_bounds__(kW * 32, 2) void mma_gemv_multi_kernel(MmaGemvMultiParams mp, int m,
+                                                                    int k, int rs, int cs) {
+  const int bid = static_cast<int>(blockIdx.x);
+  int which = 0;
+#pragma unroll
+  for (int i = 1; i < kMmaGemvMaxProblems; ++i) which += (bid >= mp.block_end[i - 1]) ? 1 : 0;
+  which = which < mp.n_prob ? which : mp.n_prob - 1;
+  const auto& q = mp.p[which];
+  const int li = bid - (which == 0 ? 0 : mp.block_end[which - 1]);
+  const int b = li % q.blocks;
+  const int s = li / q.blocks;
+  const int warp = threadIdx.x / 32;
+  const int n0 = (b * kW + warp) * kRowsPerWarp;
+  const int nwin = (k + Win<kTiles, kFp8>::kK - 1) / Win<kTiles, kFp8>::kK;
+  const int win0 = s * q.wper;
+  const int win1 = nwin < win0 + q.wper ? nwin : win0 + q.wper;
+  mma_gemv_block_body<kTiles, kFp8, kW, OutT>(
+      q.act, q.act_stride, q.wv, q.scales, reinterpret_cast<OutT*>(q.out), m, q.n, k, q.out_stride,
+      rs, cs, n0, win0, win1, q.splits > 1 ? q.part + static_cast<size_t>(s) * m * q.n : nullptr);
+}
+
+// The multi-problem split reduce: the element prefix over the problems'
+// splits > 1, in problem order, split order within (the single form's
+// deterministic order).
+template <typename OutT>
+__global__ void mma_gemv_multi_reduce_kernel(MmaGemvMultiParams mp, int m) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = 0;
+  int which = -1;
+  for (int p = 0; p < mp.n_prob; ++p) {
+    const int e = mp.p[p].splits > 1 ? m * mp.p[p].n : 0;
+    if (which < 0 && i < total + e) which = p;
+    total += e;
+    if (which >= 0) break;
+  }
+  if (which < 0) return;
+  int start = 0;
+  for (int p = 0; p < which; ++p) start += mp.p[p].splits > 1 ? m * mp.p[p].n : 0;
+  const auto& q = mp.p[which];
+  const int li = i - start;
+  const int mrow = li / q.n, col = li % q.n;
+  float acc = 0.f;
+#pragma unroll 1
+  for (int s = 0; s < q.splits; ++s) acc += q.part[(static_cast<size_t>(s) * m + mrow) * q.n + col];
+  fp8_gemv::store_dot(reinterpret_cast<OutT*>(q.out) + static_cast<size_t>(mrow) * q.out_stride + col,
+                      acc);
+}
+
+// The multi launcher: the shared width from the max n (the single form's
+// rule), each problem's split from its own (n, k) on its own workspace
+// region; no workspace (or a too-small one): the unsplit form, per problem.
+template <bool kFp8, int kTiles, typename OutT>
+struct MmaMultiDispatch {
+  static void run(int width, const MmaGemvMultiParams& mp, int total_blocks, int m, int k,
+                  int rs, int cs, cudaStream_t stream) {
+    if (width == 8) {
+      static bool opted = false;
+      if (!opted) {
+        DGPP_CUDA_OK(cudaFuncSetAttribute(mma_gemv_multi_kernel<kTiles, kFp8, 8, OutT>,
+                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                          static_cast<int>(WarpLoads<kTiles, kFp8, 8>::kSmemBytes)));
+        opted = true;
+      }
+      mma_gemv_multi_kernel<kTiles, kFp8, 8, OutT>
+          <<<total_blocks, 8 * 32, WarpLoads<kTiles, kFp8, 8>::kSmemBytes, stream>>>(mp, m, k, rs, cs);
+    } else if (width == 4) {
+      static bool opted = false;
+      if (!opted) {
+        DGPP_CUDA_OK(cudaFuncSetAttribute(mma_gemv_multi_kernel<kTiles, kFp8, 4, OutT>,
+                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                          static_cast<int>(WarpLoads<kTiles, kFp8, 4>::kSmemBytes)));
+        opted = true;
+      }
+      mma_gemv_multi_kernel<kTiles, kFp8, 4, OutT>
+          <<<total_blocks, 4 * 32, WarpLoads<kTiles, kFp8, 4>::kSmemBytes, stream>>>(mp, m, k, rs, cs);
+    } else {
+      static bool opted = false;
+      if (!opted) {
+        DGPP_CUDA_OK(cudaFuncSetAttribute(mma_gemv_multi_kernel<kTiles, kFp8, 2, OutT>,
+                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                          static_cast<int>(WarpLoads<kTiles, kFp8, 2>::kSmemBytes)));
+        opted = true;
+      }
+      mma_gemv_multi_kernel<kTiles, kFp8, 2, OutT>
+          <<<total_blocks, 2 * 32, WarpLoads<kTiles, kFp8, 2>::kSmemBytes, stream>>>(mp, m, k, rs, cs);
+    }
+    DGPP_CUDA_OK(cudaGetLastError());
+  }
+};
+
+// The split count the single form would choose for a problem's (n, k) on
+// its own region (defined below, with the split-K machinery).
+int split_k_for(int blocks, int n, int k, int win_k, const void* ws, size_t ws_bytes);
+
+template <bool kFp8, typename OutT>
+void launch_mma_gemv_multi(const MmaGemvMultiProblem* probs, int np, int m, int k, int rs,
+                           int cs, cudaStream_t stream, void* ws, size_t ws_bytes) {
+  if (np < 1 || np > kMmaGemvMaxProblems)
+    throw std::invalid_argument("mma_gemv_multi: np outside [1, 4]");
+  if (m < 1 || m > 32) throw std::invalid_argument("mma_gemv_multi: m outside [1, 32]");
+  if (k <= 0 || (k % 64) != 0) throw std::invalid_argument("mma_gemv_multi: k a multiple of 64");
+  if (cs < 4) throw std::invalid_argument("mma_gemv_multi: cs >= 4");
+  int maxn = 0;
+  for (int i = 0; i < np; ++i) {
+    if (!mma_gemv_shape_ok(probs[i].w, probs[i].act, probs[i].act_stride, m, k))
+      throw std::invalid_argument("mma_gemv_multi: alignment");
+    maxn = std::max(maxn, probs[i].n);
+  }
+  const int warps = (maxn + kRowsPerWarp - 1) / kRowsPerWarp;
+  const int width = warps >= 512 ? 8 : warps >= 128 ? 4 : 2;
+  MmaGemvMultiParams mp{};
+  mp.n_prob = np;
+  size_t region[kMmaGemvMaxProblems] = {0};
+  size_t total_region = 0;
+  for (int i = 0; i < np; ++i) {
+    region[i] = size_t(kMaxSplit) * kMmaGemvMaxRows * size_t(probs[i].n) * sizeof(float);
+    total_region += region[i];
+    mp.p[i].wv = probs[i].w;
+    mp.p[i].scales = probs[i].scales;
+    mp.p[i].act = probs[i].act;
+    mp.p[i].act_stride = probs[i].act_stride;
+    mp.p[i].out = static_cast<float*>(probs[i].out);
+    mp.p[i].n = probs[i].n;
+    mp.p[i].out_stride = probs[i].out_stride ? probs[i].out_stride : static_cast<size_t>(probs[i].n);
+    mp.p[i].part = nullptr;
+    mp.p[i].blocks = (probs[i].n + width * kRowsPerWarp - 1) / (width * kRowsPerWarp);
+    mp.p[i].splits = 1;
+  }
+  const int nwin = (k + Win<1, kFp8>::kK - 1) / Win<1, kFp8>::kK;
+  float* cur = static_cast<float*>(ws);
+  const bool have_ws = ws != nullptr && total_region <= ws_bytes;
+  for (int i = 0; i < np; ++i) {
+    if (have_ws) {
+      mp.p[i].part = cur;
+      cur += region[i] / sizeof(float);
+      mp.p[i].splits = split_k_for(mp.p[i].blocks, probs[i].n, k, Win<1, kFp8>::kK, mp.p[i].part,
+                                   region[i]);
+    }
+    mp.p[i].wper = (nwin + mp.p[i].splits - 1) / mp.p[i].splits;
+  }
+  int total_blocks = 0;
+  for (int i = 0; i < np; ++i) {
+    total_blocks += mp.p[i].blocks * mp.p[i].splits;
+    mp.block_end[i] = total_blocks;
+  }
+  for (int i = np; i < kMmaGemvMaxProblems; ++i) mp.block_end[i] = total_blocks;
+  if (m <= 16)
+    MmaMultiDispatch<kFp8, 1, OutT>::run(width, mp, total_blocks, m, k, rs, cs, stream);
+  else
+    MmaMultiDispatch<kFp8, 2, OutT>::run(width, mp, total_blocks, m, k, rs, cs, stream);
+  int total_elems = 0;
+  for (int i = 0; i < np; ++i) total_elems += mp.p[i].splits > 1 ? m * mp.p[i].n : 0;
+  if (total_elems > 0)
+    mma_gemv_multi_reduce_kernel<OutT>
+        <<<static_cast<unsigned>((total_elems + 255) / 256), 256, 0, stream>>>(mp, m);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
 // The split-K reduce: out[m, n] = sum over the splits, in split order, of
 // the fp32 partials (deterministic; the split count is a function of the
 // shape, never of m).
@@ -407,7 +631,6 @@ __global__ void mma_gemv_split_reduce_kernel(const float* __restrict__ part, int
 // also move a little, because the summation order (and so the text) does.
 // DGPP_MMA_SPLITK_FILL overrides the block target (default two resident
 // blocks per SM).
-constexpr int kMaxSplit = 16;
 int split_k_target_blocks() {
   static const int target = [] {
     if (const char* v = std::getenv("DGPP_MMA_SPLITK_FILL")) {
@@ -557,6 +780,23 @@ void launch_mma_gemv_bf16_f32(const uint16_t* act, size_t act_stride, const uint
                               float* out, int m, int n, int k, size_t out_stride,
                               cudaStream_t stream, void* ws, size_t ws_bytes) {
   launch<false, float>(act, act_stride, w, nullptr, out, m, n, k, out_stride, 7, 7, stream, ws, ws_bytes);
+}
+
+void launch_mma_gemv_multi_fp8_f32(const MmaGemvMultiProblem* probs, int np, int m, int k, int rs,
+                                   int cs, cudaStream_t stream, void* ws, size_t ws_bytes) {
+  launch_mma_gemv_multi<true, float>(probs, np, m, k, rs, cs, stream, ws, ws_bytes);
+}
+void launch_mma_gemv_multi_fp8_bf16(const MmaGemvMultiProblem* probs, int np, int m, int k, int rs,
+                                    int cs, cudaStream_t stream, void* ws, size_t ws_bytes) {
+  launch_mma_gemv_multi<true, uint16_t>(probs, np, m, k, rs, cs, stream, ws, ws_bytes);
+}
+void launch_mma_gemv_multi_bf16_f32(const MmaGemvMultiProblem* probs, int np, int m, int k, int rs,
+                                    int cs, cudaStream_t stream, void* ws, size_t ws_bytes) {
+  launch_mma_gemv_multi<false, float>(probs, np, m, k, rs, cs, stream, ws, ws_bytes);
+}
+void launch_mma_gemv_multi_bf16_bf16(const MmaGemvMultiProblem* probs, int np, int m, int k, int rs,
+                                     int cs, cudaStream_t stream, void* ws, size_t ws_bytes) {
+  launch_mma_gemv_multi<false, uint16_t>(probs, np, m, k, rs, cs, stream, ws, ws_bytes);
 }
 
 }  // namespace dgpp

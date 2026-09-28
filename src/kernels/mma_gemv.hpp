@@ -39,6 +39,10 @@
 namespace dgpp {
 
 constexpr int kMmaGemvMaxRows = 32;
+// The split-K's block cap: a problem's partials region is sized for this many
+// splits, so the multi form's workspace is the sum over its problems of
+// kMmaGemvMaxSplit * kMmaGemvMaxRows * n * sizeof(float).
+constexpr int kMmaGemvMaxSplit = 16;
 // Rows per launch: the widest single form (8 tiles); m above it runs in
 // groups of this many rows, the weights read once per group.
 constexpr int kMmaGemvMaxRowsPerLaunch = 128;
@@ -69,6 +73,35 @@ void launch_mma_gemv_bf16_f32(const uint16_t* act, size_t act_stride, const uint
                               cudaStream_t stream, void* ws = nullptr, size_t ws_bytes = 0);
 // The shape the kernel takes (k a multiple of 16, aligned pointers, m in range).
 bool mma_gemv_shape_ok(const void* w, const void* act, size_t act_stride, int m, int k);
+
+// The multi-problem decode form (2026-09-28, the 0731 dense groups): up to
+// four problems in one launch, each with its own act / weights / output,
+// all at the same m and k (the per-layer projections of one input: the
+// hidden's wq_a + wkv, the lora's wq_b + index q, the attention out's
+// output-group folds). Each problem runs the decode forms' block body over
+// its own (n, k) — the same width and split count the single launch would
+// choose for its n — so a problem's chain is the single launch's, and the
+// launches it replaces only differ by the width rule's max-n choice
+// (tolerance-equal, the decode forms' contract). The partials share one
+// workspace, region per problem.
+struct MmaGemvMultiProblem {
+  const uint16_t* act;  // [m, act_stride]
+  size_t act_stride;
+  const void* w;  // fp8: e4m3 [n, k]; bf16: bf16 [n, k]
+  const float* scales;  // fp8 only (nullptr for bf16)
+  void* out;  // f32 or bf16 per the form
+  int n;
+  size_t out_stride;
+};
+constexpr int kMmaGemvMaxProblems = 4;
+void launch_mma_gemv_multi_fp8_f32(const MmaGemvMultiProblem* probs, int np, int m, int k, int rs,
+                                   int cs, cudaStream_t stream, void* ws, size_t ws_bytes);
+void launch_mma_gemv_multi_fp8_bf16(const MmaGemvMultiProblem* probs, int np, int m, int k, int rs,
+                                    int cs, cudaStream_t stream, void* ws, size_t ws_bytes);
+void launch_mma_gemv_multi_bf16_f32(const MmaGemvMultiProblem* probs, int np, int m, int k, int rs,
+                                    int cs, cudaStream_t stream, void* ws, size_t ws_bytes);
+void launch_mma_gemv_multi_bf16_bf16(const MmaGemvMultiProblem* probs, int np, int m, int k, int rs,
+                                     int cs, cudaStream_t stream, void* ws, size_t ws_bytes);
 
 // The decode forms' block width override (warps of 8 weight rows: 1, 2, 4,
 // 8; 0 restores the rule by n) — the timing sweep's knob, not a serving

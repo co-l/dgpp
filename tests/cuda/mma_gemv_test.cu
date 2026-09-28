@@ -6,6 +6,7 @@
 // beside the GEMV cores it replaces (informational).
 #include <cmath>
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -469,6 +470,213 @@ DGPP_TEST(mma_gemv_split_k_bf16_small_n_sites) {
   }
   cudaFree(act);
   cudaFree(outf);
+  cudaFree(ws);
+}
+
+// The multi-problem decode form (2026-09-28, the 0731 dense groups): up to
+// four problems sharing one launch, each with its own act / weights /
+// output, all at the same m and k. Per problem the chain is the single
+// launch's (same shape -> same width, same split count, same window
+// partition), so every problem must stay inside the decode forms' oracle
+// budget, be deterministic, be m-invariant, and the bf16 epilogue must
+// equal bf16(f32) bit for bit. A one-problem multi is bitwise the single
+// launch (the plumbing).
+DGPP_TEST(mma_gemv_multi_problem_decode_forms) {
+  const int m = 6, k = 4096, rs = 7, cs = 7;
+  const int ns[4] = {1024, 512, 64, 4096};
+  const int np = 4;
+  std::vector<Problem> probs(np);
+  std::vector<uint8_t*> d_w8(np);
+  std::vector<uint16_t*> d_w16(np);
+  std::vector<float*> d_scale(np);
+  std::vector<uint16_t*> d_act(np);
+  std::vector<float*> d_outf(np);
+  std::vector<uint16_t*> d_outb(np);
+  size_t ws_bytes = 0;
+  for (int i = 0; i < np; ++i) {
+    probs[i] = make(m, ns[i], k, rs, cs, 0x100 + i);
+    DGPP_CUDA_OK(cudaMalloc(&d_w8[i], probs[i].w8.size()));
+    DGPP_CUDA_OK(cudaMemcpy(d_w8[i], probs[i].w8.data(), probs[i].w8.size(), cudaMemcpyHostToDevice));
+    DGPP_CUDA_OK(cudaMalloc(&d_w16[i], probs[i].w16.size() * 2));
+    DGPP_CUDA_OK(cudaMemcpy(d_w16[i], probs[i].w16.data(), probs[i].w16.size() * 2, cudaMemcpyHostToDevice));
+    DGPP_CUDA_OK(cudaMalloc(&d_scale[i], probs[i].scales.size() * 4));
+    DGPP_CUDA_OK(cudaMemcpy(d_scale[i], probs[i].scales.data(), probs[i].scales.size() * 4, cudaMemcpyHostToDevice));
+    DGPP_CUDA_OK(cudaMalloc(&d_act[i], probs[i].act.size() * 2));
+    DGPP_CUDA_OK(cudaMemcpy(d_act[i], probs[i].act.data(), probs[i].act.size() * 2, cudaMemcpyHostToDevice));
+    DGPP_CUDA_OK(cudaMalloc(&d_outf[i], size_t(m) * ns[i] * 4));
+    DGPP_CUDA_OK(cudaMalloc(&d_outb[i], size_t(m) * ns[i] * 2));
+    ws_bytes = std::max(ws_bytes, size_t(16) * dgpp::kMmaGemvMaxRows * size_t(ns[i]) * 4);
+  }
+  void* ws = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&ws, ws_bytes * np));
+  auto make_probs = [&](int form, const uint16_t* const* act, int np_) {
+    std::array<dgpp::MmaGemvMultiProblem, dgpp::kMmaGemvMaxProblems> p{};
+    for (int i = 0; i < np_; ++i) {
+      if (form == 0)
+        p[i] = {act[i], size_t(k), d_w8[i], d_scale[i], d_outf[i], ns[i], size_t(ns[i])};
+      else
+        p[i] = {act[i], size_t(k), d_w16[i], nullptr, d_outf[i], ns[i], size_t(ns[i])};
+    }
+    return p;
+  };
+  auto run_multi = [&](int form, const std::array<dgpp::MmaGemvMultiProblem, dgpp::kMmaGemvMaxProblems>& p,
+                       int mrows) {
+    if (form == 0)
+      dgpp::launch_mma_gemv_multi_fp8_f32(p.data(), np, mrows, k, rs, cs, nullptr, ws, ws_bytes);
+    else
+      dgpp::launch_mma_gemv_multi_bf16_f32(p.data(), np, mrows, k, rs, cs, nullptr, ws, ws_bytes);
+  };
+  auto check_oracle = [&](int form, int mrows, const std::vector<std::vector<float>>& got) {
+    for (int i = 0; i < np; ++i) {
+      double worst = 0;
+      for (int r = 0; r < mrows; ++r)
+        for (int c = 0; c < ns[i]; ++c) {
+          double ref = 0, mag = 0;
+          for (int t = 0; t < k; ++t) {
+            const double a = dgpp::bf16_bits_to_float(probs[i].act[size_t(r) * k + t]);
+            const double w = form == 0
+                                 ? wval8(probs[i], c, t)
+                                 : dgpp::bf16_bits_to_float(probs[i].w16[size_t(c) * k + t]);
+            ref += a * w;
+            mag += std::fabs(a * w);
+          }
+          worst = std::max(worst, std::fabs(got[i][size_t(r) * ns[i] + c] - ref) / (mag + 1e-6));
+        }
+      require(worst < 2e-3, "multi-problem " + std::string(form == 0 ? "fp8" : "bf16") +
+                                " problem " + std::to_string(i) + " [" + std::to_string(ns[i]) + " x " +
+                                std::to_string(k) + "] m=" + std::to_string(mrows) + " vs oracle: " +
+                                std::to_string(worst));
+    }
+  };
+  const uint16_t* acts0[np];
+  for (int i = 0; i < np; ++i) acts0[i] = d_act[i];
+  for (int form = 0; form < 2; ++form) {
+    const char* name = form == 0 ? "fp8" : "bf16";
+    // m = 1: the oracle budget at one row.
+    {
+      const auto p = make_probs(form, acts0, np);
+      run_multi(form, p, 1);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      std::vector<std::vector<float>> got(np);
+      for (int i = 0; i < np; ++i) got[i] = fetch_f(d_outf[i], ns[i]);
+      check_oracle(form, 1, got);
+      std::printf("[ OK ] multi-problem %s x%d m=1: oracle\n", name, np);
+    }
+    // m = 6: the oracle budget, determinism, the bf16 epilogue, and
+    // m-invariance (row r equals the m = 1 run over act row r).
+    {
+      const auto p = make_probs(form, acts0, np);
+      run_multi(form, p, m);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      std::vector<std::vector<float>> got(np);
+      for (int i = 0; i < np; ++i) got[i] = fetch_f(d_outf[i], size_t(m) * ns[i]);
+      check_oracle(form, m, got);
+      run_multi(form, p, m);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      for (int i = 0; i < np; ++i) {
+        const auto again = fetch_f(d_outf[i], size_t(m) * ns[i]);
+        require(got[i] == again, "multi-problem: two launches differ");
+      }
+      if (form == 0) {
+        dgpp::MmaGemvMultiProblem pb[np];
+        for (int i = 0; i < np; ++i)
+          pb[i] = {acts0[i], size_t(k), d_w8[i], d_scale[i], d_outb[i], ns[i], size_t(ns[i])};
+        dgpp::launch_mma_gemv_multi_fp8_bf16(pb, np, m, k, rs, cs, nullptr, ws, ws_bytes);
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+        for (int i = 0; i < np; ++i) {
+          const auto b = fetch_b(d_outb[i], size_t(m) * ns[i]);
+          for (size_t e = 0; e < b.size(); ++e)
+            require(b[e] == dgpp::float_to_bf16_bits(got[i][e]),
+                    "multi-problem: bf16 epilogue != bf16(f32)");
+        }
+      }
+      for (int r : {0, 3, m - 1}) {
+        const uint16_t* act_r[np];
+        for (int i = 0; i < np; ++i) act_r[i] = d_act[i] + size_t(r) * k;
+        const auto pr = make_probs(form, act_r, np);
+        run_multi(form, pr, 1);
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+        for (int i = 0; i < np; ++i) {
+          const auto row = fetch_f(d_outf[i], ns[i]);
+          require(row == std::vector<float>(got[i].begin() + size_t(r) * ns[i],
+                                            got[i].begin() + (size_t(r) + 1) * ns[i]),
+                  "multi-problem: row " + std::to_string(r) + " differs between m = 1 and m = " +
+                      std::to_string(m));
+        }
+      }
+      std::printf("[ OK ] multi-problem %s x%d m=%d: oracle, deterministic, m-invariant%s\n", name,
+                  np, m, form == 0 ? ", bf16 == bf16(f32)" : "");
+    }
+  }
+  // The one-problem multi is bitwise the single launch (the plumbing);
+  // out_stride 0 means n in both forms (the single launcher's default).
+  {
+    dgpp::MmaGemvMultiProblem one;
+    one.act = d_act[0];
+    one.act_stride = k;
+    one.w = d_w8[0];
+    one.scales = d_scale[0];
+    one.out = d_outf[0];
+    one.n = ns[0];
+    one.out_stride = 0;
+    dgpp::launch_mma_gemv_multi_fp8_f32(&one, 1, m, k, rs, cs, nullptr, ws, ws_bytes);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    const auto multi = fetch_f(d_outf[0], size_t(m) * ns[0]);
+    dgpp::launch_mma_gemv_fp8_f32(d_act[0], k, d_w8[0], d_scale[0], d_outf[0], m, ns[0], k, ns[0], rs, cs,
+                                  nullptr, ws, ws_bytes);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    const auto single = fetch_f(d_outf[0], size_t(m) * ns[0]);
+    require(multi == single, "one-problem multi is not bitwise the single launch");
+    std::printf("[ OK ] one-problem multi bitwise the single launch\n");
+  }
+  for (int i = 0; i < np; ++i) {
+    cudaFree(d_w8[i]);
+    cudaFree(d_w16[i]);
+    cudaFree(d_scale[i]);
+    cudaFree(d_act[i]);
+    cudaFree(d_outf[i]);
+    cudaFree(d_outb[i]);
+  }
+  cudaFree(ws);
+}
+
+DGPP_TEST(mma_gemv_multi_decode_groups_narrow_and_wide) {
+  // The model's decode groups (2026-09-28): a narrow-n group at the width-2
+  // grid (the hidden's wq_a + wkv; k = 256, one window, the layer test's
+  // config) and the two-tile (m = 32) group at the small n with the split-K
+  // geometry. Each problem must be bitwise the single launch (the group's
+  // width the rows' chains do not depend on, the split per problem's own
+  // (n, k)) — the decode wiring's contract.
+  const int rs = 7, cs = 7;
+  const int ns[2] = {64, 512};
+  const int ms[2] = {8, 32}, ks[2] = {256, 1024};
+  size_t ws_bytes = 0;
+  for (int i = 0; i < 2; ++i)
+    ws_bytes += size_t(dgpp::kMmaGemvMaxSplit) * dgpp::kMmaGemvMaxRows * size_t(ns[i]) * 4;
+  void* ws = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&ws, ws_bytes * 2));
+  for (int c = 0; c < 2; ++c) {
+    const int m = ms[c], k = ks[c];
+    std::array<Problem, 2> probs{{make(m, ns[0], k, rs, cs, 0x5DEE01 + c), make(m, ns[1], k, rs, cs, 0x5DEE02 + c)}};
+    std::array<Dev, 2> d{{Dev(probs[0]), Dev(probs[1])}};
+    dgpp::MmaGemvMultiProblem p2[2] = {{d[0].act, size_t(k), d[0].w8, d[0].scales, d[0].outf, ns[0], size_t(ns[0])},
+                                       {d[1].act, size_t(k), d[1].w8, d[1].scales, d[1].outf, ns[1], size_t(ns[1])}};
+    dgpp::launch_mma_gemv_multi_fp8_f32(p2, 2, m, k, rs, cs, nullptr, ws, ws_bytes);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    for (int i = 0; i < 2; ++i) {
+      const auto got = fetch_f(d[i].outf, size_t(m) * ns[i]);
+      const double err = max_rel_err(probs[i], got, [&](int r, int cc) { return wval8(probs[i], r, cc); });
+      require(err < 2e-3, "multi decode group [" + std::to_string(ns[i]) + " x " + std::to_string(k) +
+                              "] m=" + std::to_string(m) + " vs oracle: " + std::to_string(err));
+      dgpp::launch_mma_gemv_fp8_f32(d[i].act, k, d[i].w8, d[i].scales, d[i].outf, m, ns[i], k, ns[i], rs, cs,
+                                    nullptr, ws, ws_bytes);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      const auto single = fetch_f(d[i].outf, size_t(m) * ns[i]);
+      require(got == single, "multi decode group [" + std::to_string(ns[i]) + " x " + std::to_string(k) +
+                                 "] m=" + std::to_string(m) + " is not bitwise the single launch");
+    }
+    std::printf("[ OK ] multi decode group m=%d k=%d: oracle, bitwise the single launch\n", m, k);
+  }
   cudaFree(ws);
 }
 
