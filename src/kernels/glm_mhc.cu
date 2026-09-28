@@ -51,6 +51,27 @@ __device__ __forceinline__ T block_sum(T v, T* warp_scratch /* [8] */) {
   for (int w = 1; w < kThreads / 32; ++w) total += warp_scratch[w];
   return total;
 }
+// The csa2 256-thread block_sum_256 tree, mirrored for bitwise parity: the
+// normed rows the fused finish writes must equal the separate csa2
+// one-rounding rmsnorm on the same collapsed row, and the cross-warp sum's
+// add order is part of the bits (the balanced tree, not the chain above).
+__device__ __forceinline__ float block_sum_balanced_256(float v, float* red /*[8]*/) {
+  for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  __syncthreads();
+  if (lane == 0) red[warp] = v;
+  __syncthreads();
+  float t = 0.0f;
+  if (warp == 0) {
+    t = lane < (int)(blockDim.x >> 5) ? red[lane] : 0.0f;
+    for (int off = 4; off > 0; off >>= 1) t += __shfl_xor_sync(0xffffffffu, t, off);
+    if (lane == 0) red[0] = t;
+  }
+  __syncthreads();
+  t = red[0];
+  __syncthreads();
+  return t;
+}
 
 __device__ __forceinline__ void unpack8(uint4 q, float (&f)[8]) {
   const uint32_t w[4] = {q.x, q.y, q.z, q.w};
@@ -304,7 +325,28 @@ __device__ __forceinline__ void mhc_finish_block(
   }
   if (ln == nullptr) return;
 
-  // The fused RMSNorm (two roundings; see glm_norm.cu).
+  // The fused RMSNorm (two roundings; see glm_norm.cu). Where the collapsed
+  // row is stored (the dsv41 sites), the block re-reads it in the csa2
+  // one-rounding norm's exact thread partition (t, t + 256, ...) and
+  // balanced cross-warp tree: the row is bitwise the separate csa2 rmsnorm.
+  // The normed-only form (collapsed == nullptr) keeps the register form.
+  if (collapsed != nullptr) {
+    __syncthreads();
+    const uint16_t* cr = collapsed + t * hidden;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < hidden; i += kThreads)
+      ss = __fmaf_rn(bf16_bits_to_float(cr[i]), bf16_bits_to_float(cr[i]), ss);
+    const float total = block_sum_balanced_256(ss, fscratch);
+    const float rstd = rsqrtf(__fadd_rn(__fdiv_rn(total, static_cast<float>(hidden)), ln_eps));
+    uint16_t* yr = normed + t * hidden;
+    for (int i = threadIdx.x; i < hidden; i += kThreads) {
+      // csa2's exact chain: the x*rstd product stays fp32 (no bf16
+      // intermediate), the weight multiply is fp32, one rounding at the end.
+      const float v = __fmul_rn(bf16_bits_to_float(cr[i]), rstd);
+      yr[i] = float_to_bf16_bits(__fmul_rn(bf16_bits_to_float(fin.ln[i]), v));
+    }
+    return;
+  }
   const float total = block_sum(ssq, fscratch);
   const float rstd = rsqrtf(total / static_cast<float>(hidden) + ln_eps);
 #pragma unroll

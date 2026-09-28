@@ -332,6 +332,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   float* pre_nxt_ = nullptr;
   float* one_hot_ = nullptr;        // [M, 4] = (1, 0, 0, 0): layer 0's collapse
   float* mhc_logits_ = nullptr;     // [M, 24]
+  int* mhc_finish_counters_ = nullptr;  // [M], zeroed; the fused finish resets each token's
   uint16_t* engram_kv_ = nullptr;   // [M, 5H] the fold's fallback
   int32_t* d_ctx_ = nullptr;        // [R, 4] the Engram contexts
   int32_t* spec_ctx_ = nullptr;     // [max(M, rows), 4] per-row contexts

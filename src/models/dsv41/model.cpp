@@ -267,6 +267,8 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
   pre_b_ = dev_alloc<float>(M * 4);
   one_hot_ = dev_alloc<float>(M * 4);
   mhc_logits_ = dev_alloc<float>(M * static_cast<size_t>(mhc_cfg_.coeff_rows()));
+  mhc_finish_counters_ = dev_alloc<int>(M);
+  DGPP_CUDA_OK(cudaMemset(mhc_finish_counters_, 0, M * 4));
   {
     std::vector<float> oh(M * 4, 0.0f);
     for (size_t t = 0; t < M; ++t) oh[t * 4] = 1.0f;
@@ -880,7 +882,9 @@ void Dsv41Model::gather_embedding(const int64_t* tokens, int T, bool capture) {
 
 // One mHC site: the coefficients of this site (pre_nxt_, post, comb) from
 // the streams, the collapse with the coefficients in use (pre_cur_), the
-// sublayer's one-rounding norm into x_.
+// sublayer's one-rounding norm into x_. Decode rows fuse the norm into the
+// finish (the counters' last block writes x_); prefill keeps the tiled
+// dots and the separate norm.
 void Dsv41Model::mhc_site(const uint16_t* streams, const GlmMhcWeights& w, const uint16_t* ln, int T, bool decode) {
   MhcSinglePass sp;
   // The 0731 release (and the GLM form) collapses with the site's own pre:
@@ -889,11 +893,15 @@ void Dsv41Model::mhc_site(const uint16_t* streams, const GlmMhcWeights& w, const
   sp.pre_out = pre_nxt_;
   sp.post_f32 = post_f32_;
   sp.comb_f32 = comb_f32_;
-  // Decode rows stay on the per-coefficient form at any count (a batched
-  // row bitwise the row alone; the >= 16-token prefill forms are not).
-  (void)launch_mhc_compute_normed(streams, w, mhc_cfg_, collapsed_, post_bf16_, comb_bf16_, mhc_logits_, nullptr, nullptr,
-                                  cfg_.rms_norm_eps, T, stream_, nullptr, false, &sp, decode);
-  csa2_rmsnorm_bf16(collapsed_, cfg_.hidden_size, ln, x_, cfg_.hidden_size, T, cfg_.hidden_size, cfg_.rms_norm_eps, stream_);
+  if (decode) {
+    (void)launch_mhc_compute_normed(streams, w, mhc_cfg_, collapsed_, post_bf16_, comb_bf16_, mhc_logits_, ln,
+                                    x_, cfg_.rms_norm_eps, T, stream_, mhc_finish_counters_, false, &sp, true);
+  } else {
+    (void)launch_mhc_compute_normed(streams, w, mhc_cfg_, collapsed_, post_bf16_, comb_bf16_, mhc_logits_, nullptr,
+                                    nullptr, cfg_.rms_norm_eps, T, stream_, nullptr, false, &sp, decode);
+    csa2_rmsnorm_bf16(collapsed_, cfg_.hidden_size, ln, x_, cfg_.hidden_size, T, cfg_.hidden_size,
+                      cfg_.rms_norm_eps, stream_);
+  }
   pre_cur_ = pre_nxt_;
   pre_nxt_ = pre_cur_ == pre_a_ ? pre_b_ : pre_a_;
 }

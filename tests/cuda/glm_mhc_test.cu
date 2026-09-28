@@ -21,6 +21,7 @@
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
 #include "common/test.hpp"
+#include "kernels/csa2.hpp"
 #include "kernels/glm_mhc_launch.hpp"
 #include "models/glm/mhc.hpp"
 #include "models/glm/mhc_reference.hpp"
@@ -628,6 +629,68 @@ DGPP_TEST(mhc_collapse_normed_is_bitwise_the_finish_with_the_same_pre) {
                 "collapse_normed normed vs oracle");
     std::printf("[ OK ] collapse_normed tokens=%d: bitwise the finish, within budget of the oracle\n", tokens);
     cudaFree(pre); cudaFree(ln); cudaFree(normed_a); cudaFree(normed_b); cudaFree(collapsed_b);
+    c.free_all();
+  }
+}
+
+DGPP_TEST(mhc_fused_finish_normed_matches_the_separate_rmsnorm) {
+  // The decode path folds the site's one-rounding RMSNorm into the fused
+  // finish (the dsv41 sites): the fused finish's normed row must be bitwise
+  // the two-step chain (the collapse, then the csa2 one-rounding norm) —
+  // the norm's cross-warp sum is the csa2 balanced 256-thread tree.
+  for (int tokens : {1, 7, 24, 512}) {
+    Case c = make_case(real_config(), tokens, 0xC0D0 + tokens);
+    c.alloc();
+    const int D = c.cfg.hidden;
+    uint16_t *ln = nullptr, *xa = nullptr, *xb = nullptr, *collapsed_a = nullptr;
+    DGPP_CUDA_OK(cudaMallocManaged(&ln, static_cast<size_t>(D) * 2));
+    DGPP_CUDA_OK(cudaMallocManaged(&xa, static_cast<size_t>(tokens) * D * 2));
+    DGPP_CUDA_OK(cudaMallocManaged(&xb, static_cast<size_t>(tokens) * D * 2));
+    DGPP_CUDA_OK(cudaMallocManaged(&collapsed_a, static_cast<size_t>(tokens) * D * 2));
+    Rng rng(0x7A + tokens);
+    for (int d = 0; d < D; ++d)
+      ln[d] = float_to_bf16_bits(1.0f + 0.1f * static_cast<float>(rng.unit()));
+    const float ln_eps = 1e-5f;
+    int* counters = nullptr;
+    DGPP_CUDA_OK(cudaMalloc(&counters, static_cast<size_t>(tokens) * 4));
+    DGPP_CUDA_OK(cudaMemset(counters, 0, static_cast<size_t>(tokens) * 4));
+    // Chain A: the two-step form (the collapse, then the csa2 one-rounding norm).
+    dgpp::launch_mhc_compute_normed(c.d_streams, c.dev_w, c.cfg, collapsed_a, c.d_post, c.d_comb,
+                                    c.d_logits, nullptr, nullptr, 0.f, tokens, nullptr, nullptr,
+                                    false, nullptr, true);
+    dgpp::csa2_rmsnorm_bf16(collapsed_a, D, ln, xa, D, tokens, D, ln_eps, nullptr);
+    // Chain B: the fused finish writing the normed row (the decode form).
+    dgpp::launch_mhc_compute_normed(c.d_streams, c.dev_w, c.cfg, c.d_collapsed, c.d_post, c.d_comb,
+                                    c.d_logits, ln, xb, ln_eps, tokens, nullptr, counters,
+                                    false, nullptr, true);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    const auto ra = read_back(xa, static_cast<size_t>(tokens) * D),
+        rb = read_back(xb, static_cast<size_t>(tokens) * D),
+        ca = read_back(collapsed_a, static_cast<size_t>(tokens) * D),
+        cb = read_back(c.d_collapsed, static_cast<size_t>(tokens) * D);
+    size_t badc = static_cast<size_t>(-1), bad = static_cast<size_t>(-1);
+    for (size_t i = 0; i < ra.size(); ++i) {
+      if (badc == static_cast<size_t>(-1) && ca[i] != cb[i]) badc = i;
+      if (bad == static_cast<size_t>(-1) && ra[i] != rb[i]) bad = i;
+    }
+    if (badc != static_cast<size_t>(-1))
+      throw std::runtime_error("collapse mismatch at " + std::to_string(badc) + " a=" +
+                               std::to_string(bf16_bits_to_float(ca[badc])) + " b=" +
+                               std::to_string(bf16_bits_to_float(cb[badc])) + " (normed bad=" +
+                               std::to_string(bad) + ")");
+    if (bad != static_cast<size_t>(-1))
+      throw std::runtime_error("fused normed mismatch at " + std::to_string(bad) +
+                               " a=" + std::to_string(bf16_bits_to_float(ra[bad])) +
+                               " b=" + std::to_string(bf16_bits_to_float(rb[bad])) +
+                               " collapsed rows identical");
+    require(ca == cb, "the fused collapse equals the two-step collapse");
+    require(ra == rb, "the fused finish's normed row is bitwise the collapse + csa2 rmsnorm chain");
+    std::printf("[ OK ] fused finish normed tokens=%d: bitwise the separate rmsnorm chain\n", tokens);
+    cudaFree(ln);
+    cudaFree(xa);
+    cudaFree(xb);
+    cudaFree(collapsed_a);
+    cudaFree(counters);
     c.free_all();
   }
 }
