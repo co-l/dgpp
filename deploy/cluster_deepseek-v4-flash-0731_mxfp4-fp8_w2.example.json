@@ -5,19 +5,21 @@
     "max_concurrency": 4,
     "kv_capacity": 1048576,
     "bf16_weights": "bf12",
+    "dense_weights": "fp8",
     "prefill": "bounded",
     "default_max_tokens": 32768,
     "queue_limit": 8,
     "max_connections": 64,
     "decode_graph": true,
     "mtp": true,
-    "mtp_schedule": true,
+    "mtp_schedule": false,
     "mtp_schedule_lambda": 0.045,
     "prefix_cache_gib": 1.5,
     "admission": "full",
     "admission_window": 256,
     "sampling_candidates": 128,
-    "stats_interval_s": 10
+    "stats_interval_s": 10,
+    "model_alias": "deepseek-v4-flash-0731"
   },
   "paths": {
     "resident_cache": ""

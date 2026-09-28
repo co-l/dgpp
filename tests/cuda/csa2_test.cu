@@ -1010,6 +1010,18 @@ DGPP_TEST(csa2_0731_actquant8_dequant_matches_the_reference) {
   x[448] = float_to_bf16_bits(448.0f);
   x[449] = float_to_bf16_bits(0.1875f);
   for (int c = 0; c < 64; ++c) x[size_t(512) + c] = float_to_bf16_bits(0.25f);
+  // The encode edge battery: subnormal-zone quotients (tiny values against
+  // amax = 1), the saturation boundary, the exact floor, and a wide row.
+  for (int p = 1; p <= 16; ++p)
+    x[2 * 512 + 2 * p - 2] = float_to_bf16_bits(std::ldexp(1.0f, -13 - (p % 6)));  // 2^-13..2^-18
+  x[2 * 512 + 31] = 0;
+  x[3 * 512] = float_to_bf16_bits(1e30f);
+  for (int c = 1; c < 64; ++c) x[3 * 512 + c] = float_to_bf16_bits(-1e30f * (c & 1 ? 1.0f : 0.5f));
+  for (int c = 0; c < 512; ++c) x[4 * 512 + c] = (c % 7 == 0) ? 0 : float_to_bf16_bits(1e-4f);
+  x[5 * 512] = float_to_bf16_bits(450.0f);
+  x[5 * 512 + 1] = float_to_bf16_bits(449.0f);
+  x[5 * 512 + 2] = float_to_bf16_bits(448.0f);
+  for (int c = 3; c < 512; ++c) x[5 * 512 + c] = float_to_bf16_bits(448.0f * (c % 2 ? 1.0f : 0.25f));
   for (int r = 0; r < rows; ++r) ref_actquant8_dequant(x.data() + size_t(r) * 512, want.data() + size_t(r) * 512);
   DevBuf dx(rows * 512 * 2), dy(rows * 512 * 2);
   dx.upload(x.data(), x.size() * 2);
@@ -1499,13 +1511,14 @@ DGPP_TEST(csa2_0731_compress128_prefill_and_decode) {
   }
   std::vector<float> states(2 * 256 * D, 0.0f);
   DevBuf dkvd = upload(kvd), dscd = upload(scd), dri = upload(req_ids), dpos = upload(pos), dsp = upload(spans),
-      dst = upload(states), dlatd(size_t(tokens) * D * 2), dent(size_t(tokens) * 8), dsnap(size_t(tokens) * 256 * D * 4);
+      dst = upload(states), dlatd(size_t(tokens) * D * 2), dent(size_t(tokens) * 8), dsnap(size_t(tokens) * 256 * D * 4),
+      dscratch(2 * 256 * D * 4);
   DGPP_CUDA_OK(cudaMemset(dsnap.p, 0x7F, dsnap.bytes));
   dgpp::csa2_compress128_decode(static_cast<const float*>(dkvd.p), static_cast<const float*>(dscd.p),
                                 static_cast<const int32_t*>(dri.p), static_cast<const int64_t*>(dpos.p),
                                 static_cast<const int32_t*>(dsp.p), 2, static_cast<const float*>(dap.p), dw.p,
                                 eps, static_cast<float*>(dst.p), dlatd.p, static_cast<int64_t*>(dent.p), tokens,
-                                static_cast<float*>(dsnap.p), 0);
+                                static_cast<float*>(dsnap.p), static_cast<float*>(dscratch.p), 0);
   sync();
   const auto latd = download<uint16_t>(dlatd, size_t(tokens) * D);
   const auto ent = download<int64_t>(dent, tokens);
@@ -1683,6 +1696,17 @@ DGPP_TEST(csa2_0731_bf16_decode_scores_select_the_topk_beyond_the_select_bound) 
     require(got == want, "bf16 decode select IDs/pass " + std::to_string(pass));
   }
   DGPP_CUDA_OK(cudaStreamDestroy(stream));
+}
+
+DGPP_TEST(csa2_0731_index_k_launchers_accept_zero_rows) {
+  // A boundary-cut chunk shorter than the ratio (one to three rows) publishes
+  // zero entries: the launchers must not launch a zero-block grid.
+  dgpp::csa2_hadamard128_bf16(nullptr, nullptr, 0, 0);
+  require(cudaGetLastError() == cudaSuccess, "hadamard128 zero-row launch");
+  dgpp::csa2_fp4_dequant_bf16(nullptr, nullptr, 0, 0);
+  require(cudaGetLastError() == cudaSuccess, "fp4 dequant zero-row launch");
+  dgpp::csa2_actquant8_dequant_bf16(nullptr, nullptr, 0, 0);
+  require(cudaGetLastError() == cudaSuccess, "actquant8 zero-row launch");
 }
 
 int main() { return dgpp::test::run_all(); }

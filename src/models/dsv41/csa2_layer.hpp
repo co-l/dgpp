@@ -107,10 +107,10 @@ class Csa2Layer {
  public:
   Csa2Layer(IGemm& gemm, const Csa2Config& cfg, int max_tokens, int64_t max_cache_tokens, void* scratch,
             size_t scratch_capacity, void* gemm_workspace, size_t gemm_ws_bytes, int max_decode_rows = 16,
-            int decode_n_split = 32, size_t dot_budget = 64ull << 20);
+            int decode_n_split = 32, size_t dot_budget = 64ull << 20, int max_requests = 4);
   static size_t scratch_bytes(const Csa2Config& cfg, int max_tokens, int64_t max_cache_tokens,
                               int max_decode_rows = 16, int decode_n_split = 32,
-                              size_t dot_budget = 64ull << 20);
+                              size_t dot_budget = 64ull << 20, int max_requests = 4);
 
   void rebind(const Csa2LayerWeights& w, int layer);
   // GEMM plans for `tokens` rows and the shared-memory opt-ins; outside capture.
@@ -206,7 +206,7 @@ class Csa2Layer {
     size_t pos, req_ids, req_zero, slots, pos_sel, entries, ent_pos, scratch_pos, iota, one_block;
     size_t wlist, wcounts, wscratch, dlist, dcounts, topk, counts, cand, cand_counts;
     size_t m_main, l_main, c_main, m_win, l_win, c_win;
-    size_t gather_k, gather_scale, dot, logits, select_ws, counter, violations;
+    size_t gather_k, gather_scale, dot, logits, select_ws, counter, violations, snap_scratch;
     int tile_cap = 0;
     int sel_col = 0;
     int64_t max_entries = 0;
@@ -214,7 +214,7 @@ class Csa2Layer {
     int ws_win_rows = 0;
   };
   static Layout layout(const Csa2Config& cfg, int max_tokens, int64_t max_cache_tokens, int max_decode_rows,
-                       int decode_n_split, size_t dot_budget);
+                       int decode_n_split, size_t dot_budget, int max_requests = 4);
 
   enum class SelKind { kNone, kPrefill, kDecode };
   struct SelShape {
@@ -324,6 +324,7 @@ class Csa2Layer {
   void* select_ws_ = nullptr;
   int32_t* counter_ws_ = nullptr;
   unsigned* violations_ = nullptr;
+  float* snap_scratch_ = nullptr;  // [max_requests, 256, 512] the ratio-128 snapshots' base
 };
 
 }  // namespace dgpp

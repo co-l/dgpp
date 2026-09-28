@@ -102,6 +102,13 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   // prefill replays from its resume point.
   void set_prefill_bounded(bool on) { prefill_bounded_ = on; }
   bool prefill_bounded() const { return prefill_bounded_; }
+  // The lm head's form (engine.dense_weights = "fp8", read from the loader
+  // family at construction): the block-FP8 head takes the scale GEMM's
+  // fp8 decode form, else the BF16 head GEMM.
+  bool head_fp8() const { return head_fp8_; }
+  // The lm head GEMM (normed hidden [rows, H] -> logits [rows, vocab slice],
+  // f32): the FP8 head's scale GEMM form when head_fp8_, else the BF16 head.
+  void head_gemm(const uint16_t* act, float* logits, int rows, cudaStream_t stream);
   // The diagnostic forward walks the first `n` layers only (n <= 0: all;
   // the head is skipped when limited — the cross-check's per-layer dump,
   // dsv41_forward_check --layers).
@@ -213,7 +220,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   static constexpr int kBlockTokens = 128;
   // Amortize prefill launches while bounding scratch growth on four GB10s.
   static constexpr int kPrefillChunkTokens = 4096;
-  static constexpr int kDecodeSplit = 32;
+  static constexpr int kDecodeSplit = 8;
   static constexpr size_t kDotBudget = 64ull << 20;
   static constexpr int kRingSlots = 160;
 
@@ -279,6 +286,7 @@ class Dsv41Model : public SessionModel<Dsv41Model> {
   Dsv41LayerStream loader_;
   CublasLtGemm gemm_;
   bool dense_mma_ = true;  // the dense projections' and head's decode form (DGPP_DSV41_DENSE_GEMV=1: the GEMV chunks)
+  bool head_fp8_ = false;  // the lm head's block-FP8 form (engine.dense_weights = "fp8")
   void* gemm_ws_ = nullptr;
   size_t gemm_ws_bytes_ = 0;
   Dsv41GlobalsResident globals_;

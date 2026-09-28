@@ -505,10 +505,10 @@ void CublasLtGemm::matmul(const void* act, const void* weight, void* out,
     auto* y = static_cast<uint8_t*>(out);
     if (out_dtype == GemmOut::F32)
       launch_mma_gemv_bf16_f32(x, act_row_stride, w, reinterpret_cast<float*>(y), m, n, k,
-                               static_cast<size_t>(n), stream);
+                               static_cast<size_t>(n), stream, workspace, ws_bytes);
     else
       launch_mma_gemv_bf16_bf16(x, act_row_stride, w, reinterpret_cast<uint16_t*>(y), m, n, k,
-                                static_cast<size_t>(n), stream);
+                                static_cast<size_t>(n), stream, workspace, ws_bytes);
     return;
   }
   // A registered companion (bf12_gemv.hpp) takes the lowering's launches —

@@ -583,6 +583,59 @@ DGPP_TEST(scale_gemm_gemv_path_propagates_nan_exactly) {
   std::printf("[ OK ] gemv nan propagation: columns 9 and 250 NaN\n");
 }
 
+DGPP_TEST(scale_gemm_grid_decode_mma_split_k_small_n_sites) {
+  // The small-n decode sites (the csa2 projections at k = hidden: wq_a /
+  // wkv [512, 4096]) launch fewer output blocks than SMs; the split-K mma
+  // form fills them only with a workspace, and must match both oracles, be
+  // deterministic, and stay oracle-true with no workspace (the fallback).
+  const std::vector<std::tuple<int, int, int, uint64_t>> sites = {
+      {6, 512, 4096, 0x7A1},  // wq_a / wkv geometry
+      {6, 512, 512, 0x7A2},   // small-k geometry (wq_b class)
+      {1, 512, 4096, 0x7A3},  // single row
+  };
+  size_t ws_bytes = 64u << 20;
+  void* ws = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&ws, ws_bytes));
+  cudaStream_t stream = nullptr;
+  DGPP_CUDA_OK(cudaStreamCreate(&stream));
+  for (const auto& [m, n, k, seed] : sites) {
+    Problem p = make_problem(m, n, k, seed);
+    uint16_t* act = nullptr;
+    uint8_t* w = nullptr;
+    float* s = nullptr;
+    uint16_t* out = nullptr;
+    DGPP_CUDA_OK(cudaMallocManaged(&act, p.act.size() * 2));
+    DGPP_CUDA_OK(cudaMallocManaged(&w, p.payload.size()));
+    DGPP_CUDA_OK(cudaMallocManaged(&s, p.scales.size() * 4));
+    DGPP_CUDA_OK(cudaMallocManaged(&out, static_cast<size_t>(m) * n * 2));
+    std::memcpy(act, p.act.data(), p.act.size() * 2);
+    std::memcpy(w, p.payload.data(), p.payload.size());
+    std::memcpy(s, p.scales.data(), p.scales.size() * 4);
+    dgpp::launch_scale_gemm_grid_bf16(act, k, w, s, out, m, n, k, stream, 0, 7, 7, true, ws, ws_bytes);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    std::vector<uint16_t> got(static_cast<size_t>(m) * n);
+    std::memcpy(got.data(), out, got.size() * 2);
+    const std::string label = "grid-mma-splitK M" + std::to_string(m) + "xN" + std::to_string(n) + "xK" +
+                              std::to_string(k);
+    check_both_oracles(p, got, label.c_str());
+    const std::vector<uint16_t> first = got;
+    dgpp::launch_scale_gemm_grid_bf16(act, k, w, s, out, m, n, k, stream, 0, 7, 7, true, ws, ws_bytes);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    std::memcpy(got.data(), out, got.size() * 2);
+    require(got == first, "split-K mma form is deterministic");
+    dgpp::launch_scale_gemm_grid_bf16(act, k, w, s, out, m, n, k, stream, 0, 7, 7, true);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    std::memcpy(got.data(), out, got.size() * 2);
+    check_both_oracles(p, got, (label + " no-ws").c_str());
+    DGPP_CUDA_OK(cudaFree(act));
+    DGPP_CUDA_OK(cudaFree(w));
+    DGPP_CUDA_OK(cudaFree(s));
+    DGPP_CUDA_OK(cudaFree(out));
+  }
+  DGPP_CUDA_OK(cudaFree(ws));
+  DGPP_CUDA_OK(cudaStreamDestroy(stream));
+}
+
 // Real-checkpoint slice parity lives in scale_gemm_checkpoint.cpp (host-only
 // TU: minijson does not mix with nvcc).
 int run_scale_gemm_checkpoint_parity(const char* checkpoint_dir);

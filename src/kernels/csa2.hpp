@@ -273,12 +273,13 @@ void csa2_compress128_prefill(const float* kv, const float* score, int T, const 
                               cudaStream_t stream);
 // Decode as the ratio-4 machine with 128 slots: the state of request r at
 // `states` + r * (256 * 512); p with (p + 1) % 128 == 0 pools, entry p / 128;
-// snapshots fp32 [tokens, 256, 512].
+// snapshots fp32 [tokens, 256, 512]. scratch (num_requests * 256 * 512):
+// the snapshots' base copy, only when snapshots is non-null and tokens > 1.
 void csa2_compress128_decode(const float* kv, const float* score, const int32_t* req_ids,
                              const int64_t* pos, const int32_t* req_spans, int num_requests,
                              const float* ape, const void* norm_w, float eps, float* states,
                              void* latent_out, int64_t* entries_out, int tokens, float* snapshots,
-                             cudaStream_t stream);
+                             float* scratch, cudaStream_t stream);
 
 // ---- the candidate and restricted selections --------------------------------------
 // The candidate pool of a row (the reference's select_candidate_blocks):

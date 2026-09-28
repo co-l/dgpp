@@ -37,7 +37,8 @@ void Csa2Config::validate(const Csa2Config& c) {
 }
 
 Csa2Layer::Layout Csa2Layer::layout(const Csa2Config& cfg, int max_tokens, int64_t max_cache_tokens,
-                                    int max_decode_rows, int decode_n_split, size_t dot_budget) {
+                                    int max_decode_rows, int decode_n_split, size_t dot_budget,
+                                    int max_requests) {
   Csa2Config::validate(cfg);
   if (max_tokens <= 0 || max_cache_tokens <= 0) throw std::invalid_argument("csa2 layer: max_tokens / max_cache_tokens");
   if (max_decode_rows <= 0 || max_decode_rows > 32 || max_decode_rows > max_tokens)
@@ -113,22 +114,27 @@ Csa2Layer::Layout Csa2Layer::layout(const Csa2Config& cfg, int max_tokens, int64
   L.select_ws = alloc(dsa_select_workspace_bytes(max_decode_rows, L.max_entries));
   L.counter = alloc(16);
   L.violations = alloc(16);
+  // The ratio-128 snapshots' base copy: one 256 x 512 float state per
+  // concurrent request (the snapshot kernels' read source before the rows
+  // update the live tail).
+  L.snap_scratch = alloc(size_t(max_requests) * 256 * 512 * 4);
   L.total = align256(off);
   return L;
 }
 
 size_t Csa2Layer::scratch_bytes(const Csa2Config& cfg, int max_tokens, int64_t max_cache_tokens, int max_decode_rows,
-                                int decode_n_split, size_t dot_budget) {
-  return layout(cfg, max_tokens, max_cache_tokens, max_decode_rows, decode_n_split, dot_budget).total;
+                                int decode_n_split, size_t dot_budget, int max_requests) {
+  return layout(cfg, max_tokens, max_cache_tokens, max_decode_rows, decode_n_split, dot_budget, max_requests)
+      .total;
 }
 
 Csa2Layer::Csa2Layer(IGemm& gemm, const Csa2Config& cfg, int max_tokens, int64_t max_cache_tokens, void* scratch,
                      size_t scratch_capacity, void* gemm_workspace, size_t gemm_ws_bytes, int max_decode_rows,
-                     int decode_n_split, size_t dot_budget)
+                     int decode_n_split, size_t dot_budget, int max_requests)
     : gemm_(gemm), cfg_(cfg), max_tokens_(max_tokens), max_cache_tokens_(max_cache_tokens),
       max_decode_rows_(max_decode_rows), decode_n_split_(decode_n_split), gemm_ws_(gemm_workspace),
       gemm_ws_bytes_(gemm_ws_bytes) {
-  const Layout L = layout(cfg, max_tokens, max_cache_tokens, max_decode_rows, decode_n_split, dot_budget);
+  const Layout L = layout(cfg, max_tokens, max_cache_tokens, max_decode_rows, decode_n_split, dot_budget, max_requests);
   if (scratch == nullptr || scratch_capacity < L.total) throw std::invalid_argument("csa2 layer: scratch too small");
   scratch_ = static_cast<uint8_t*>(scratch);
   tile_cap_ = L.tile_cap;
@@ -186,6 +192,7 @@ Csa2Layer::Csa2Layer(IGemm& gemm, const Csa2Config& cfg, int max_tokens, int64_t
   select_ws_ = at(L.select_ws);
   counter_ws_ = reinterpret_cast<int32_t*>(at(L.counter));
   violations_ = reinterpret_cast<unsigned*>(at(L.violations));
+  snap_scratch_ = reinterpret_cast<float*>(at(L.snap_scratch));
   // The constants: the iota, the zero request ids, the one-block table,
   // the select workspace and counters (zeroed once).
   std::vector<int64_t> iota(static_cast<size_t>(max_tokens));
@@ -290,7 +297,8 @@ void Csa2Layer::validate_pool(const Csa2StatePool& pool) const {
 void Csa2Layer::project_kv(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream) {
   const uint16_t* h = static_cast<const uint16_t*>(hidden_in);
   launch_scale_gemm_grid_bf16(h, size_t(cfg_.hidden), w_.wkv.payload, w_.wkv.scales, kv_, tokens, kCsa2Latent,
-                              cfg_.hidden, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(), cfg_.dense_mma);
+                              cfg_.hidden, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(), cfg_.dense_mma,
+                              gemm_ws_, gemm_ws_bytes_);
   csa2_rmsnorm_bf16(kv_, kCsa2Latent, w_.kv_norm, kv_, kCsa2Latent, tokens, kCsa2Latent, cfg_.eps, stream);
   csa2_rope_apply(kv_ + (kCsa2Latent - kCsa2Rope), kCsa2Latent, kCsa2Latent, 1, kCsa2Rope, pos, w_.inv_freq, false,
                   tokens, stream);
@@ -301,11 +309,13 @@ void Csa2Layer::project_q_kv(const void* hidden_in, int tokens, const int64_t* p
   const uint16_t* h = static_cast<const uint16_t*>(hidden_in);
   const int lh = cfg_.local_heads();
   launch_scale_gemm_grid_bf16(h, size_t(cfg_.hidden), w_.wq_a.payload, w_.wq_a.scales, qr_, tokens, cfg_.q_lora,
-                              cfg_.hidden, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(), cfg_.dense_mma);
+                              cfg_.hidden, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(), cfg_.dense_mma,
+                              gemm_ws_, gemm_ws_bytes_);
   csa2_rmsnorm_bf16(qr_, cfg_.q_lora, w_.q_norm, qr_, cfg_.q_lora, tokens, cfg_.q_lora, cfg_.eps, stream);
   project_kv(hidden_in, tokens, pos, stream);
   launch_scale_gemm_grid_bf16(qr_, size_t(cfg_.q_lora), w_.wq_b.payload, w_.wq_b.scales, q_, tokens,
-                              lh * kCsa2Latent, cfg_.q_lora, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(), cfg_.dense_mma);
+                              lh * kCsa2Latent, cfg_.q_lora, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(),
+                              cfg_.dense_mma, gemm_ws_, gemm_ws_bytes_);
   if (cfg_.q_renorm) csa2_q_renorm_bf16(q_, tokens, lh, cfg_.eps, stream);
   csa2_rope_apply(q_ + (kCsa2Latent - kCsa2Rope), int64_t(lh) * kCsa2Latent, kCsa2Latent, lh, kCsa2Rope, pos,
                   w_.inv_freq, false, tokens, stream);
@@ -314,7 +324,8 @@ void Csa2Layer::project_q_kv(const void* hidden_in, int tokens, const int64_t* p
 void Csa2Layer::indexer_query(const void* hidden_in, int tokens, const int64_t* pos, cudaStream_t stream) {
   const int heads = cfg_.index_heads;
   launch_scale_gemm_grid_bf16(qr_, size_t(cfg_.q_lora), w_.idx_wq_b.payload, w_.idx_wq_b.scales, idx_q_, tokens,
-                              heads * kCsa2IndexDim, cfg_.q_lora, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(), cfg_.dense_mma);
+                              heads * kCsa2IndexDim, cfg_.q_lora, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(),
+                              cfg_.dense_mma, gemm_ws_, gemm_ws_bytes_);
   csa2_rope_apply(idx_q_ + (kCsa2IndexDim - kCsa2Rope), int64_t(heads) * kCsa2IndexDim, kCsa2IndexDim, heads,
                   kCsa2Rope, pos, w_.inv_freq, false, tokens, stream);
   if (cfg_.index_bf16) {
@@ -462,7 +473,8 @@ void Csa2Layer::enqueue_decode(const void* hidden_in, Csa2StatePool& pool, const
         gemm_.matmul(hidden_in, w_.comp_wgate, comp_score_, tokens, kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32,
                      size_t(cfg_.hidden), gemm_ws_, gemm_ws_bytes_, stream);
         csa2_compress128_decode(comp_kv_, comp_score_, req_ids, pos, req_spans, num_requests, w_.comp_ape, w_.comp_norm,
-                                cfg_.eps, pool.tails(w_.tail_ord), latent_, entries_, tokens, tail_snapshots, stream);
+                                cfg_.eps, pool.tails(w_.tail_ord), latent_, entries_, tokens, tail_snapshots,
+                                snap_scratch_, stream);
         csa2_scaled_positions(entries_, ent_pos_, tokens, 128, 0, stream);
       } else if (w_.ratio == 2) {
         gemm_.matmul(hidden_in, w_.comp_wkv, comp_kv_, tokens, kCsa2Latent, cfg_.hidden, DType::BF16, GemmOut::F32,

@@ -389,4 +389,87 @@ DGPP_TEST(mma_gemv_split_k_small_n_sites) {
   cudaFree(act); cudaFree(out); cudaFree(ws);
 }
 
+// Split-K at the small-n bf16 sites (2026-09-28, the DSV4-Flash-0731 decode
+// indexer/compressor projections): with a workspace the bf16 decode forms
+// split the k range across blocks, the same contract as the fp8 ones —
+// oracle, deterministic across launches, m-invariant, the bf16 epilogue
+// bf16(f32), and a cold timing line beside the unsplit form.
+DGPP_TEST(mma_gemv_split_k_bf16_small_n_sites) {
+  void* ws = nullptr;
+  const size_t ws_bytes = 4u << 20;
+  DGPP_CUDA_OK(cudaMalloc(&ws, ws_bytes));
+  for (auto [n, k] : std::vector<std::pair<int, int>>{{64, 4096}, {128, 512}, {256, 4096}, {512, 4096}}) {
+    for (int m : {6, 30}) {
+      const Problem p = make(m, n, k, 7, 7, 0xB165F00Dull + m + n * 7919u + k);
+      Dev d(p);
+      dgpp::launch_mma_gemv_bf16_f32(d.act, p.k, d.w16, d.outf, m, p.n, p.k, 0, nullptr, ws, ws_bytes);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      const std::vector<float> a = fetch_f(d.outf, size_t(m) * p.n);
+      const double err = max_rel_err(p, a, [&](int r, int c) {
+        return dgpp::bf16_bits_to_float(p.w16[size_t(r) * p.k + c]);
+      });
+      require(err < 2e-3, "split-K bf16 [" + std::to_string(n) + " x " + std::to_string(k) + "] m=" +
+                             std::to_string(m) + " vs oracle: " + std::to_string(err));
+      dgpp::launch_mma_gemv_bf16_f32(d.act, p.k, d.w16, d.outf, m, p.n, p.k, 0, nullptr, ws, ws_bytes);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      const std::vector<float> b = fetch_f(d.outf, size_t(m) * p.n);
+      require(std::memcmp(a.data(), b.data(), a.size() * 4) == 0, "split-K bf16: two launches differ");
+      dgpp::launch_mma_gemv_bf16_f32(d.act, p.k, d.w16, d.outf, std::min(m, 30), p.n, p.k, 0, nullptr, ws,
+                                     ws_bytes);
+      const int m2 = std::min(m, 30);
+      const std::vector<float> m16 = fetch_f(d.outf, size_t(m2) * p.n);
+      require(std::memcmp(a.data(), m16.data(), m16.size() * 4) == 0,
+              "split-K bf16: rows differ between m and the shorter batch");
+      dgpp::launch_mma_gemv_bf16_bf16(d.act, p.k, d.w16, d.outb, m, p.n, p.k, 0, nullptr, ws, ws_bytes);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      const std::vector<uint16_t> ob = fetch_b(d.outb, size_t(m) * p.n);
+      for (size_t i = 0; i < ob.size(); ++i)
+        require(ob[i] == dgpp::float_to_bf16_bits(a[i]), "split-K bf16: bf16 epilogue != bf16(f32)");
+      std::printf("[ OK ] mma_gemv split-K bf16 [%d x %d] m=%d: oracle %.3e, deterministic, m-invariant, bf16 == bf16(f32)\n",
+                  n, k, m, err);
+    }
+  }
+  // Cold timing (weights cycled past the 24 MB L2): unsplit vs split, m = 6.
+  cudaEvent_t e0, e1;
+  DGPP_CUDA_OK(cudaEventCreate(&e0));
+  DGPP_CUDA_OK(cudaEventCreate(&e1));
+  uint16_t* act;
+  DGPP_CUDA_OK(cudaMalloc(&act, size_t(32) * 4096 * 2));
+  DGPP_CUDA_OK(cudaMemset(act, 0x3f, size_t(32) * 4096 * 2));
+  float* outf;
+  DGPP_CUDA_OK(cudaMalloc(&outf, size_t(32) * 512 * 4));
+  for (auto [n, k] : std::vector<std::pair<int, int>>{{64, 4096}, {256, 4096}, {512, 4096}}) {
+    const size_t bytes = size_t(n) * k * 2;
+    const int copies = std::min<size_t>(64, (48u << 20) / bytes + 1);
+    std::vector<uint16_t*> w(copies);
+    for (int c = 0; c < copies; ++c) {
+      DGPP_CUDA_OK(cudaMalloc(&w[c], bytes));
+      DGPP_CUDA_OK(cudaMemset(w[c], 0x38, bytes));
+    }
+    float t[2];
+    for (int path = 0; path < 2; ++path) {
+      auto run = [&](int i) {
+        dgpp::launch_mma_gemv_bf16_f32(act, k, w[i], outf, 6, n, k, 0, nullptr, path ? ws : nullptr,
+                                       path ? ws_bytes : 0);
+      };
+      for (int i = 0; i < copies; ++i) run(i);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      const int reps = copies * 3;
+      DGPP_CUDA_OK(cudaEventRecord(e0));
+      for (int i = 0; i < reps; ++i) run(i % copies);
+      DGPP_CUDA_OK(cudaEventRecord(e1));
+      DGPP_CUDA_OK(cudaEventSynchronize(e1));
+      float ms = 0;
+      DGPP_CUDA_OK(cudaEventElapsedTime(&ms, e0, e1));
+      t[path] = ms * 1000.f / reps;
+    }
+    std::printf("[ .. ]   bf16 [%d x %d] m=6 cold: unsplit %7.1f us (%.0f GB/s)  split-K %7.1f us (%.0f GB/s)\n",
+                n, k, t[0], bytes / t[0] / 1e3, t[1], bytes / t[1] / 1e3);
+    for (auto* wp : w) cudaFree(wp);
+  }
+  cudaFree(act);
+  cudaFree(outf);
+  cudaFree(ws);
+}
+
 int main() { return dgpp::test::run_all(); }

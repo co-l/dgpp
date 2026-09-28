@@ -125,6 +125,7 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
   log_memory_ledger("dsv41: loader opened");
   const int H = cfg_.hidden_size;
   globals_ = loader_.load_globals();
+  head_fp8_ = Dsv41LoaderFamily::dense_weights_fp8();
   embed_sharded_ = globals_.embed_vocab_count < cfg_.vocab_size;
   if (embed_sharded_ && boundary == nullptr)
     throw std::invalid_argument("Dsv41Model: a vocab-sharded embedding needs the boundary reducer (world > 1)");
@@ -233,7 +234,8 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
   // The pool and the CSA2 scratch.
   const int64_t slots = max_cache_tokens_;
   pool_.init(pool_shape(cfg_, max_requests_, slots));
-  csa2_scratch_bytes_ = Csa2Layer::scratch_bytes(csa2_cfg_, max_tokens_, slots, max_decode_rows_, kDecodeSplit, kDotBudget);
+  csa2_scratch_bytes_ =
+      Csa2Layer::scratch_bytes(csa2_cfg_, max_tokens_, slots, max_decode_rows_, kDecodeSplit, kDotBudget, max_requests_);
   csa2_scratch_ = dev_alloc<char>(csa2_scratch_bytes_);
   log_memory_ledger("dsv41: pool and scratch");
   // The rotary tables: the window's (theta, no YaRN) and the compressed
@@ -542,7 +544,7 @@ Dsv41EngramLayerWeights Dsv41Model::engram_view(const Dsv41EngramResident& e) co
 void Dsv41Model::build_layer_objects(const Dsv41LayerResident& r) {
   if (!csa2_) {
     csa2_ = std::make_unique<Csa2Layer>(gemm_, csa2_cfg_, max_tokens_, max_cache_tokens_, csa2_scratch_, csa2_scratch_bytes_,
-                                        gemm_ws_, gemm_ws_bytes_, max_decode_rows_, kDecodeSplit, kDotBudget);
+                                        gemm_ws_, gemm_ws_bytes_, max_decode_rows_, kDecodeSplit, kDotBudget, max_requests_);
   }
   csa2_->rebind(csa2_view(r, r.layer), r.layer);
   if (cfg_.is_draft(r.layer)) {
@@ -706,6 +708,20 @@ void Dsv41Model::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos,
   draft_first(req, tokens, d_pos, d_req, T, decode_row, capture, head_rows, batch_requests);
 }
 
+void Dsv41Model::head_gemm(const uint16_t* act, float* logits, int rows, cudaStream_t stream) {
+  const int H = cfg_.hidden_size;
+  if (head_fp8_) {
+    // The head's scale grid is always encode_block128's 128 x 128 (7, 7),
+    // whatever the release's dense fp8 grid (the fixture's is 32 x 32).
+    launch_scale_gemm_grid_f32(act, static_cast<size_t>(H), globals_.lm_head_fp8.payload,
+                               globals_.lm_head_fp8.scales, logits, rows, lm_vocab_count_, H, stream,
+                               static_cast<size_t>(lm_vocab_count_), 7, 7, dense_mma_);
+    return;
+  }
+  gemm_.matmul(act, globals_.lm_head, logits, rows, lm_vocab_count_, H, DType::BF16, GemmOut::F32,
+               static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream);
+}
+
 void Dsv41Model::draft_first(int req, const int64_t* tokens, const int64_t* d_pos, const int32_t* d_req, int T,
                              bool decode_row, bool capture, int head_rows, int batch_requests) {
   const int H = cfg_.hidden_size;
@@ -791,8 +807,7 @@ void Dsv41Model::draft_first(int req, const int64_t* tokens, const int64_t* d_po
   } else
     launch_mhc_collapse_normed(cur_, pre_cur_, nullptr, eps, collapsed_, nullptr, mhc_cfg_, rows, stream_);
   csa2_rmsnorm_bf16(collapsed_, H, dl.norm, h_, H, rows, H, eps, stream_);
-  gemm_.matmul(h_, globals_.lm_head, base_logits_, rows, lm_vocab_count_, H, DType::BF16, GemmOut::F32,
-               static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
+  head_gemm(h_, base_logits_, rows, stream_);
   // ---- block row 0, biased by the Markov head of `next`, into the head rows ----
   const int rows_out = head_rows / groups;
   dsv41_dspark_markov_bias(base_logits_, static_cast<int64_t>(block) * lm_vocab_count_, 0, dl.markov_embed, dl.markov_head,
@@ -1303,9 +1318,8 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
                                  stream_);
     csa2_rmsnorm_bf16(collapsed_ + static_cast<size_t>(head_off) * H, H, globals_.final_norm,
                       h_ + static_cast<size_t>(head_off) * H, H, head_rows, H, cfg_.rms_norm_eps, stream_);
-    gemm_.matmul(h_ + static_cast<size_t>(head_off) * H, globals_.lm_head,
-                 logits_ + static_cast<size_t>(head_off) * lm_vocab_count_, head_rows, lm_vocab_count_, H, DType::BF16,
-                 GemmOut::F32, static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
+    head_gemm(h_ + static_cast<size_t>(head_off) * H,
+              logits_ + static_cast<size_t>(head_off) * lm_vocab_count_, head_rows, stream_);
     if (group && !dec_row0.empty()) {
       // The packed decoder's last row of each span into the row the
       // session core reads (the span's last prompt row), last span first:

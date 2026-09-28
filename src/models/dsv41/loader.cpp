@@ -1,5 +1,7 @@
 #include "models/dsv41/loader.hpp"
 
+#include "loaders/fp8_quant.hpp"
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -529,6 +531,12 @@ bool Dsv41LoaderFamily::digest_included(const Dsv41ExpectedTensor& e) {
   return is_replicated(e);
 }
 
+// The dense stack's form (engine.dense_weights): off by default, the
+// checkpoint's BF16 head; on, the head encoded to block FP8 at load.
+static bool g_dsv41_dense_weights_fp8 = false;
+void Dsv41LoaderFamily::set_dense_weights_fp8(bool on) { g_dsv41_dense_weights_fp8 = on; }
+bool Dsv41LoaderFamily::dense_weights_fp8() { return g_dsv41_dense_weights_fp8; }
+
 size_t Dsv41LoaderFamily::globals_bytes(const Dsv41TextConfig& cfg, int rank, int world,
                                         LoaderHeadSharding head) {
   const size_t H = static_cast<size_t>(cfg.hidden_size);
@@ -536,7 +544,12 @@ size_t Dsv41LoaderFamily::globals_bytes(const Dsv41TextConfig& cfg, int rank, in
   size_t b = 0;
   b += align_up_256(static_cast<size_t>(geo.embed_vocab_count) * H * 2);
   b += align_up_256(H * 2);
-  b += align_up_256(static_cast<size_t>(geo.lm_vocab_count) * H * 2);
+  if (g_dsv41_dense_weights_fp8)
+    b += align_up_256(static_cast<size_t>(geo.lm_vocab_count) * H) +
+         align_up_256(static_cast<size_t>(fp8_quant::scale_rows(static_cast<int64_t>(geo.lm_vocab_count))) *
+                      fp8_quant::scale_cols(static_cast<int64_t>(H)) * 4);
+  else
+    b += align_up_256(static_cast<size_t>(geo.lm_vocab_count) * H * 2);
   if (cfg.variant == Dsv41Variant::V4) {
     const int64_t fn_bytes = static_cast<int64_t>(cfg.hc_head_rows()) * 4 * H * 2;  // bf16 resident
     b += align_up_256(static_cast<size_t>(fn_bytes)) + align_up_256(static_cast<size_t>(cfg.hc_head_rows()) * 4) + align_up_256(4);
@@ -579,11 +592,29 @@ void Dsv41LoaderFamily::build_globals(const Dsv41TextConfig& cfg, const Dsv41Loc
   }
   const TensorInfo& t = lookup("head.weight");
   const int begin = geo.lm_vocab_begin, count = geo.lm_vocab_count;
-  uint16_t* dst = static_cast<uint16_t*>(bump.alloc(static_cast<size_t>(count) * row_bytes));
-  std::memcpy(bump.host(dst), static_cast<const uint8_t*>(t.data) + static_cast<size_t>(begin) * row_bytes,
-              static_cast<size_t>(count) * row_bytes);
-  source_bytes += static_cast<size_t>(count) * row_bytes;
-  if (head == LoaderHeadSharding::Full) verbatim_bytes += static_cast<size_t>(count) * row_bytes;
+  if (g_dsv41_dense_weights_fp8) {
+    const int64_t H = cfg.hidden_size;
+    GlmQuantMatrix q;
+    q.rows = count;
+    q.cols = H;
+    q.payload = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(count) * H));
+    q.scales = static_cast<const float*>(bump.alloc(
+        static_cast<size_t>(fp8_quant::scale_rows(static_cast<int64_t>(count))) *
+        fp8_quant::scale_cols(static_cast<int64_t>(H)) * 4));
+    fp8_quant::encode_block128(static_cast<const uint16_t*>(t.data) + static_cast<size_t>(begin) * H,
+                               static_cast<size_t>(H), count, H,
+                               bump.host(const_cast<uint8_t*>(q.payload)),
+                               bump.host(const_cast<float*>(q.scales)));
+    source_bytes += static_cast<size_t>(count) * row_bytes;
+    out.lm_head_fp8 = q;
+  } else {
+    uint16_t* dst = static_cast<uint16_t*>(bump.alloc(static_cast<size_t>(count) * row_bytes));
+    std::memcpy(bump.host(dst), static_cast<const uint8_t*>(t.data) + static_cast<size_t>(begin) * row_bytes,
+                static_cast<size_t>(count) * row_bytes);
+    source_bytes += static_cast<size_t>(count) * row_bytes;
+    if (head == LoaderHeadSharding::Full) verbatim_bytes += static_cast<size_t>(count) * row_bytes;
+    out.lm_head = dst;
+  }
   if (cfg.variant == Dsv41Variant::V4) {
     const TensorInfo& hf = lookup("hc_head_fn");
     const float* hsrc = static_cast<const float*>(hf.data);
@@ -606,7 +637,6 @@ void Dsv41LoaderFamily::build_globals(const Dsv41TextConfig& cfg, const Dsv41Loc
     source_bytes += hf.nbytes() + base_bytes + 4;
     verbatim_bytes += hf.nbytes() + base_bytes + 4;
   }
-  out.lm_head = dst;
   out.lm_vocab_begin = begin;
   out.lm_vocab_count = count;
 }

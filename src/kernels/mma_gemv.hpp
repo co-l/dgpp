@@ -58,13 +58,15 @@ void launch_mma_gemv_fp8_f32(const uint16_t* act, size_t act_stride, const uint8
                              const float* scales, float* out, int m, int n, int k,
                              size_t out_stride, int rs, int cs, cudaStream_t stream,
                              void* ws = nullptr, size_t ws_bytes = 0);
-// bf16 weights (the lm head); out bf16 or f32.
+// bf16 weights (the lm head, the small dense sites); out bf16 or f32. The
+// ws pair rides the fp8 pair's split-K contract (2026-09-28): a small n
+// under-fills the grid, and a workspace splits the k range across blocks.
 void launch_mma_gemv_bf16_bf16(const uint16_t* act, size_t act_stride, const uint16_t* w,
                                uint16_t* out, int m, int n, int k, size_t out_stride,
-                               cudaStream_t stream);
+                               cudaStream_t stream, void* ws = nullptr, size_t ws_bytes = 0);
 void launch_mma_gemv_bf16_f32(const uint16_t* act, size_t act_stride, const uint16_t* w,
                               float* out, int m, int n, int k, size_t out_stride,
-                              cudaStream_t stream);
+                              cudaStream_t stream, void* ws = nullptr, size_t ws_bytes = 0);
 // The shape the kernel takes (k a multiple of 16, aligned pointers, m in range).
 bool mma_gemv_shape_ok(const void* w, const void* act, size_t act_stride, int m, int k);
 

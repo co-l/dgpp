@@ -1673,6 +1673,7 @@ int main(int argc, char** argv) {
   // The DeepSeek-V4.1 prefill mode: every model built from here on takes it.
   dgpp::Dsv41Model::set_default_prefill_bounded(prefill == "bounded");
   dgpp::QwenLayerStream::set_dense_weights_fp8(dense_weights == "fp8");
+  dgpp::Dsv41LoaderFamily::set_dense_weights_fp8(dense_weights == "fp8");
   if (mtp_expert_format != "fp8" && mtp_expert_format != "bf16_fused") {
     DGPP_LOG_ERROR("--mtp-expert-format must be fp8 or bf16_fused, got '{}'", mtp_expert_format);
     return 2;
@@ -1886,8 +1887,9 @@ int main(int argc, char** argv) {
     if (std::string(family->name()) != "qwen4_exp" && ngram_table != "resident")
       DGPP_LOG_WARN("serve: --ngram-table {} applies to the Qwen n-gram table only; the {} family has none",
                     ngram_table, family->name());
-    if (std::string(family->name()) != "qwen4_exp" && dense_weights != "checkpoint")
-      DGPP_LOG_WARN("serve: --dense-weights {} applies to the Qwen dense stack only; the {} family loads as shipped",
+    if (std::string(family->name()) != "qwen4_exp" && std::string(family->name()) != "deepseek_v41" &&
+        dense_weights != "checkpoint")
+      DGPP_LOG_WARN("serve: --dense-weights {} applies to the Qwen dense stack and the DeepSeek-V4.1 head only; the {} family loads as shipped",
                     dense_weights, family->name());
     if (std::string(family->name()) != "qwen4_exp" && mtp_expert_format != "fp8")
       DGPP_LOG_WARN("serve: --mtp-expert-format {} applies to the Qwen draft experts only; the {} family loads as shipped",

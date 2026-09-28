@@ -56,6 +56,10 @@ __global__ void block_rows_kernel(const int64_t* __restrict__ step_pos, const in
 
 constexpr int kMaxRank = 512;
 
+// Warp-per-row GEMV: lane `lig` owns a 16-byte (8-element) slice of the
+// row's rank, the dot is its FMAs plus the fixed xor tree across the row's
+// lane group (rank a multiple of 8, <= 512: one slice per lane at
+// rank <= 256, two at 512). The e-vector is the shared form's.
 __global__ void markov_bias_kernel(const float* __restrict__ base, int64_t base_group_stride, int block_row,
                                    const uint16_t* __restrict__ markov_embed, const uint16_t* __restrict__ markov_head,
                                    int rank, int vocab_begin, int count, const int64_t* __restrict__ tok,
@@ -67,16 +71,37 @@ __global__ void markov_bias_kernel(const float* __restrict__ base, int64_t base_
   for (int r = threadIdx.x; r < rank; r += blockDim.x)
     e[r] = t < 0 ? 0.f : bf16_bits_to_float(markov_embed[static_cast<size_t>(t) * rank + r]);
   __syncthreads();
-  const int v = blockIdx.x * blockDim.x + threadIdx.x;
-  if (v >= count) return;
-  const uint16_t* h = markov_head + static_cast<size_t>(vocab_begin + v) * rank;
+  const int lpr = rank < 256 ? rank / 8 : 32;  // lanes per row (a power of two)
+  const int chunks = rank / (lpr * 8);         // 8-element slices per lane (1 or 2)
+  const int rows_per_warp = 32 / lpr;
+  const int row = blockIdx.x * (8 * rows_per_warp) + (threadIdx.x / 32) * rows_per_warp +
+                  (threadIdx.x % 32) / lpr;
+  if (row >= count) return;
+  const int lig = threadIdx.x % lpr;
+  const uint16_t* h = markov_head + static_cast<size_t>(vocab_begin + row) * rank + lig * 8;
   float acc = 0.f;
-  if (t >= 0)
-    for (int r = 0; r < rank; ++r) acc = fmaf(e[r], bf16_bits_to_float(h[r]), acc);
-  const float b = base[static_cast<size_t>(g) * base_group_stride + static_cast<size_t>(block_row) * count + v];
+  if (t >= 0) {
+#pragma unroll
+    for (int ch = 0; ch < 2; ++ch) {
+      if (ch >= chunks) break;
+      const uint4 w = *reinterpret_cast<const uint4*>(h + static_cast<size_t>(ch) * lpr * 8);
+      const uint32_t ws[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const uint16_t p0 = static_cast<uint16_t>(ws[q] & 0xFFFFu);
+        const uint16_t p1 = static_cast<uint16_t>(ws[q] >> 16);
+        const int r0 = ch * lpr * 8 + lig * 8 + 2 * q;
+        acc = fmaf(e[r0], bf16_bits_to_float(p0), acc);
+        acc = fmaf(e[r0 + 1], bf16_bits_to_float(p1), acc);
+      }
+    }
+    for (int off = lpr / 2; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+  }
+  const float b = base[static_cast<size_t>(g) * base_group_stride + static_cast<size_t>(block_row) * count + row];
   const float val = b + acc;
-  float* o = out + static_cast<size_t>(g) * out_group_stride + v;
-  for (int j = 0; j < rows_out; ++j) o[static_cast<size_t>(j) * count] = val;
+  float* o = out + static_cast<size_t>(g) * out_group_stride + row;
+  if (lig == 0)
+    for (int j = 0; j < rows_out; ++j) o[static_cast<size_t>(j) * count] = val;
 }
 
 __global__ void confidence_kernel(const uint16_t* __restrict__ x, int64_t x_group_stride, int block_row, int hidden,
@@ -133,7 +158,11 @@ void dsv41_dspark_markov_bias(const float* base, int64_t base_group_stride, int 
   if (!base || !markov_embed || !markov_head || !tok || !out) throw std::invalid_argument("dsv41_dspark_markov_bias: null buffer");
   if (rank <= 0 || rank > kMaxRank || count <= 0 || groups <= 0 || rows_out <= 0 || block_row < 0 || tok_stride <= 0)
     throw std::invalid_argument("dsv41_dspark_markov_bias: shape");
-  const dim3 grid(static_cast<unsigned>((count + 255) / 256), static_cast<unsigned>(groups));
+  if (rank % 8 != 0 || (rank < 256 && (rank / 8) & (rank / 8 - 1)) != 0)
+    throw std::invalid_argument("dsv41_dspark_markov_bias: rank must be 8 x a power of two");
+  const int lpr = rank < 256 ? rank / 8 : 32;
+  const int rows_per_block = 8 * (32 / lpr);
+  const dim3 grid(static_cast<unsigned>((count + rows_per_block - 1) / rows_per_block), static_cast<unsigned>(groups));
   markov_bias_kernel<<<grid, 256, 0, stream>>>(base, base_group_stride, block_row, markov_embed, markov_head, rank,
                                                vocab_begin, count, tok, tok_stride, out, out_group_stride, rows_out);
   DGPP_CUDA_OK(cudaGetLastError());

@@ -549,13 +549,14 @@ void launch_mma_gemv_fp8_f32(const uint16_t* act, size_t act_stride, const uint8
 }
 void launch_mma_gemv_bf16_bf16(const uint16_t* act, size_t act_stride, const uint16_t* w,
                                uint16_t* out, int m, int n, int k, size_t out_stride,
-                               cudaStream_t stream) {
-  launch<false, uint16_t>(act, act_stride, w, nullptr, out, m, n, k, out_stride, 7, 7, stream);
+                               cudaStream_t stream, void* ws, size_t ws_bytes) {
+  launch<false, uint16_t>(act, act_stride, w, nullptr, out, m, n, k, out_stride, 7, 7, stream, ws,
+                          ws_bytes);
 }
 void launch_mma_gemv_bf16_f32(const uint16_t* act, size_t act_stride, const uint16_t* w,
                               float* out, int m, int n, int k, size_t out_stride,
-                              cudaStream_t stream) {
-  launch<false, float>(act, act_stride, w, nullptr, out, m, n, k, out_stride, 7, 7, stream);
+                              cudaStream_t stream, void* ws, size_t ws_bytes) {
+  launch<false, float>(act, act_stride, w, nullptr, out, m, n, k, out_stride, 7, 7, stream, ws, ws_bytes);
 }
 
 }  // namespace dgpp

@@ -150,6 +150,7 @@ struct Dsv41GlobalsResident {
   int embed_vocab_count = 0;
   const uint16_t* final_norm = nullptr;  // bf16 [hidden]
   const uint16_t* lm_head = nullptr;     // bf16 [lm_vocab_count, hidden]
+  GlmQuantMatrix lm_head_fp8;            // the head's block-FP8 form (dense_weights fp8)
   int lm_vocab_begin = 0;
   int lm_vocab_count = 0;
   // The V4-Flash-0731 head collapse (hc_head over the streams).
@@ -250,6 +251,10 @@ struct Dsv41LoaderFamily {
   static void check_sources(const Config&, const LoaderTensorMap&) {}
   static bool digest_included(const Expected& e);
   static bool discard_after_pack(const Expected&) { return false; }
+  // The dense stack's form (engine.dense_weights = "fp8"): the lm head
+  // encoded to block FP8 at load. Set before the plan and the load.
+  static void set_dense_weights_fp8(bool on);
+  static bool dense_weights_fp8();
   static void build_globals(const Config& c, const Geometry& geo, const LoaderTensorMap& tensors,
                             LayerBump& bump, GlobalsResident& out, uint64_t& source_bytes,
                             uint64_t& verbatim_bytes, LoaderHeadSharding head);

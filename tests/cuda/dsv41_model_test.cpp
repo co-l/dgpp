@@ -21,6 +21,7 @@
 #include "common/test.hpp"
 #include "dsv41_fixture.hpp"
 #include "kda_test_helpers.hpp"
+#include "models/dsv41/loader.hpp"
 #include "models/dsv41/model.hpp"
 
 namespace {
@@ -431,6 +432,41 @@ DGPP_TEST(dsv41_model_dspark_draft_rows_and_chain_at_world_1) {
   const auto dc1 = model.session_draft_chain(0, argmax(d1.logits.data(), size_t(V)), 0, true, false);
   for (const float v : dc1.logits) require(std::isfinite(v), "second chain finite");
   model.session_close(0);
+}
+
+// engine.dense_weights = "fp8" (the DeepSeek-V4.1 family): the lm head is
+// encoded to block FP8 at load (128 x 128 grid, the 0731 release's dense
+// form), and the head GEMM takes the fp8 decode form. The prefill's last
+// row and the first decode step stay inside the fp8 quantization budget of
+// the bf16 head's logits (the weight noise, not a kernel order change).
+DGPP_TEST(dsv41_model_head_fp8_logits_within_the_fp8_budget) {
+  require(!dgpp::Dsv41LoaderFamily::dense_weights_fp8(), "the dense stack is the checkpoint's by default");
+  const Fixture fx = make_fixture();
+  const int V = fx.cfg.vocab_size;
+  const auto prompt = tokens_of(0xB1, 19, V);
+  std::vector<float> ref_prefill, ref_step;
+  int tok = -1;
+  {
+    dgpp::Dsv41Model m(fx.cfg, fx.dir, 96, 512, dgpp::Dsv41Residency::Streaming, nullptr, 0, 1, 1, /*mtp=*/false, 8);
+    const auto o = m.session_prefill(0, prompt);
+    ref_prefill = o.logits;
+    tok = argmax(o.logits.data(), size_t(V));
+    ref_step = m.session_step(0, tok).logits;
+    m.session_close(0);
+  }
+  {
+    dgpp::Dsv41LoaderFamily::set_dense_weights_fp8(true);
+    struct Reset { ~Reset() { dgpp::Dsv41LoaderFamily::set_dense_weights_fp8(false); } } reset;
+    dgpp::Dsv41Model m(fx.cfg, fx.dir, 96, 512, dgpp::Dsv41Residency::Streaming, nullptr, 0, 1, 1, /*mtp=*/false, 8);
+    require(m.head_fp8(), "the model takes the FP8 head when the family flag is on");
+    const auto o = m.session_prefill(0, prompt);
+    const double prefill_err = rel_l2(o.logits.data(), ref_prefill.data(), ref_prefill.size());
+    require(prefill_err < 5e-2, "fp8 head prefill logits outside the fp8 budget: " + std::to_string(prefill_err));
+    const auto st = m.session_step(0, tok);
+    const double step_err = rel_l2(st.logits.data(), ref_step.data(), ref_step.size());
+    require(step_err < 5e-2, "fp8 head decode logits outside the fp8 budget: " + std::to_string(step_err));
+    std::printf("[ OK ] head FP8 (128 x 128 grid at load): prefill rel_l2 %.2e, decode rel_l2 %.2e\n", prefill_err, step_err);
+  }
 }
 
 int main() { return dgpp::test::run_all(); }
