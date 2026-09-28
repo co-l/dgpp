@@ -229,7 +229,7 @@ int main(int argc, char** argv) {
     // Diagnostic: the unchanged prefill streaming selector over precomputed
     // scores. This is not a stage of the new decoder.
     auto select_only = [&] {
-      dgpp::csa2_select_rows_prefill(logits.p, stride, dp.p, rows, select_k, candidates.p,
+      dgpp::csa2_select_rows_prefill(logits.p, stride, dp.p, rows, 32, select_k, candidates.p,
                                      candidate_blocks, candidate_counts.p, block_size, top.p,
                                      counts.p, stream);
     };
