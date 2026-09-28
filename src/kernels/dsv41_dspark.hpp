@@ -52,4 +52,18 @@ void dsv41_dspark_confidence(const uint16_t* x, int64_t x_group_stride, int bloc
                              const uint16_t* markov_embed, int rank, const int64_t* tok, int tok_stride,
                              const float* w, int groups, float* conf_out, int conf_stride, cudaStream_t stream);
 
+// The V4-Flash-0731 learned head collapse (the checkpoint reference's
+// `hc_head`, vllm's `hc_head_fused_kernel_tilelang`), over the hc_mult
+// residual streams BEFORE the final norm:
+//   rms   = rsqrt(mean over the flat (hc_mult * hidden) row of x^2 + eps)
+//   mix_m = dot(x[t, :], fn[m, :]) * rms      (the whole flat row, vllm's F.linear)
+//   pre_m = sigmoid(mix_m * scale + base[m]) + hc_eps
+//   out[t, d] = bf16(sum_m pre_m * x[t, m, d])
+// x is bf16 [rows, hc_mult * hidden], fn bf16 [hc_mult, hc_mult * hidden],
+// base f32 [hc_mult], scale f32 [1]; fp32 accumulation, one final rounding.
+// One block per row; graph-capturable.
+void dsv41_hc_head_bf16(const uint16_t* x, int hc_mult, int hidden, int rows, const uint16_t* fn,
+                        const float* scale, const float* base, float eps, float hc_eps, uint16_t* out,
+                        cudaStream_t stream);
+
 }  // namespace dgpp

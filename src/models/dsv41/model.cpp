@@ -777,12 +777,19 @@ void Dsv41Model::draft_first(int req, const int64_t* tokens, const int64_t* d_po
     enqueue_layer(r, cfg_.num_hidden_layers + s, rows, wr);
   }
   debug_capture_ = false;
-  // ---- the head over the block: hc_pre with the last stage's pre, the draft's
-  // norm, the shared lm head -> base_logits_ [rows, vocab slice] --------------
+  // ---- the head over the block: the collapse (hc_pre with the last
+  // stage's pre on V4.1, the learned hc_head on V4-Flash-0731), the
+  // draft's norm, the shared lm head -> base_logits_ [rows, vocab slice] --
   const Dsv41DraftResident& dl = draft_stage(stages - 1);
   if (!dl.norm || !dl.markov_embed || !dl.markov_head || !dl.confidence)
     throw std::runtime_error("mtp_run_rows: the DSpark head tensors are unbound");
-  launch_mhc_collapse_normed(cur_, pre_cur_, nullptr, eps, collapsed_, nullptr, mhc_cfg_, rows, stream_);
+  if (cfg_.variant == Dsv41Variant::V4) {
+    if (!dl.hc_head_fn || !dl.hc_head_base || !dl.hc_head_scale)
+      throw std::runtime_error("mtp_run_rows: the DSpark head collapse is unbound");
+    dsv41_hc_head_bf16(cur_, 4, H, rows, dl.hc_head_fn, dl.hc_head_scale, dl.hc_head_base, eps, cfg_.hc_eps,
+                       collapsed_, stream_);
+  } else
+    launch_mhc_collapse_normed(cur_, pre_cur_, nullptr, eps, collapsed_, nullptr, mhc_cfg_, rows, stream_);
   csa2_rmsnorm_bf16(collapsed_, H, dl.norm, h_, H, rows, H, eps, stream_);
   gemm_.matmul(h_, globals_.lm_head, base_logits_, rows, lm_vocab_count_, H, DType::BF16, GemmOut::F32,
                static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
@@ -894,9 +901,11 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
     fold(kv, T, 5 * H, rows.capture);
     engram_->gate(ew, cur_, kv, T, stream_);
   }
-  // DSpark: the target layers' attention INPUT, its stream mean, per row
-  // into [h_t1 | h_t2 | h_t3] (the reference reads it before the layer).
-  if (mtp_) {
+  // DSpark: the target layers' stream mean, per row into [h_t1 | h_t2 |
+  // h_t3] — the V4.1 reference reads the attention INPUT (before the
+  // layer, here); the V4-Flash-0731 reference reads the layer OUTPUT
+  // (captured at the layer's end below).
+  if (mtp_ && !cfg_.dspark_capture_post_layer()) {
     const int ord = target_ordinal(layer);
     if (ord >= 0)
       dsv41_stream_mean_bf16(cur_, 4, H, T, main_hidden_ + static_cast<size_t>(ord) * H,
@@ -961,6 +970,14 @@ void Dsv41Model::enqueue_layer(const Dsv41LayerResident& r, int layer, int T, co
   if (debug_capture_) cap.ffn_out = grab(ffn_out, static_cast<size_t>(T) * H);
   stream_update(ffn_out, T);
   if (debug_capture_) debug_sites_.push_back(std::move(cap));
+  // The V4-Flash-0731 DSpark target hidden is the layer OUTPUT (the
+  // reference reads it after the layer, its stream mean).
+  if (mtp_ && cfg_.dspark_capture_post_layer()) {
+    const int ord = target_ordinal(layer);
+    if (ord >= 0)
+      dsv41_stream_mean_bf16(cur_, 4, H, T, main_hidden_ + static_cast<size_t>(ord) * H,
+                             static_cast<int64_t>(targets_) * H, stream_);
+  }
 }
 
 Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
@@ -1272,9 +1289,18 @@ Dsv41Model::Outputs Dsv41Model::run_rows(const RowRun& run) {
       DGPP_CUDA_OK(cudaMemsetAsync(logits_, 0xFF, static_cast<size_t>(head_off) * lm_vocab_count_ * sizeof(float), stream_));
       DGPP_CUDA_OK(cudaMemsetAsync(h_, 0xFF, static_cast<size_t>(head_off) * H * 2, stream_));
     }
-    launch_mhc_collapse_normed(cur_ + static_cast<size_t>(head_skip) * 4 * H,
-                               pre_cur_ + static_cast<size_t>(head_skip) * 4, nullptr, cfg_.rms_norm_eps,
-                               collapsed_ + static_cast<size_t>(head_off) * H, nullptr, mhc_cfg_, head_rows, stream_);
+    // The V4-Flash-0731 head collapse is the learned hc_head (the
+    // reference's Transformer: hc_head over the four residual streams
+    // before the final norm); V4.1 keeps the last site's pre collapse.
+    if (cfg_.variant == Dsv41Variant::V4)
+      dsv41_hc_head_bf16(cur_ + static_cast<size_t>(head_skip) * 4 * H, 4, H, head_rows, globals_.hc_head_fn,
+                         globals_.hc_head_scale, globals_.hc_head_base, cfg_.rms_norm_eps, cfg_.hc_eps,
+                         collapsed_ + static_cast<size_t>(head_off) * H, stream_);
+    else
+      launch_mhc_collapse_normed(cur_ + static_cast<size_t>(head_skip) * 4 * H,
+                                 pre_cur_ + static_cast<size_t>(head_skip) * 4, nullptr, cfg_.rms_norm_eps,
+                                 collapsed_ + static_cast<size_t>(head_off) * H, nullptr, mhc_cfg_, head_rows,
+                                 stream_);
     csa2_rmsnorm_bf16(collapsed_ + static_cast<size_t>(head_off) * H, H, globals_.final_norm,
                       h_ + static_cast<size_t>(head_off) * H, H, head_rows, H, cfg_.rms_norm_eps, stream_);
     gemm_.matmul(h_ + static_cast<size_t>(head_off) * H, globals_.lm_head,

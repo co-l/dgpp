@@ -243,3 +243,15 @@ DGPP_TEST(dsv41_config_reads_the_landed_checkpoint) {
     return;
   }
 }
+
+DGPP_TEST(dsv41_config_dspark_capture_point_is_variant_gated) {
+  // The V4.1 reference reads the attention INPUT of the target layers
+  // ("not their output"); the V4-Flash-0731 reference reads the layer
+  // OUTPUT. The capture point is a per-variant fact, not a per-config knob.
+  const dgpp::Dsv41TextConfig v41 = parse(config_json());
+  require(v41.variant == dgpp::Dsv41Variant::V41, "fixture is V4.1");
+  require(!v41.dspark_capture_post_layer(), "V4.1 reads the attention input");
+  dgpp::Dsv41TextConfig v4 = v41;
+  v4.variant = dgpp::Dsv41Variant::V4;
+  require(v4.dspark_capture_post_layer(), "V4-Flash-0731 reads the layer output");
+}

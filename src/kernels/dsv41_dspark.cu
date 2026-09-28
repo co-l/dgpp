@@ -150,4 +150,74 @@ void dsv41_dspark_confidence(const uint16_t* x, int64_t x_group_stride, int bloc
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
+template <int M>
+__global__ void hc_head_kernel(const uint16_t* __restrict__ x, int hidden, int rows, const uint16_t* __restrict__ fn,
+                               const float* __restrict__ scale, const float* __restrict__ base, float eps, float hc_eps,
+                               uint16_t* __restrict__ out) {
+  const int t = blockIdx.x;
+  if (t >= rows) return;
+  const int W = M * hidden;
+  const uint16_t* xr = x + static_cast<size_t>(t) * static_cast<size_t>(W);
+  __shared__ float red[32];
+  {
+    float ss = 0.f;
+    for (int d = threadIdx.x; d < W; d += blockDim.x) {
+      const float v = bf16_bits_to_float(xr[d]);
+      ss = fmaf(v, v, ss);
+    }
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+      float v = (static_cast<int>(blockDim.x) / 32 > threadIdx.x) ? red[threadIdx.x] : 0.f;
+      for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+      if (threadIdx.x == 0) red[0] = v;
+    }
+    __syncthreads();
+    const float rms = rsqrtf(red[0] / W + eps);
+    __syncthreads();
+    float pre[M];
+    #pragma unroll
+    for (int m = 0; m < M; ++m) {
+      const uint16_t* w = fn + static_cast<size_t>(m) * static_cast<size_t>(W);
+      float acc = 0.f;
+      for (int d = threadIdx.x; d < W; d += blockDim.x)
+        acc = fmaf(bf16_bits_to_float(xr[d]), bf16_bits_to_float(w[d]), acc);
+      for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
+      if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
+      __syncthreads();
+      if (threadIdx.x < 32) {
+        float v = (static_cast<int>(blockDim.x) / 32 > threadIdx.x) ? red[threadIdx.x] : 0.f;
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+        if (threadIdx.x == 0) red[0] = v;
+      }
+      __syncthreads();
+      pre[m] = 1.f / (1.f + expf(-(red[0] * rms * scale[0] + base[m]))) + hc_eps;
+      // Barrier before the next m clobbers red[]: pre[m] just read red[0],
+      // and the leaders' next-m store must not race a lagging read.
+      __syncthreads();
+    }
+    for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
+      float acc = 0.f;
+      #pragma unroll
+      for (int m = 0; m < M; ++m) acc = fmaf(pre[m], bf16_bits_to_float(xr[static_cast<size_t>(m) * hidden + d]), acc);
+      out[static_cast<size_t>(t) * hidden + d] = float_to_bf16_bits(acc);
+    }
+  }
+}
+
+void dsv41_hc_head_bf16(const uint16_t* x, int hc_mult, int hidden, int rows, const uint16_t* fn, const float* scale,
+                        const float* base, float eps, float hc_eps, uint16_t* out, cudaStream_t stream) {
+  if (!x || !fn || !scale || !base || !out) throw std::invalid_argument("dsv41_hc_head_bf16: null buffer");
+  if (hc_mult <= 0 || hc_mult > 8 || hidden <= 0 || rows <= 0) throw std::invalid_argument("dsv41_hc_head_bf16: shape");
+  switch (hc_mult) {
+    case 1: hc_head_kernel<1><<<static_cast<unsigned>(rows), 256, 0, stream>>>(x, hidden, rows, fn, scale, base, eps, hc_eps, out); break;
+    case 2: hc_head_kernel<2><<<static_cast<unsigned>(rows), 256, 0, stream>>>(x, hidden, rows, fn, scale, base, eps, hc_eps, out); break;
+    case 4: hc_head_kernel<4><<<static_cast<unsigned>(rows), 256, 0, stream>>>(x, hidden, rows, fn, scale, base, eps, hc_eps, out); break;
+    case 8: hc_head_kernel<8><<<static_cast<unsigned>(rows), 256, 0, stream>>>(x, hidden, rows, fn, scale, base, eps, hc_eps, out); break;
+    default: throw std::invalid_argument("dsv41_hc_head_bf16: hc_mult must be 1, 2, 4 or 8");
+  }
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
 }  // namespace dgpp

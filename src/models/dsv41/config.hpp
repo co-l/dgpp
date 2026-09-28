@@ -202,6 +202,10 @@ struct Dsv41TextConfig {
   int engram_rows_per_layer() const { return (engram_max_ngram_size - 1) * engram_n_heads; }
   int engram_width() const { return engram_rows_per_layer() * engram_head_dim; }
   bool is_dspark_target(int l) const;
+  // The DSpark target hidden: the V4.1 reference reads the attention INPUT
+  // of the target layers, the V4-Flash-0731 reference their OUTPUT — the
+  // capture point is a variant fact, not a config knob.
+  bool dspark_capture_post_layer() const { return variant == Dsv41Variant::V4; }
   // The 0731 hash-routed prefix: layer l picks experts from the tid2eid table.
   bool is_hash_layer(int l) const { return l >= 0 && l < num_hash_layers; }
   bool has_tid2eid() const { return num_hash_layers > 0; }

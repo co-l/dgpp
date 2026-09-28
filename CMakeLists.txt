@@ -1077,6 +1077,12 @@ target_link_libraries(dsv41_engram_test PRIVATE dgpp_kernels CUDA::cudart Thread
 dgpp_set_common(dsv41_engram_test)
 add_test(NAME dsv41_engram_test COMMAND dsv41_engram_test)
 
+add_executable(dsv41_hc_head_test tests/cuda/dsv41_hc_head_test.cu)
+target_include_directories(dsv41_hc_head_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
+target_link_libraries(dsv41_hc_head_test PRIVATE dgpp_kernels CUDA::cudart Threads::Threads)
+dgpp_set_common(dsv41_hc_head_test)
+add_test(NAME dsv41_hc_head_test COMMAND dsv41_hc_head_test)
+
 add_executable(qwen_moe_test tests/cuda/qwen_moe_test.cu)
 target_include_directories(qwen_moe_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda)
 target_link_libraries(qwen_moe_test PRIVATE dgpp_models_qwen_layers dgpp_models_kda CUDA::cudart Threads::Threads)
