@@ -712,8 +712,16 @@ void Csa2Layer::enqueue_prefill(const void* hidden_in, Csa2StatePool& pool, int 
           dsa_gather_index_pools(pool.block_tables() + size_t(req) * pool.total_blocks(), epb, pool.index_k(ord),
                                  pool.index_scale(ord), n_gather, gather_k_, gather_scale_, kCsa2IndexDim, stream);
       }
-      for (int row0 = 0; row0 < tokens; row0 += tile_cap_) {
-        const int rows = std::min(tile_cap_, tokens - row0);
+      // The tile's rows at the live context: the dot workspace spans
+      // tile_cap_ rows across the pool's horizon, which at padded_n entries
+      // is tile_cap_ * max_entries_ / padded_n rows (tile_cap_ alone is the
+      // horizon's worst case and tiles the prefill one row at a time).
+      const int tile =
+          padded_n > 0
+              ? int(std::min<int64_t>(tokens, int64_t(tile_cap_) * (max_entries_ / padded_n)))
+              : std::min(tile_cap_, tokens);
+      for (int row0 = 0; row0 < tokens; row0 += tile) {
+        const int rows = std::min(tile, tokens - row0);
         if (padded_n > 0) {
           if (cfg_.index_bf16) {
             gemm_.matmul(idx_q_ + size_t(row0) * cfg_.index_heads * kCsa2IndexDim, gather_k_, dot_, rows * cfg_.index_heads,
@@ -742,7 +750,7 @@ void Csa2Layer::enqueue_prefill(const void* hidden_in, Csa2StatePool& pool, int 
         csa2_select_rows_prefill(logits_, stride, pos_sel_ + row0, rows, cfg_.index_heads, cfg_.index_topk,
                                  restricted ? cand_ + srow * cfg_.candidate_blocks : nullptr, cfg_.candidate_blocks,
                                  restricted ? cand_counts_ + srow : nullptr, cfg_.candidate_block,
-                                 topk_ + srow * cfg_.index_topk, counts_ + srow, stream);
+                                 topk_ + srow * sel_col_, sel_col_, counts_ + srow, stream);
       }
       if (w_.candidate_source) cand_at(row_base) = shape;
       else if (w_.uses_candidates) require_shape(cand_at(row_base), shape, "the candidate pool");

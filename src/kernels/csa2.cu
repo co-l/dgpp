@@ -1174,7 +1174,7 @@ struct RowKeyFn {
 __global__ void select_rows_prefill_kernel(const float* logits, int64_t logits_stride,
                                            const int64_t* pos_sel, int select_k, const int32_t* cand,
                                            int cand_stride, const int32_t* cand_counts, int block_size,
-                                           int32_t* topk_out, int32_t* counts) {
+                                           int32_t* topk_out, int topk_stride, int32_t* counts) {
   extern __shared__ uint8_t smem_raw[];
   uint32_t* best_hi = reinterpret_cast<uint32_t*>(smem_raw);
   uint32_t* best_lo = best_hi + select_k;
@@ -1184,7 +1184,7 @@ __global__ void select_rows_prefill_kernel(const float* logits, int64_t logits_s
   __shared__ int smem_count;
   const int r = blockIdx.x;
   const int64_t p = pos_sel[r];
-  int32_t* out = topk_out + int64_t(r) * select_k;
+  int32_t* out = topk_out + int64_t(r) * topk_stride;
   if (p < 0) {
     for (int i = threadIdx.x; i < select_k; i += blockDim.x) out[i] = -1;
     if (threadIdx.x == 0) counts[r] = 0;
@@ -1720,16 +1720,18 @@ void csa2_logits_prefill(const float* dot, int64_t dot_stride, const float* w_fo
 }
 void csa2_select_rows_prefill(const float* logits, int64_t logits_stride, const int64_t* pos_sel, int rows,
                               int heads, int select_k, const int32_t* cand, int cand_stride,
-                              const int32_t* cand_counts, int block_size, int32_t* topk_out,
+                              const int32_t* cand_counts, int block_size, int32_t* topk_out, int topk_stride,
                               int32_t* counts, cudaStream_t stream) {
   if (rows <= 0) return;
   check_select_common(heads, select_k, "csa2_select_rows_prefill");
   if (select_k > kSelectTile / 2) throw std::invalid_argument("csa2_select_rows_prefill: select_k <= 1024");
+  if (topk_stride < select_k) throw std::invalid_argument("csa2_select_rows_prefill: topk_stride >= select_k");
   if (cand != nullptr && (cand_counts == nullptr || cand_stride <= 0 || block_size <= 0))
     throw std::invalid_argument("csa2_select_rows_prefill: a candidate pool needs its counts, stride and block size");
   csa2_prepare_kernel_smem();
   select_rows_prefill_kernel<<<unsigned(rows), kCsa2Threads, rows_smem(select_k), stream>>>(
-      logits, logits_stride, pos_sel, select_k, cand, cand_stride, cand_counts, block_size, topk_out, counts);
+      logits, logits_stride, pos_sel, select_k, cand, cand_stride, cand_counts, block_size, topk_out, topk_stride,
+      counts);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 void csa2_select_candidates_prefill(const float* logits, int64_t logits_stride, const int64_t* pos_sel,

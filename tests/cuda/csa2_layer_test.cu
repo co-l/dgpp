@@ -1000,7 +1000,8 @@ struct Scenario0731 {
   int flips = 0;
   std::vector<std::vector<float>> hidden;
 
-  explicit Scenario0731(const std::string& tag_) : tag(tag_) {
+  explicit Scenario0731(const std::string& tag_, int max_tokens_ = 128, int64_t max_cache_ = 512)
+      : max_tokens(max_tokens_), max_cache(max_cache_), tag(tag_) {
     cfg.hidden = 256; cfg.q_lora = 64; cfg.o_lora = 32; cfg.num_heads = 16; cfg.o_groups = 4;
     cfg.index_topk = 16; cfg.candidate_block = 8; cfg.candidate_blocks = 4; cfg.window = 32; cfg.ring_slots = 48;
     cfg.block_tokens = 128;
@@ -1146,7 +1147,7 @@ struct Scenario0731 {
         }
     }
   }
-  void prefill(int req, int64_t p0, int T) {
+  void prefill(int req, int64_t p0, int T, bool check_output = true) {
     require(pool.ensure_request_blocks(req, p0 + T, 0), "blocks");
     const auto hb = hidden_bits(req, p0, T);
     std::vector<float> hf(hb.size());
@@ -1161,15 +1162,35 @@ struct Scenario0731 {
 
       std::vector<std::vector<int32_t>> dsel;
       if (layers[l].w.ratio > 0) {
-        const auto topk = download<int32_t>(layer->debug_topk(), size_t(T) * cfg.index_topk);
+        const int tstride = layer->topk_stride();
+        const auto topk = download<int32_t>(layer->debug_topk(), size_t(T) * tstride);
         const auto counts = download<int32_t>(layer->debug_counts(), size_t(T));
         dsel.resize(size_t(T));
         for (int i = 0; i < T; ++i)
-          dsel[size_t(i)].assign(topk.begin() + i * cfg.index_topk, topk.begin() + i * cfg.index_topk + counts[size_t(i)]);
+          dsel[size_t(i)].assign(topk.begin() + i * tstride, topk.begin() + i * tstride + counts[size_t(i)]);
       }
 
-      check(int(l), got, want, T, "prefill req " + std::to_string(req) + " pos " + std::to_string(p0) + "+" + std::to_string(T),
-            layers[l].w.ratio > 0 ? &dsel : nullptr, ref->reqs[size_t(req)]);
+      if (check_output) {
+        check(int(l), got, want, T, "prefill req " + std::to_string(req) + " pos " + std::to_string(p0) + "+" + std::to_string(T),
+              layers[l].w.ratio > 0 ? &dsel : nullptr, ref->reqs[size_t(req)]);
+      } else if (layers[l].w.ratio > 0) {
+        for (int i = 0; i < T; ++i) {
+          const auto& d = dsel[size_t(i)];
+          const auto& r = ref->reqs[size_t(req)].sel[size_t(i)];
+          if (d == r) continue;
+          ++flips;
+          const auto& lg = ref->reqs[size_t(req)].logits[size_t(i)];
+          float lo = INFINITY, hi = -INFINITY;
+          for (const float v : lg) { lo = std::min(lo, v); hi = std::max(hi, v); }
+          float boundary = INFINITY;
+          for (const int32_t e : r) boundary = std::min(boundary, lg[size_t(e)]);
+          for (const int32_t e : d)
+            if (std::find(r.begin(), r.end(), e) == r.end())
+              require(std::fabs(lg[size_t(e)] - boundary) <= 2e-3f * std::max(1e-6f, hi - lo) + 1e-6f,
+                      tag + " layer " + std::to_string(int(l)) + " prefill row " + std::to_string(int(p0 + i)) +
+                          ": a selection flip beyond a near tie");
+        }
+      }
     }
   }
   struct Span { int req; int64_t p0; int rows; };
@@ -1232,5 +1253,18 @@ DGPP_TEST(csa2_layer_0731_matches_the_oracle) {
   std::printf("[INFO] 0731: %d selection flips, every one certified as a near tie\n", s.flips);
 }
 
+
+DGPP_TEST(csa2_layer_prefill_tiles_the_select_by_the_live_context) {
+  // A wide pool: the layout's dot workspace sizes the worst case (one row
+  // across the pool's horizon), which would tile the prefill one row at a
+  // time. The select must size its tiles from the live context: 512 tokens
+  // at ratio 4 is 128 entries, so the chunk's rows share the workspace. The
+  // oracle checks ride along through prefill().
+  Scenario0731 s("0731-tile", 1024, 1 << 19);
+  s.prefill(0, 0, 512, false);
+  require(s.layer->debug_logits_rows() > 1, "the prefill select tiled the chunk one row at a time");
+  require(s.layer->index_violations() == 0, s.tag + ": index-key exactness violations");
+  std::printf("[INFO] 0731-tile: %d selection flips, every one certified as a near tie\n", s.flips);
+}
 
 int main() { return dgpp::test::run_all(); }

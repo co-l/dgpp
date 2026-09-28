@@ -336,7 +336,7 @@ void csa2_logits_prefill(const float* dot, int64_t dot_stride, const float* w_fo
 void csa2_select_rows_prefill(const float* logits, int64_t logits_stride,
                               const int64_t* pos_sel, int rows, int heads, int select_k,
                               const int32_t* cand, int cand_stride, const int32_t* cand_counts,
-                              int block_size, int32_t* topk_out, int32_t* counts,
+                              int block_size, int32_t* topk_out, int topk_stride, int32_t* counts,
                               cudaStream_t stream);
 void csa2_select_candidates_prefill(const float* logits, int64_t logits_stride,
                                     const int64_t* pos_sel, int rows, int heads, int block_size,

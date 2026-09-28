@@ -782,7 +782,7 @@ void selections_match_the_oracles(int heads) {
     const int select_k = 32;
     DevBuf dtop(size_t(rows) * select_k * 4), dcnt(rows * 4), dcp(size_t(rows) * cand_stride * 4), dcpc(rows * 4);
     dgpp::csa2_select_rows_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, heads, select_k, nullptr, 0, nullptr, 0,
-                                   static_cast<int32_t*>(dtop.p), static_cast<int32_t*>(dcnt.p), 0);
+                                   static_cast<int32_t*>(dtop.p), select_k, static_cast<int32_t*>(dcnt.p), 0);
     dgpp::csa2_select_candidates_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, heads, block_size, topk_blocks,
                                          static_cast<int32_t*>(dcp.p), static_cast<int32_t*>(dcpc.p), 0);
     sync();
@@ -803,7 +803,7 @@ void selections_match_the_oracles(int heads) {
     }
     dgpp::csa2_select_rows_prefill(static_cast<const float*>(dlog.p), stride, fx.ps(), rows, heads, select_k,
                                    static_cast<const int32_t*>(dcp.p), cand_stride, static_cast<const int32_t*>(dcpc.p), block_size,
-                                   static_cast<int32_t*>(dtop.p), static_cast<int32_t*>(dcnt.p), 0);
+                                   static_cast<int32_t*>(dtop.p), select_k, static_cast<int32_t*>(dcnt.p), 0);
     sync();
     const auto top2 = download<int32_t>(dtop, size_t(rows) * select_k);
     const auto cnt2 = download<int32_t>(dcnt, rows);
