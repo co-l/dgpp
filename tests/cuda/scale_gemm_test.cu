@@ -284,14 +284,15 @@ DGPP_TEST(scale_gemm_large_m_route_is_bitwise_the_tile_kernel) {
   check_both_oracles(p, routed, "large-m M300xN200xK512");
 }
 
-DGPP_TEST(scale_gemm_grid_decode_mma_prefill_m_takes_the_streaming_gemm) {
-  // Prefill batches (m far above the decode row counts) deliberately take
-  // the streaming GEMV groups, not the tile kernel: on sm_121a the stream
-  // is 1.3-12x faster than the tile kernel at the 0731 dense projections
-  // for every m (dense_gemm_path_bench). Pin the dispatch: exactly the
-  // 128-row groups, all the streaming kernel.
-  for (const int m : {300, 2000}) {
+DGPP_TEST(scale_gemm_grid_decode_mma_prefill_m_takes_the_pipe) {
+  // The decode_mma dispatch by row count: m <= 128 the streaming GEMV
+  // groups (128 rows each), m > 128 the prefill pipe (the 128-row tile
+  // kernel is 1.3-12x slower than the streaming form at the 0731 shapes —
+  // benchmarks/micro/dense_gemm_path_bench). Pin the dispatch shape:
+  // exactly the expected kernel, exactly the expected count.
+  for (const int m : {128, 300, 2000}) {
     const int groups = (m + 127) / 128;
+    const bool pipe_path = m > 128;
     const Problem p = make_problem(m, 512, 1024, 0x5110 + m);
     for (const bool f32 : {false, true}) {
       uint16_t* act = nullptr;
@@ -322,18 +323,21 @@ DGPP_TEST(scale_gemm_grid_decode_mma_prefill_m_takes_the_streaming_gemm) {
       DGPP_CUDA_OK(cudaGraphGetNodes(graph, nullptr, &count));
       std::vector<cudaGraphNode_t> nodes(count);
       DGPP_CUDA_OK(cudaGraphGetNodes(graph, nodes.data(), &count));
-      bool all_streaming = count == static_cast<size_t>(groups);
-      for (size_t i = 0; all_streaming && i < count; ++i) {
+      const size_t wanted = pipe_path ? 1 : static_cast<size_t>(groups);
+      const char* wanted_name = pipe_path ? "scale_gemm_pipe_kernel" : "mma_gemv_kernel";
+      bool all_expected = count == wanted;
+      for (size_t i = 0; all_expected && i < count; ++i) {
         cudaKernelNodeParams params{};
         DGPP_CUDA_OK(cudaGraphKernelNodeGetParams(nodes[i], &params));
         const char* name = nullptr;
         DGPP_CUDA_OK(cudaFuncGetName(&name, params.func));
-        all_streaming = std::string(name).find("mma_gemv_kernel") != std::string::npos;
+        all_expected = std::string(name).find(wanted_name) != std::string::npos;
       }
-      const std::string label = "prefill m=" + std::to_string(m) + (f32 ? " f32" : " bf16");
-      require(all_streaming,
-              (label + " dispatch must be the streaming GEMV groups (got " + std::to_string(count) +
-               " kernel node(s), wanted " + std::to_string(groups) + ")")
+      const std::string label = "decode_mma m=" + std::to_string(m) + (f32 ? " f32" : " bf16");
+      require(all_expected,
+              (label + " dispatch must be the " + std::string(wanted_name) + " path (got " +
+               std::to_string(count) + " kernel node(s), wanted " + std::to_string(wanted) +
+               ")")
                   .c_str());
       DGPP_CUDA_OK(cudaGraphDestroy(graph));
       DGPP_CUDA_OK(cudaStreamDestroy(stream));
@@ -344,17 +348,95 @@ DGPP_TEST(scale_gemm_grid_decode_mma_prefill_m_takes_the_streaming_gemm) {
       DGPP_CUDA_OK(cudaFree(outf32));
     }
   }
-  std::printf("[ OK ] prefill m takes the streaming GEMV groups under decode_mma\n");
+  std::printf("[ OK ] decode_mma prefill m takes the pipe, decode m the streaming groups\n");
+}
+
+DGPP_TEST(scale_gemm_grid_decode_mma_prefill_shape_routes) {
+  // The prefill pipe's shape routing (benchmarks/micro/dense_gemm_path_bench,
+  // m = 300 / 2000): the pipe beats the streaming form on the 0731
+  // projections with moderate n (wq_a / wkv / wo, and wq_b at m >= 1024);
+  // the streaming form keeps the very wide n (lm_head) and the wide-n small-m
+  // corner (wq_b at m = 300). Pin the dispatch per class:
+  struct Route {
+    int m, n, k;
+    bool pipe;
+  };
+  for (const Route r : {Route{2000, 32768, 1024, true},
+                        Route{300, 32768, 1024, false},
+                        Route{2000, 65536, 1024, false},
+                        Route{2000, 1024, 4096, true},
+                        Route{300, 1024, 4096, true}}) {
+    const Problem p = make_problem(r.m, r.n, r.k, 0x5130 + r.m / 100 + r.n / 1024);
+    uint16_t* act = nullptr;
+    uint8_t* w = nullptr;
+    float* s = nullptr;
+    uint16_t* out16 = nullptr;
+    DGPP_CUDA_OK(cudaMallocManaged(&act, p.act.size() * 2));
+    DGPP_CUDA_OK(cudaMallocManaged(&w, p.payload.size()));
+    DGPP_CUDA_OK(cudaMallocManaged(&s, p.scales.size() * 4));
+    DGPP_CUDA_OK(cudaMallocManaged(&out16, static_cast<size_t>(r.m) * r.n * 2));
+    std::memcpy(act, p.act.data(), p.act.size() * 2);
+    std::memcpy(w, p.payload.data(), p.payload.size());
+    std::memcpy(s, p.scales.data(), p.scales.size() * 4);
+    cudaStream_t stream = nullptr;
+    cudaGraph_t graph = nullptr;
+    DGPP_CUDA_OK(cudaStreamCreate(&stream));
+    DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    dgpp::launch_scale_gemm_grid_bf16(act, r.k, w, s, out16, r.m, r.n, r.k, stream, r.n, 7, 7,
+                                      /*decode_mma=*/true);
+    DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+    size_t count = 0;
+    DGPP_CUDA_OK(cudaGraphGetNodes(graph, nullptr, &count));
+    const size_t groups = static_cast<size_t>((r.m + 127) / 128);
+    const size_t wanted = r.pipe ? 1 : groups;
+    bool ok = count == wanted;
+    if (ok) {
+      std::vector<cudaGraphNode_t> nodes(count);
+      DGPP_CUDA_OK(cudaGraphGetNodes(graph, nodes.data(), &count));
+      for (size_t i = 0; i < count; ++i) {
+        cudaKernelNodeParams params{};
+        DGPP_CUDA_OK(cudaGraphKernelNodeGetParams(nodes[i], &params));
+        const char* name = nullptr;
+        DGPP_CUDA_OK(cudaFuncGetName(&name, params.func));
+        const std::string want = r.pipe ? "scale_gemm_pipe_kernel" : "mma_gemv_kernel";
+        if (std::string(name).find(want) == std::string::npos) ok = false;
+      }
+    }
+    DGPP_CUDA_OK(cudaGraphDestroy(graph));
+    DGPP_CUDA_OK(cudaStreamDestroy(stream));
+    DGPP_CUDA_OK(cudaFree(act));
+    DGPP_CUDA_OK(cudaFree(w));
+    DGPP_CUDA_OK(cudaFree(s));
+    DGPP_CUDA_OK(cudaFree(out16));
+    require(ok, ("shape route m=" + std::to_string(r.m) + " n=" + std::to_string(r.n) + " k=" +
+                 std::to_string(r.k) + (r.pipe ? " must take the pipe"
+                                               : " must keep the streaming groups"))
+                    .c_str());
+  }
+  std::printf("[ OK ] decode_mma prefill shape routes pin the pipe / streaming split\n");
 }
 
 DGPP_TEST(scale_gemm_grid_decode_mma_prefill_m_matches_both_oracles) {
   // The prefill-scale rows through the production decode_mma grid dispatch
   // (the csa2 q/k/v/o projections' geometry, k = hidden) stay within both
-  // oracles' budgets.
+  // oracles' budgets, and the dispatch is deterministic (the pipe's
+  // ascending-k16 accumulation order).
   for (const int m : {300, 2000}) {
     const Problem p = make_problem(m, 512, 1024, 0x5120 + m);
-    check_both_oracles(p, run_grid_decode_mma(p),
+    const auto got = run_grid_decode_mma(p);
+    check_both_oracles(p, got,
                        ("grid decode_mma prefill M" + std::to_string(m) + "xN512xK1024").c_str());
+    require(got == run_grid_decode_mma(p), "prefill dispatch is deterministic");
+  }
+  // The wide-wo class (n = hidden, k = the latent) at prefill m.
+  {
+    const Problem p = make_problem(2000, 512, 4096, 0x5121);
+    check_both_oracles(p, run_grid_decode_mma(p), "grid decode_mma M2000xN512xK4096");
+  }
+  // The narrow-k class (wq_b geometry, k = the q lora rank) at prefill m.
+  {
+    const Problem p = make_problem(2000, 4096, 1024, 0x5122);
+    check_both_oracles(p, run_grid_decode_mma(p), "grid decode_mma M2000xN4096xK1024");
   }
   std::printf("[ OK ] grid decode_mma prefill m matches both oracles\n");
 }

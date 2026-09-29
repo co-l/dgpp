@@ -114,7 +114,13 @@ void launch_scale_gemv_multi_bf16(const Fp8GemvProblem* problems, int n_problems
 // 16-row tile kernel (above). The bound is deliberate, not an oversight:
 // on sm_121a the streaming form beats the tile kernel 1.3-12x at the 0731
 // dense projections for every m (benchmarks/micro/dense_gemm_path_bench:
-// the tile kernel is 2.4-4.1 TFLOPS, the stream 5-35 TFLOPS). A per-call
+// the tile kernel is 2.4-4.1 TFLOPS, the stream 5-35 TFLOPS). At
+// prefill-scale rows (m > 128) with moderate n the grid dispatch takes the
+// prefill pipe kernel instead (128-row tiles, a cp.async ring, bf16 mma on
+// the same dequantized weight bits): it beats the streaming form 1.3-5.6x
+// at the 0731 shapes (the same bench), except the very wide n (the
+// per-m-tile weight decode then outruns the mma gain, the lm_head class)
+// and the wide-n small-m corner (wq_b at m = 300). A per-call
 // opt-in — the forms are tolerance-equal, not bitwise — so a family
 // switches every site or none (its batched decode rows must stay bitwise
 // its rows alone). Shapes the mma form cannot take (k % 64, alignment)

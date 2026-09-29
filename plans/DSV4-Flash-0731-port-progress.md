@@ -7,7 +7,10 @@ meaningful step.
 ## Snapshot (2026-09-29)
 
 Serving: `070b661` live (dense GEMV form kept at prefill m — the
-"tile-GEMM fix" was measured a regression and reverted).
+"tile-GEMM fix" was measured a regression and reverted). The prefill
+pipe (128-row tiled fp8 GEMM) is **built and unit-green, not yet
+deployed**: shape-routed over the streaming GEMV (below), expected
+dense 1.17 s → ~0.89 s bench (A/B benchy pending).
 
 | path | pp2000 t/s | tg64 t/s | parity |
 |------|-----------:|---------:|--------|
@@ -63,6 +66,22 @@ Serving: `070b661` live (dense GEMV form kept at prefill m — the
   (streaming GEMV); the tile kernel is 2.4–4.1 TF on the same shapes —
   GEMV wins 1.3–12×. m=300 same verdict. Total dense ≈ 1.17 s of the
   2.67 s e2e pp2000.
+- Prefill pipe (`scale_gemm_pipe_kernel`: 128×128 tiles, 3-stage
+  cp.async ring, ldmatrix A, in-register fp8→bf16 weight decode on the
+  same dequant bridge as the tile kernel) at the 0731 shapes (bench,
+  3rd path): m=2000 — wq_a 0.44 ms / 38.3 TF (3.6× over GEMV), wkv
+  0.28 ms / 29.8 TF (5.6×), wo 14.60 ms / 36.8 TF (1.31×), wq_b 3.73 ms
+  / 36.0 TF (1.08×), lm_head 74.8 ms / 28.3 TF (GEMV wins 69.4 / 30.5);
+  m=300 — pipe wins wq_a 1.9×, wkv 1.9×, wo 1.29×; GEMV wins wq_b
+  (707.9 vs 673.4) and lm_head (12483 vs 11349). Physics: the pipe
+  decodes the B tile per m-tile (grid.y = m/128 amplification), so very
+  wide n or small m favors the stream. Routing: pipe iff
+  `m > 128 && rs ≤ 7 && cs ≥ 6 && n ≤ 32768 && (n ≤ 4096 || m ≥ 1024)`
+  (pins: `scale_gemm_grid_decode_mma_prefill_shape_routes`).
+- Pipe IMA root cause (m=2000, act-end 16 B read): the A row is 10
+  16-byte chunks (8 data + 2 pad); the pad clamp covered only the last
+  chunk — chunk 8 at the final k stage reads 16 B past the last row.
+  Both pad chunks clamp to the row's data start.
 - Prefill is not chunked (scheduler `prefill_chunk_limit()` default 0):
   a 2000-token prefill is one pass, m=2000. `dense_mma` default ON
   (`DGPP_DSV41_DENSE_GEMV` env disables; `dsv41/model.cpp:193`); grid
@@ -106,6 +125,32 @@ Serving: `070b661` live (dense GEMV form kept at prefill m — the
   cap. No config change needed for 500K.
 
 ## Log
+
+### 2026-09-29 — the prefill pipe: built, unit-green, shape-routed
+
+- `scale_gemm_pipe_kernel` (the MoE-class geometry on the scale-aware
+  path): BM/BN/BK 128/128/64, 256 threads as 4m×2n warps, 3-stage
+  cp.async ring (92,160 B smem), ldmatrix A, the same fp8→bf16 decode
+  bridge as the tile kernel (one scalar weight scale per 128-deep k
+  pair) → strict-oracle-safe. mma m16n8k16 bf16, vectorized epilogue.
+- Bugs found in order: name clash (qualify `pipe::`), missing
+  namespace brace, scale-index precedence (`… + (f*BK) >> 7` →
+  `… + ((f*BK) >> 7)`; caught by pipe/tile ratio = s[0]/s[1]), short-GEMM
+  pipeline race (stages < kStages → cp_wait no-op; runtime switch),
+  pad-chunk OOB **×2** (A row = 10 chunks, 2 pad; only the last was
+  clamped — chunk 8 at the final k stage read 16 B past the last row:
+  the m=2000 IMA at act+4,096,000, offset +0x1000 vs the first fix's
+  +0xef0 = the two cp.async sites).
+- TDD: dispatch pinned by graph-capture node count (m=300/2000 → 1 pipe
+  node), both-oracle correctness at m=300/2000 (strict l2_rel ~6e-5,
+  semantic ~0.0024, deterministic), shape routing pinned per class
+  (new test). 19/19 `scale_gemm_test`, 4/4 `csa2_layer_test`,
+  `dsv41_forward_test --smoke`, 5/5 `dsv41_engine_test` green.
+- Bench: pipe beats the stream 1.3–5.6× at the 0731 prefill shapes
+  (above); the stream keeps lm_head-class n and wq_b @ m=300. Dense
+  bench m=2000: 1.17 s → ~0.89 s (−24 %).
+- Next: release build, `up --replace`, benchy A/B (expect pp2000 ~850–950,
+  far from 1800 — MoE 247 ms, attn 220 ms, fabric 190 ms are the rest).
 
 ### 2026-09-29 — prefill hunt: the GEMV form was right; the real target is a fast fp8 GEMM (070b661)
 
@@ -176,14 +221,14 @@ Serving: `070b661` live (dense GEMV form kept at prefill m — the
 
 ## Next steps
 
-1. Fast fp8 dense GEMM for m > 128 (MoE-class 128-row tiles on the
-   scale-aware path): target ≥ 20–30 TF effective at the 0731 shapes —
-   dense 1.17 s → ~400 ms. Gate it behind the existing dispatch; keep
-   the streaming GEMV for m ≤ 128.
-2. Kill the decode regression: gate the MX quantize cost out of decode
+1. Deploy the pipe (release build, `up --replace`, benchy A/B): expect
+   pp2000 ~850–950 (dense 1.17 → ~0.89 s bench; nsys dense 722.8 ms →
+   ~550 ms). Record the numbers.
+2. Experts at prefill M (w4a4_mx 247.6 ms, small-M per expert).
+3. attn_flash 219.9 ms (13 %) + fabric ~7 %.
+4. Kill the decode regression: gate the MX quantize cost out of decode
    (or make the fallback free); verify with benchy tg64 ≥ 35 with
    W4A4 on.
-3. Experts at prefill M (247.6 ms, small-M per expert) — after 1.
-4. Decode profile for the remaining ~5 t/s on tg (W4A16).
-5. When parity holds: `serve_tools_check.sh` + `serve_agentic_streams.py`
+5. Decode profile for the remaining ~5 t/s on tg (W4A16).
+6. When parity holds: `serve_tools_check.sh` + `serve_agentic_streams.py`
    as the final gate

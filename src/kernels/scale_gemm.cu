@@ -1,5 +1,7 @@
 #include "kernels/scale_gemm.hpp"
 
+#include <cuda_bf16.h>
+
 #include <algorithm>
 #include <stdexcept>
 #include <type_traits>
@@ -122,6 +124,216 @@ __global__ void scale_gemm_kernel(const uint16_t* __restrict__ act,
   store(r + 8, 0, c2);
   store(r + 8, 1, c3);
 }
+
+// The prefill pipe (2026-09-29): the dense projections at prefill row
+// counts (m > 128) were served by the small tile kernel above (BM 16 /
+// BN 64 / BK 32, no pipeline: 2.4-4.1 TF, 1.3-12x below the decode
+// streaming form — benchmarks/micro/dense_gemm_path_bench). This kernel
+// takes m > 128: 128 x 128 tiles, a 3-stage cp.async ring, ldmatrix A,
+// and the same ascending-k16 bf16 mma chain over the same dequantized
+// weight bits (fp8 -> float x scale -> one bf16 round, the dequant
+// bridge), so the results stay within the same oracle budgets.
+//
+// Geometry: 8 warps as a 4 x 2 grid, each warp 32m x 64n. Per stage:
+// A 128 rows x 64 k bf16 (16-byte padded rows) and B 128 rows x 64 k
+// fp8 (16-byte padded rows); the two 64-deep stages spanning one
+// 128-deep scale column share the one scalar weight scale (BN | 128,
+// cs >= 6). smem: 3 x (20,480 + 10,240) = 92,160 B.
+namespace pipe {
+constexpr int BM = 128;
+constexpr int BN = 128;
+constexpr int BK = 64;
+constexpr int kThreads = 256;
+constexpr int kStages = 3;
+constexpr size_t kARow = (size_t)(BK + 16) * 2;  // bf16 + pad
+constexpr size_t kBRow = BK + 16;                // fp8 + pad
+constexpr size_t kASlot = (size_t)BM * kARow;    // 18,432
+constexpr size_t kBSlot = (size_t)BN * kBRow;    // 10,240
+constexpr size_t kSlot = kASlot + kBSlot;
+constexpr size_t kSmem = kStages * kSlot;        // 86,016
+
+__device__ __forceinline__ void cp16(void* dst, const void* src, int bytes) {
+  asm volatile(
+      "cp.async.ca.shared.global [%0], [%1], 16, %2;\n"
+      ::"r"((unsigned)__cvta_generic_to_shared(dst)), "l"(src), "r"(bytes));
+}
+__device__ __forceinline__ void cp_commit() {
+  asm volatile("cp.async.commit_group;\n" ::);
+}
+template <int kWait>
+__device__ __forceinline__ void cp_wait() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(kWait));
+}
+__device__ __forceinline__ void ldmx4(uint32_t (&r)[4], const void* p) {
+  const unsigned d = static_cast<unsigned>(__cvta_generic_to_shared(p));
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(d));
+}
+}  // namespace pipe
+
+template <typename OutT>
+__global__ __launch_bounds__(pipe::kThreads, 2) void scale_gemm_pipe_kernel(    const uint16_t* __restrict__ act, size_t act_stride,
+    const uint8_t* __restrict__ w, const float* __restrict__ scales,
+    OutT* __restrict__ out, int m, int n, int k, size_t out_stride, int rs,
+    int cs) {
+    extern __shared__ __align__(16) uint8_t smem[];
+  const int m0 = blockIdx.y * pipe::BM;
+  const int n0 = blockIdx.x * pipe::BN;
+  const int scale_cols = (k + (1 << cs) - 1) >> cs;
+  const int n_scale_row = n0 >> rs;  // BN | 128, rs <= 7: one scale row per tile
+  const int stages = k / pipe::BK;
+
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  const int wm = warp / 2, wn = warp % 2;  // 4 m x 2 n
+  const int lm = lane >> 3, lr = lane & 7;
+  const int r = lane / 4, cc = (lane % 4) * 2;  // m16n8k16 fragment coords
+
+  auto stage_ptr = [&](int s) { return smem + (size_t)s * pipe::kSlot; };
+  // One cp.async ring over both operands; the row's validity selects the
+  // src byte count (cp.async zero-fills the dst tail when src < 16). The
+  // pad chunk (the row's last 16 bytes, never consumed) reads the row's
+  // data start so the final row does not run past the allocation.
+  auto issue = [&](int f) {
+    const int k0 = f * pipe::BK;
+    uint8_t* base = stage_ptr(f % pipe::kStages);
+    const int a_pad = pipe::BK / 8;  // pad chunks (row tail, never consumed)
+    for (int c = threadIdx.x; c < (int)(pipe::kASlot / 16); c += pipe::kThreads) {
+      const int row = c / (pipe::kARow / 16), ch = c % (pipe::kARow / 16);
+      const int gm = m0 + row;
+      const int src_row = gm < m ? gm : 0;  // 0-byte src never reads
+      const int kelem = ch >= a_pad ? 0 : k0 + ch * 8;
+      pipe::cp16(base + row * pipe::kARow + ch * 16,
+           act + (size_t)src_row * act_stride + kelem, gm < m ? 16 : 0);
+    }
+    for (int c = threadIdx.x; c < (int)(pipe::kBSlot / 16); c += pipe::kThreads) {
+      const int row = c / (pipe::kBRow / 16), ch = c % (pipe::kBRow / 16);
+      const int gn = n0 + row;
+      const int src_row = gn < n ? gn : 0;  // 0-byte src never reads
+      const int kelem = ch == (int)(pipe::kBRow / 16) - 1 ? 0 : k0 + ch * 16;
+      pipe::cp16(base + pipe::kASlot + row * pipe::kBRow + ch * 16,
+           w + (size_t)src_row * k + kelem, gn < n ? 16 : 0);
+    }
+    pipe::cp_commit();
+  };
+
+  float acc[2][8][4];
+#pragma unroll
+  for (int i = 0; i < 2; ++i)
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+      acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
+
+  for (int f = 0; f < pipe::kStages - 1 && f < stages; ++f) issue(f);
+  for (int f = 0; f < stages; ++f) {
+    const int s = f % pipe::kStages;
+    // Wait for this stage's group: the ring holds min(kStages, stages - f)
+    // outstanding groups, so allow min(kStages - 2, stages - f - 1).
+    switch (stages - f - 1 < pipe::kStages - 2 ? stages - f - 1 : pipe::kStages - 2) {
+      case 0: pipe::cp_wait<0>(); break;
+      case 1: pipe::cp_wait<1>(); break;
+      default: pipe::cp_wait<2>(); break;
+    }
+    __syncthreads();
+    const int nx = f + pipe::kStages - 1;
+    if (nx < stages) issue(nx);
+    const float wscale = scales[(size_t)n_scale_row * scale_cols + ((f * pipe::BK) >> 7)];
+    const uint8_t* base = stage_ptr(s);
+    const uint16_t* aS = reinterpret_cast<const uint16_t*>(base);
+    const uint8_t* bS = base + pipe::kASlot;
+#pragma unroll
+    for (int kh = 0; kh < pipe::BK / 16; ++kh) {
+      uint32_t af[2][4];
+#pragma unroll
+      for (int i = 0; i < 2; ++i)
+        pipe::ldmx4(af[i], aS + (wm * 32 + i * 16 + (lm & 1) * 8 + lr) * (pipe::kARow / 2) +
+                     kh * 16 + (lm >> 1) * 8);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int nrow = wn * 64 + j * 8 + r;
+        // b0 / b1: the thread's 8 n-rows' codes at k cc..cc+1 / cc+8..cc+9;
+        // the byte offset of code cc within its u32 is cc % 4.
+        const uint32_t* bp = reinterpret_cast<const uint32_t*>(
+            bS + (size_t)nrow * pipe::kBRow + kh * 16);
+        const uint32_t w0 = bp[cc >> 2] >> (8 * (cc & 3));
+        const uint32_t w1 = bp[2 + (cc >> 2)] >> (8 * (cc & 3));
+        const float2 d0 =
+            fp8_gemv::e4m3x2_to_float2(static_cast<uint16_t>(w0 & 0xFFFFu));
+        const float2 d1 =
+            fp8_gemv::e4m3x2_to_float2(static_cast<uint16_t>(w1 & 0xFFFFu));
+        const uint32_t b0 = *reinterpret_cast<const uint32_t*>(
+            &__floats2bfloat162_rn(d0.x * wscale, d0.y * wscale));
+        const uint32_t b1 = *reinterpret_cast<const uint32_t*>(
+            &__floats2bfloat162_rn(d1.x * wscale, d1.y * wscale));
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+          asm volatile(
+              "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+              "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+              : "+f"(acc[i][j][0]), "+f"(acc[i][j][1]), "+f"(acc[i][j][2]),
+                "+f"(acc[i][j][3])
+              : "r"(af[i][0]), "r"(af[i][1]), "r"(af[i][2]), "r"(af[i][3]),
+                "r"(b0), "r"(b1));
+      }
+    }
+    __syncthreads();  // stage consumed before the next issue overwrites it
+  }
+
+  auto store_pair = [&](int gm, int gn, float lo, float hi) {
+    if (gm < m && gn + 1 < n) {
+      if constexpr (std::is_same_v<OutT, uint16_t>) {
+        const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+        *reinterpret_cast<__nv_bfloat162*>(
+            out + (size_t)gm * out_stride + gn) = v;
+      } else {
+        out[(size_t)gm * out_stride + gn] = lo;
+        out[(size_t)gm * out_stride + gn + 1] = hi;
+      }
+    }
+  };
+  for (int i = 0; i < 2; ++i)
+    for (int j = 0; j < 8; ++j) {
+      const int gn = n0 + wn * 64 + j * 8 + cc;
+      store_pair(m0 + wm * 32 + i * 16 + r, gn, acc[i][j][0], acc[i][j][1]);
+      store_pair(m0 + wm * 32 + i * 16 + r + 8, gn, acc[i][j][2], acc[i][j][3]);
+    }
+  // Odd n tails (gn + 1 >= n): single-element stores.
+  for (int i = 0; i < 2; ++i)
+    for (int j = 0; j < 8; ++j) {
+      const int gn = n0 + wn * 64 + j * 8 + cc + 1;
+      if (gn >= n) continue;
+      const int gm = m0 + wm * 32 + i * 16 + r;
+      if (gm < m)
+        fp8_gemv::store_dot(out + (size_t)gm * out_stride + gn, acc[i][j][1]);
+      if (gm + 8 < m)
+        fp8_gemv::store_dot(out + (size_t)(gm + 8) * out_stride + gn,
+                            acc[i][j][3]);
+    }
+}
+
+namespace {
+template <typename OutT>
+void launch_scale_gemm_pipe(const uint16_t* act, size_t act_row_stride_elems,
+                            const uint8_t* w_payload, const float* w_scales,
+                            OutT* out, int m, int n, int k, cudaStream_t stream,
+                            size_t out_row_stride_elems, int rs, int cs) {
+  static bool configured = false;
+  if (!configured) {
+    DGPP_CUDA_OK(cudaFuncSetAttribute(
+        scale_gemm_pipe_kernel<OutT>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, pipe::kSmem));
+    configured = true;
+  }
+  if (out_row_stride_elems == 0) out_row_stride_elems = static_cast<size_t>(n);
+  const dim3 grid((n + pipe::BN - 1) / pipe::BN, (m + pipe::BM - 1) / pipe::BM);
+  scale_gemm_pipe_kernel<OutT><<<grid, pipe::kThreads, pipe::kSmem, stream>>>(
+      act, act_row_stride_elems, w_payload, w_scales, out, m, n, k,
+      out_row_stride_elems, rs, cs);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+}  // namespace
 
 // The small-m path (m <= fp8_gemv::kMaxRows): the bandwidth GEMV core, one
 // warp per weight row, activations staged in dynamic smem. Same dequant
@@ -336,6 +548,15 @@ void launch_scale_gemm_grid_bf16(const uint16_t* act, size_t act_row_stride_elem
                                  void* ws, size_t ws_bytes) {
   if (decode_mma && m >= 1 && n > 0 && k > 0 && cs >= 4 &&
       mma_gemv_shape_ok(w_payload, act, act_row_stride_elems, m, k)) {
+    // The prefill pipe wins the 0731 projections at moderate n (wq_a / wkv /
+    // wo, wq_b at m >= 1024); the streaming form keeps the very wide n (the
+    // per-m-tile weight decode then outruns the mma gain, lm_head class) and
+    // the wide-n small-m corner (benchmarks/micro/dense_gemm_path_bench).
+    if (m > pipe::BM && rs <= 7 && cs >= 6 && n <= 32768 && (n <= 4096 || m >= 1024)) {
+      launch_scale_gemm_pipe<uint16_t>(act, act_row_stride_elems, w_payload, w_scales,
+                                       out, m, n, k, stream, out_row_stride_elems, rs, cs);
+      return;
+    }
     launch_mma_gemv_fp8_bf16(act, act_row_stride_elems, w_payload, w_scales, out, m, n, k,
                              out_row_stride_elems, rs, cs, stream, ws, ws_bytes);
     return;
@@ -351,6 +572,12 @@ void launch_scale_gemm_grid_f32(const uint16_t* act, size_t act_row_stride_elems
                                 void* ws, size_t ws_bytes) {
   if (decode_mma && m >= 1 && n > 0 && k > 0 && cs >= 4 &&
       mma_gemv_shape_ok(w_payload, act, act_row_stride_elems, m, k)) {
+    // Same pipe / streaming shape split as the bf16 launcher.
+    if (m > pipe::BM && rs <= 7 && cs >= 6 && n <= 32768 && (n <= 4096 || m >= 1024)) {
+      launch_scale_gemm_pipe<float>(act, act_row_stride_elems, w_payload, w_scales,
+                                    out, m, n, k, stream, out_row_stride_elems, rs, cs);
+      return;
+    }
     launch_mma_gemv_fp8_f32(act, act_row_stride_elems, w_payload, w_scales, out, m, n, k,
                             out_row_stride_elems, rs, cs, stream, ws, ws_bytes);
     return;
