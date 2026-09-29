@@ -567,18 +567,27 @@ dot GEMM (was the 343 ms mma storm).
 
 ## Next steps
 
-1. **Done (2026-09-29 evening):** spark1 fixed (user; 91.4 TFLOPS on the
-   bench — the 59.4 vs 91.4 gap vs spark2 is the torch 2.14 vs 2.9.1
-   bench-side delta, a bonus). Flash double-buffer A/B re-run:
-   pp2000 1127.7 / 1131.2 t/s (vs 1122.3 baseline, +0.7 %), tg64
-   16.0 / 16.2 (neutral) — KEPT. Clocks verified 2125-2132 MHz under
-   load at 84 W (was 507 MHz at 10 W).
-2. attn_flash (bigger lever): the double buffer only hides the gather
-   latency; the b12x CuTe/TMA port
-   (`~/dev/sparkrun-ds4/b12x/attention/`) is the real fix — scope as a
-   project.
-3. w4a4 experts ~466 ms (26 %): at the DRAM ceiling (~273 GB/s, the GB10
-   peak) — no kernel-level win; the lever is traffic (weight reuse / L2).
-4. Fabric: bus_bulk_collective 173.8 ms (9.7 %).
+1. **Expert fp4 GEMV kernels: the big kernel prize.** 41.4 ms/step
+   (moe_slot_gate_up 28.2 + down 13.2) at ~155 GB/s — 3.7× below the
+   580–600 GB/s slab ceiling. ncu one chain (standalone driver; ncu
+   attach mode needs an executable, not a running serve) for the
+   stall pattern, same playbook as mma_gemv (per-use global loads on
+   the dequant→mma chain, barrier cadence, in-flight bytes). A 2×
+   there is ~+2 t/s.
+2. **mma_gemv streaming rate: 155 → 580 GB/s.** The per-group scale
+   prefetch killed the critical-path stall (54.86 live, 2026-09-29);
+   the isolated cold kernel is still 82.6 us ncu-flushed vs the 29 us
+   slab ceiling. Levers: window width (256→512 k, 1 block/SM smem
+   cost), stage depth (the 24 KB budget is a 2026-09-14 artifact —
+   re-A/B at the true ceiling), barrier cadence.
+3. **Fabric fold pipeline:** 37.2 us × 92.2/step = 3.43 ms; the v1
+   contract is single-outstanding. Worth ~1.5–2.5 ms/step; a
+   bus-protocol project.
+4. **prefill (pp 1032 vs 1800):** the dense fp8 projections at m > 128
+   are the target (~1.17 s of 2.67 s e2e); a fast fp8 tile GEMM
+   (MoE-class 128-row tiles) is the lever — the streaming GEMV form
+   is right, its rate is not (same 3.7× gap as decode).
 5. When parity holds: `serve_tools_check.sh` + `serve_agentic_streams.py`
    as the final gate; then criterion 1 (verify branch committed + pushed).
+   (Branch is committed + pushed as a2fba46; the gate remains open
+   until parity.)
