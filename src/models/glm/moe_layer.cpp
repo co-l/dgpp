@@ -681,9 +681,11 @@ static size_t moe_w4a4_min_rows() {
   return v;
 }
 
-static bool moe_w4a4_eligible(bool calibrated, int hidden, int inter, size_t rows) {
+// mx: MXFP4 experts need no calibrated scale (the dynamic per-32 e8m0 scale
+// IS the format), so the default mode takes them on sight.
+static bool moe_w4a4_eligible(bool calibrated, int hidden, int inter, size_t rows, bool mx = false) {
   const int mode = moe_w4a4_mode();
-  return (mode == 1 || (mode == -1 && calibrated)) && rows >= moe_w4a4_min_rows() && hidden > 0 &&
+  return (mode == 1 || (mode == -1 && (calibrated || mx))) && rows >= moe_w4a4_min_rows() && hidden > 0 &&
          inter > 0 && hidden % 64 == 0 && inter % 64 == 0 && hidden <= 16384 && inter <= 16384;
 }
 
@@ -716,9 +718,10 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   const int routed_bits = packq ? w_.experts_packed[0].bits : 0;
   const int shared_bits = (packq && shared_seg) ? w_.shared_packed[0].bits : 0;
   const int fp4_group = fp4 ? w_.experts_fp4[0].scale_group : kFp4Group;
+  const bool mx4 = fp4_group == kMxfp4Group;
   const size_t I_max = static_cast<size_t>(std::max(I_r, I_s));
-  const bool w4a4 = fp4 && !packq && fp4_group == kFp4Group && kernel == MoeExpertKernel::kMma &&
-                    moe_w4a4_eligible(w_.act_scales_dev != nullptr, H, I_r, rows_total);
+  const bool w4a4 = fp4 && !packq && (fp4_group == kFp4Group || mx4) && kernel == MoeExpertKernel::kMma &&
+                    moe_w4a4_eligible(w_.act_scales_dev != nullptr, H, I_r, rows_total, mx4);
   // The W4A4 chain's down rows in bf16 (half the write and the ordered
   // accumulation's read; SGLang's CUTLASS MoE keeps a bf16 intermediate too)
   // unless DGPP_MOE_W4A4_F32_DOWN=1; only without a shared segment, whose
@@ -727,14 +730,20 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   down_bf16_ = w4a4 && shared_seg == nullptr && !f32_down;
   if (w4a4) {
     static const bool logged = [&] {
-      DGPP_LOG_INFO("moe: W4A4 NVFP4 prefill experts on ({} activation scale; DGPP_MOE_W4A4=0 turns it off)",
-                    moe_w4a4_static() && w_.act_scales_dev != nullptr ? "the checkpoint's static" : "a dynamic per-row");
+      DGPP_LOG_INFO("moe: W4A4 {} prefill experts on ({} activation scale; DGPP_MOE_W4A4=0 turns it off)",
+                    mx4 ? "MXFP4" : "NVFP4",
+                    mx4 ? "dynamic per-32 e8m0"
+                        : (moe_w4a4_static() && w_.act_scales_dev != nullptr ? "the checkpoint's static"
+                                                                             : "a dynamic per-row"));
       return true;
     }();
     (void)logged;
     ensure_w4a4(std::max(static_cast<size_t>(tokens), rows_total), std::max(H, I_r));
-    launch_quantize_rows_nvfp4(hidden, static_cast<size_t>(H), tokens, H, d_q_codes_, d_q_scales_, d_q_gs_,
-                               stream, 0.f, moe_w4a4_static() ? w_.act_scales_dev : nullptr);
+    if (mx4)
+      launch_quantize_rows_mx(hidden, static_cast<size_t>(H), tokens, H, d_q_codes_, d_q_scales_, stream);
+    else
+      launch_quantize_rows_nvfp4(hidden, static_cast<size_t>(H), tokens, H, d_q_codes_, d_q_scales_, d_q_gs_,
+                                 stream, 0.f, moe_w4a4_static() ? w_.act_scales_dev : nullptr);
   }
   // The shared segment is every token: split across blocks along z (the
   // GEMV core in 16-row pieces, the tensor-core kernel in whole m-tiles).
@@ -777,6 +786,9 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
       launch_moe_grouped_gemv_packq_bf16(d_gather_, H, sg, ns, mr, split, d_views_prefill_,
                                          which, out, I_max, n, H,
                                          routed_arg ? routed_bits : shared_bits, stream);
+    else if (w4a4 && routed_arg && mx4)
+      launch_moe_grouped_w4a4_mx_bf16(d_q_codes_, d_q_scales_, d_rows_, sg, ns, mr, d_views_prefill_, which, out,
+                                      I_max, n, H, stream);
     else if (w4a4 && routed_arg)
       launch_moe_grouped_w4a4_bf16(d_q_codes_, d_q_scales_, d_q_gs_, d_rows_, sg, ns, mr, d_views_prefill_, which, out,
                                    I_max, n, H, stream);
@@ -803,6 +815,9 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
       launch_moe_grouped_gemv_packq_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_,
                                         2, d_down_, H, H, k,
                                         routed_arg ? routed_bits : shared_bits, stream);
+    else if (w4a4 && routed_arg && mx4)
+      launch_moe_grouped_w4a4_mx_f32(d_q_codes_, d_q_scales_, nullptr, sg, ns, mr, d_views_prefill_, 2, d_down_, H, H,
+                                     k, stream);
     else if (w4a4 && routed_arg && down_bf16_)
       launch_moe_grouped_w4a4_bf16(d_q_codes_, d_q_scales_, d_q_gs_, nullptr, sg, ns, mr, d_views_prefill_, 2,
                                    reinterpret_cast<uint16_t*>(d_down_), H, H, k, stream);
@@ -838,16 +853,25 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   const bool fused_swiglu =
       w4a4 && shared_seg == nullptr && fused_act && I_max == static_cast<size_t>(I_r);
   if (fused_swiglu) {
-    launch_swiglu_quantize_rows_nvfp4(d_gate_, d_up_, I_max, static_cast<int>(rows_total), I_r, cfg_.swiglu_limit,
-                                      d_q_codes_, d_q_scales_, d_q_gs_, stream,
-                                      0.f, moe_w4a4_static() && w_.act_scales_dev ? w_.act_scales_dev + 1 : nullptr);
+    if (mx4)
+      launch_swiglu_quantize_rows_mx(d_gate_, d_up_, I_max, static_cast<int>(rows_total), I_r, cfg_.swiglu_limit,
+                                     d_q_codes_, d_q_scales_, stream);
+    else
+      launch_swiglu_quantize_rows_nvfp4(d_gate_, d_up_, I_max, static_cast<int>(rows_total), I_r, cfg_.swiglu_limit,
+                                        d_q_codes_, d_q_scales_, d_q_gs_, stream,
+                                        0.f, moe_w4a4_static() && w_.act_scales_dev ? w_.act_scales_dev + 1 : nullptr);
   } else {
     launch_moe_swiglu_clamp(d_gate_, d_up_, d_act_,
                             static_cast<int64_t>(rows_total) * I_max,
                             cfg_.swiglu_limit, stream);
-    if (w4a4)
-      launch_quantize_rows_nvfp4(d_act_, I_max, static_cast<int>(rows_total), I_r, d_q_codes_, d_q_scales_, d_q_gs_,
-                                 stream, 0.f, moe_w4a4_static() && w_.act_scales_dev ? w_.act_scales_dev + 1 : nullptr);
+    if (w4a4) {
+      if (mx4)
+        launch_quantize_rows_mx(d_act_, I_max, static_cast<int>(rows_total), I_r, d_q_codes_, d_q_scales_, stream);
+      else
+        launch_quantize_rows_nvfp4(d_act_, I_max, static_cast<int>(rows_total), I_r, d_q_codes_, d_q_scales_, d_q_gs_,
+                                   stream, 0.f,
+                                   moe_w4a4_static() && w_.act_scales_dev ? w_.act_scales_dev + 1 : nullptr);
+    }
   }
   gemm_f32(segs, n_segs, max_rows, 0, I_r, true);
   if (shared_seg) gemm_f32(shared_seg, 1, tokens, shared_split, I_s, false);

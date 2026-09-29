@@ -221,7 +221,7 @@ class GlmMoeLayer {
   uint16_t* d_up_ = nullptr;
   uint16_t* d_act_ = nullptr;
   float* d_down_ = nullptr;  // [max_tokens, hidden] fp32 segment output
-  // W4A4 prefill (DGPP_MOE_W4A4=1, 2026-09-23): the NVFP4 activation
+  // W4A4 prefill (2026-09-23; the MXFP4 chain, 2026-09-29): the activation
   // buffers, grown on first use (eager prefill only, never under capture).
   uint8_t* d_q_codes_ = nullptr;
   uint8_t* d_q_scales_ = nullptr;
