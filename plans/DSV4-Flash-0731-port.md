@@ -49,12 +49,14 @@ A change lands only when, in order:
 
 | location | role | rule |
 |----------|------|------|
-| OpenFox workspace `dsv4-flash-0731-port` | working ground truth, branch `dsv4-flash-0731-port` | edit here |
-| `~/dev/dgpp` (session cwd clone) | mirror of the workspace | sync from the workspace, never diverge |
+| `~/dev/dgpp` (the original project, session cwd) | working ground truth, branch `dsv4-flash-0731-port` | edit here |
 | `spark:~/dgpp` | live instance (rank 0 head + HTTP) | **never edit directly** — rsync / `git pull` only |
 
-Git: commit in the workspace, push `fork` (github.com/co-l/dgpp) and
-`nicefox` (git@nicefox.net:dgpp) on the branch `dsv4-flash-0731-port`.
+No side clones: a previous OpenFox workspace copy was retired
+(2026-09-29) so the tree can't drift from the branch.
+
+Git: commit here, push `fork` (github.com/co-l/dgpp) and `nicefox`
+(git@nicefox.net:dgpp) on the branch `dsv4-flash-0731-port`.
 `spark:~/dgpp` tracks the fork and pulls.
 
 ## Build / deploy / bench (the ritual)
