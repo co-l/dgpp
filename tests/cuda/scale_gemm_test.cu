@@ -153,6 +153,34 @@ std::vector<uint16_t> run_tile_kernel(const Problem& p) {
   return got;
 }
 
+// The production decode_mma grid dispatch (the csa2 projections): the
+// bandwidth GEMV form is for decode row counts, so at prefill-scale m the
+// result must come from the tile GEMM and match both oracles.
+std::vector<uint16_t> run_grid_decode_mma(const Problem& p) {
+  uint16_t* act = nullptr;
+  uint8_t* w = nullptr;
+  float* s = nullptr;
+  uint16_t* out = nullptr;
+  DGPP_CUDA_OK(cudaMallocManaged(&act, p.act.size() * 2));
+  DGPP_CUDA_OK(cudaMallocManaged(&w, p.payload.size()));
+  DGPP_CUDA_OK(cudaMallocManaged(&s, p.scales.size() * 4));
+  DGPP_CUDA_OK(
+      cudaMallocManaged(&out, static_cast<size_t>(p.m) * p.n * 2));
+  std::memcpy(act, p.act.data(), p.act.size() * 2);
+  std::memcpy(w, p.payload.data(), p.payload.size());
+  std::memcpy(s, p.scales.data(), p.scales.size() * 4);
+  dgpp::launch_scale_gemm_grid_bf16(act, p.k, w, s, out, p.m, p.n, p.k, nullptr, p.n, 7, 7,
+                                    /*decode_mma=*/true);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  std::vector<uint16_t> got(static_cast<size_t>(p.m) * p.n);
+  std::memcpy(got.data(), out, got.size() * 2);
+  DGPP_CUDA_OK(cudaFree(act));
+  DGPP_CUDA_OK(cudaFree(w));
+  DGPP_CUDA_OK(cudaFree(s));
+  DGPP_CUDA_OK(cudaFree(out));
+  return got;
+}
+
 // Runs both oracles and asserts the budgets.
 void check_both_oracles(const Problem& p, const std::vector<uint16_t>& got,
                         const char* label) {
@@ -254,6 +282,79 @@ DGPP_TEST(scale_gemm_large_m_route_is_bitwise_the_tile_kernel) {
   require(std::memcmp(routed.data(), tile.data(), routed.size() * 2) == 0,
           "large-m route bitwise the tile kernel");
   check_both_oracles(p, routed, "large-m M300xN200xK512");
+}
+
+DGPP_TEST(scale_gemm_grid_decode_mma_prefill_m_routes_to_the_tile_gemm) {
+  // The prefill batch (m far above the decode row counts) must not take the
+  // bandwidth GEMV path: the grid launcher's decode_mma gate must bound m,
+  // so a 2000-row prefill is one tile GEMM, not 16 GEMV groups re-reading
+  // the weights. Captured: exactly one kernel node, the tile GEMM.
+  for (const int m : {300, 2000}) {
+    const Problem p = make_problem(m, 512, 1024, 0x5110 + m);
+    for (const bool f32 : {false, true}) {
+      uint16_t* act = nullptr;
+      uint8_t* w = nullptr;
+      float* s = nullptr;
+      uint16_t* out16 = nullptr;
+      float* outf32 = nullptr;
+      DGPP_CUDA_OK(cudaMallocManaged(&act, p.act.size() * 2));
+      DGPP_CUDA_OK(cudaMallocManaged(&w, p.payload.size()));
+      DGPP_CUDA_OK(cudaMallocManaged(&s, p.scales.size() * 4));
+      DGPP_CUDA_OK(cudaMallocManaged(&out16, static_cast<size_t>(m) * 512 * 2));
+      DGPP_CUDA_OK(cudaMallocManaged(&outf32, static_cast<size_t>(m) * 512 * 4));
+      std::memcpy(act, p.act.data(), p.act.size() * 2);
+      std::memcpy(w, p.payload.data(), p.payload.size());
+      std::memcpy(s, p.scales.data(), p.scales.size() * 4);
+      cudaStream_t stream = nullptr;
+      cudaGraph_t graph = nullptr;
+      DGPP_CUDA_OK(cudaStreamCreate(&stream));
+      DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+      if (f32)
+        dgpp::launch_scale_gemm_grid_f32(act, p.k, w, s, outf32, m, 512, 1024, stream, 512, 7, 7,
+                                         /*decode_mma=*/true);
+      else
+        dgpp::launch_scale_gemm_grid_bf16(act, p.k, w, s, out16, m, 512, 1024, stream, 512, 7, 7,
+                                          /*decode_mma=*/true);
+      DGPP_CUDA_OK(cudaStreamEndCapture(stream, &graph));
+      size_t count = 0;
+      DGPP_CUDA_OK(cudaGraphGetNodes(graph, nullptr, &count));
+      std::vector<cudaGraphNode_t> nodes(count);
+      DGPP_CUDA_OK(cudaGraphGetNodes(graph, nodes.data(), &count));
+      std::string kernel_name;
+      if (count == 1) {
+        cudaKernelNodeParams params{};
+        DGPP_CUDA_OK(cudaGraphKernelNodeGetParams(nodes[0], &params));
+        const char* name = nullptr;
+        DGPP_CUDA_OK(cudaFuncGetName(&name, params.func));
+        kernel_name = name;
+      }
+      const std::string label = "prefill m=" + std::to_string(m) + (f32 ? " f32" : " bf16");
+      require(count == 1 && kernel_name.find("scale_gemm_kernel") != std::string::npos,
+              (label + " dispatch must be the single tile GEMM (got " + std::to_string(count) +
+               " kernel node(s))")
+                  .c_str());
+      DGPP_CUDA_OK(cudaGraphDestroy(graph));
+      DGPP_CUDA_OK(cudaStreamDestroy(stream));
+      DGPP_CUDA_OK(cudaFree(act));
+      DGPP_CUDA_OK(cudaFree(w));
+      DGPP_CUDA_OK(cudaFree(s));
+      DGPP_CUDA_OK(cudaFree(out16));
+      DGPP_CUDA_OK(cudaFree(outf32));
+    }
+  }
+  std::printf("[ OK ] prefill m routes to the tile GEMM under decode_mma\n");
+}
+
+DGPP_TEST(scale_gemm_grid_decode_mma_prefill_m_matches_both_oracles) {
+  // The prefill-scale rows through the production decode_mma grid dispatch
+  // (the csa2 q/k/v/o projections' geometry, k = hidden) stay within both
+  // oracles' budgets.
+  for (const int m : {300, 2000}) {
+    const Problem p = make_problem(m, 512, 1024, 0x5120 + m);
+    check_both_oracles(p, run_grid_decode_mma(p),
+                       ("grid decode_mma prefill M" + std::to_string(m) + "xN512xK1024").c_str());
+  }
+  std::printf("[ OK ] grid decode_mma prefill m matches both oracles\n");
 }
 
 DGPP_TEST(scale_gemm_last_row_preserves_full_product_bits_and_output_bounds) {
