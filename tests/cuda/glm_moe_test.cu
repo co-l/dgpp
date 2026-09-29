@@ -1678,7 +1678,9 @@ void moe_slot_bench() {
   DGPP_CUDA_OK(cudaMallocManaged(&d_ids, slots * sizeof(int32_t)));
   std::memcpy(d_ids, ids, slots * sizeof(int32_t));
   DGPP_CUDA_OK(cudaMallocManaged(&order, slots * sizeof(int32_t)));
-  for (int i = 0; i < slots; ++i) order[i] = i;
+  // The live path (tokens > 1) sorts the slots by expert id so a shared
+  // expert's second read hits L2 — the bench must mirror it.
+  launch_moe_slot_order(d_ids, order, slots, K, E, nullptr);
   uint16_t* x = nullptr;
   uint16_t* act = nullptr;
   float* out = nullptr;

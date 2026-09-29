@@ -1751,7 +1751,8 @@ namespace {
 constexpr bool kFp4SlotStreaming = DGPP_FP4_SLOT_STREAMING != 0;
 
 template <int K, bool kSharedFp4, int kGroup = fp4_gemv::kGroup>
-__global__ void moe_slot_gate_up_swiglu_fp4_kernel(
+__global__ __launch_bounds__(fp8_gemv::kThreads, 3)
+void moe_slot_gate_up_swiglu_fp4_kernel(
     const uint16_t* __restrict__ x, size_t x_stride,
     const int32_t* __restrict__ ids, const int32_t* __restrict__ order,
     const MoeExpertView* __restrict__ views, int n_routed,
@@ -1842,7 +1843,8 @@ __global__ void moe_slot_gate_up_swiglu_fp4_kernel(
 }
 
 template <int K, bool kSharedFp4, int kGroup = fp4_gemv::kGroup>
-__global__ void moe_slot_down_fp4_kernel(
+__global__ __launch_bounds__(fp8_gemv::kThreads, 4)
+void moe_slot_down_fp4_kernel(
     const uint16_t* __restrict__ act, size_t act_stride,
     const int32_t* __restrict__ ids, const int32_t* __restrict__ order,
     const MoeExpertView* __restrict__ views, int n_routed,

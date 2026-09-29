@@ -11,6 +11,7 @@ prefetch (mma_gemv fp8 decode forms). Parity 58 % on pp, ~88 % on tg.
 
 | path | pp2000 t/s | tg64 t/s | parity |
 |------|-----------:|---------:|--------|
+| + slot-kernel launch_bounds (gate 3, down 4) | 1033.0 | 30.15 (55.57 step-chunks/s fixed-bench) | 1800 / 35 |
 | + per-group scale prefetch (2026-09-29 late night) | 1032.4 | ~30 (54.86 step-chunks/s fixed-bench) | 1800 / 35 |
 | W4A16 site default + wo_b ws (2026-09-29 night) | 1031.9 | ~30 (54.79) | 1800 / 35 |
 | + flash DB, W4A16 site default (e4f4acb) | 1033.4 | 29.1 | 1800 / 35 |
@@ -286,6 +287,36 @@ dot GEMM (was the 343 ms mma storm).
   cap. No config change needed for 500K.
 
 ## Log
+
+### 2026-09-29 (late night 3) — slot experts: occupancy is the wall; launch_bounds landed
+
+- **ncu on the slot gate_up (isolated bench, 19 unique experts):** the
+  kernel is latency-bound, not bandwidth-bound — 78 % "No Eligible",
+  33 % occupancy (theoretical), IPC 0.86, 89 regs/thread → the
+  register file caps the block at 2/SM (16 warps). Each warp stalls
+  ~8.5 cyc on L1TEX scoreboards (weight loads) and there simply are
+  not enough warps to hide it. The "144 GB/s" the bench printed was
+  against the UNIQUE bytes; the real tell is the occupancy.
+- **Slot reordering is already live** (the multi-token path sorts
+  slots by expert id so a shared expert's 2nd read hits L2). The
+  micro-bench had been using identity order — fixing that in the
+  bench moved gate_up 1104→752 us and L2 hit 5 %→52 % (the bench
+  now mirrors the live path). No live change there; it was the bench
+  lying, not the engine.
+- **launch_bounds (the real lever):** forcing the gate kernel to 3
+  blocks/SM (80 regs) and down to 4 (64 regs) lifts occupancy
+  (48–51 %) and each kernel ~3–4 %. Unit-green both modes. Live
+  fixed-bench 54.86→55.57 step-chunks/s (+1.3 %), llama-benchy
+  tg64 30.15. Small, because the experts are ~53 % of the step and
+  the rest (dense GEMVs, fabric, mhc) is untouched.
+- **The structural gap remains:** at ~50 % occupancy the slot kernels
+  stream at ~200 GB/s against the 580–600 GB/s practical slab-cold —
+  3× headroom. The fix is more in-flight weight bytes per SM without
+  the register cost of the two-row form (which is occupancy-limited):
+  cp.async/TMA staging of the weights into smem so the in-flight data
+  lives in the async-copy queue, not registers. That is the next
+  kernel project (and it is the same wall the dense GEMVs hit, so it
+  is shared with the pp-1800 dense-fp8-GEMM work).
 
 ### 2026-09-29 (late night 2) — two-step slot gate_up: bitwise, perf-neutral, reverted
 
