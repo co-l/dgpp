@@ -3,6 +3,8 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <type_traits>
 
@@ -138,12 +140,13 @@ __global__ void scale_gemm_kernel(const uint16_t* __restrict__ act,
 // A 128 rows x 64 k bf16 (16-byte padded rows) and B 128 rows x 64 k
 // fp8 (16-byte padded rows); the two 64-deep stages spanning one
 // 128-deep scale column share the one scalar weight scale (BN | 128,
-// cs >= 6). smem: 3 x (20,480 + 10,240) = 92,160 B.
+// cs >= 6). smem: 3 x (20,480 + 10,240) = 92,160 B — one block per SM
+// (smem limit); 512 threads (16 warps) for the occupancy.
 namespace pipe {
 constexpr int BM = 128;
 constexpr int BN = 128;
 constexpr int BK = 64;
-constexpr int kThreads = 256;
+constexpr int kThreads = 512;
 constexpr int kStages = 3;
 constexpr size_t kARow = (size_t)(BK + 16) * 2;  // bf16 + pad
 constexpr size_t kBRow = BK + 16;                // fp8 + pad
@@ -173,7 +176,7 @@ __device__ __forceinline__ void ldmx4(uint32_t (&r)[4], const void* p) {
 }  // namespace pipe
 
 template <typename OutT>
-__global__ __launch_bounds__(pipe::kThreads, 2) void scale_gemm_pipe_kernel(    const uint16_t* __restrict__ act, size_t act_stride,
+__global__ __launch_bounds__(pipe::kThreads, 1) void scale_gemm_pipe_kernel(    const uint16_t* __restrict__ act, size_t act_stride,
     const uint8_t* __restrict__ w, const float* __restrict__ scales,
     OutT* __restrict__ out, int m, int n, int k, size_t out_stride, int rs,
     int cs) {
@@ -186,7 +189,7 @@ __global__ __launch_bounds__(pipe::kThreads, 2) void scale_gemm_pipe_kernel(    
 
   const int warp = threadIdx.x / 32;
   const int lane = threadIdx.x % 32;
-  const int wm = warp / 2, wn = warp % 2;  // 4 m x 2 n
+  const int wm = warp / 4, wn = warp % 4;  // 4 m x 4 n (32 rows x 32 cols per warp)
   const int lm = lane >> 3, lr = lane & 7;
   const int r = lane / 4, cc = (lane % 4) * 2;  // m16n8k16 fragment coords
 
@@ -218,11 +221,11 @@ __global__ __launch_bounds__(pipe::kThreads, 2) void scale_gemm_pipe_kernel(    
     pipe::cp_commit();
   };
 
-  float acc[2][8][4];
+  float acc[2][4][4];
 #pragma unroll
   for (int i = 0; i < 2; ++i)
 #pragma unroll
-    for (int j = 0; j < 8; ++j)
+    for (int j = 0; j < 4; ++j)
       acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0.f;
 
   for (int f = 0; f < pipe::kStages - 1 && f < stages; ++f) issue(f);
@@ -250,8 +253,8 @@ __global__ __launch_bounds__(pipe::kThreads, 2) void scale_gemm_pipe_kernel(    
         pipe::ldmx4(af[i], aS + (wm * 32 + i * 16 + (lm & 1) * 8 + lr) * (pipe::kARow / 2) +
                      kh * 16 + (lm >> 1) * 8);
 #pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        const int nrow = wn * 64 + j * 8 + r;
+      for (int j = 0; j < 4; ++j) {
+        const int nrow = wn * 32 + j * 8 + r;
         // b0 / b1: the thread's 8 n-rows' codes at k cc..cc+1 / cc+8..cc+9;
         // the byte offset of code cc within its u32 is cc % 4.
         const uint32_t* bp = reinterpret_cast<const uint32_t*>(
@@ -293,15 +296,15 @@ __global__ __launch_bounds__(pipe::kThreads, 2) void scale_gemm_pipe_kernel(    
     }
   };
   for (int i = 0; i < 2; ++i)
-    for (int j = 0; j < 8; ++j) {
-      const int gn = n0 + wn * 64 + j * 8 + cc;
+    for (int j = 0; j < 4; ++j) {
+      const int gn = n0 + wn * 32 + j * 8 + cc;
       store_pair(m0 + wm * 32 + i * 16 + r, gn, acc[i][j][0], acc[i][j][1]);
       store_pair(m0 + wm * 32 + i * 16 + r + 8, gn, acc[i][j][2], acc[i][j][3]);
     }
   // Odd n tails (gn + 1 >= n): single-element stores.
   for (int i = 0; i < 2; ++i)
-    for (int j = 0; j < 8; ++j) {
-      const int gn = n0 + wn * 64 + j * 8 + cc + 1;
+    for (int j = 0; j < 4; ++j) {
+      const int gn = n0 + wn * 32 + j * 8 + cc + 1;
       if (gn >= n) continue;
       const int gm = m0 + wm * 32 + i * 16 + r;
       if (gm < m)
@@ -553,6 +556,8 @@ void launch_scale_gemm_grid_bf16(const uint16_t* act, size_t act_row_stride_elem
     // per-m-tile weight decode then outruns the mma gain, lm_head class) and
     // the wide-n small-m corner (benchmarks/micro/dense_gemm_path_bench).
     if (m > pipe::BM && rs <= 7 && cs >= 6 && n <= 32768 && (n <= 4096 || m >= 1024)) {
+      if (const char* t = std::getenv("DGPP_PIPE_TRACE"))
+        std::fprintf(stderr, "pipe m=%d n=%d k=%d out=%p\n", m, n, k, out);
       launch_scale_gemm_pipe<uint16_t>(act, act_row_stride_elems, w_payload, w_scales,
                                        out, m, n, k, stream, out_row_stride_elems, rs, cs);
       return;
@@ -574,6 +579,8 @@ void launch_scale_gemm_grid_f32(const uint16_t* act, size_t act_row_stride_elems
       mma_gemv_shape_ok(w_payload, act, act_row_stride_elems, m, k)) {
     // Same pipe / streaming shape split as the bf16 launcher.
     if (m > pipe::BM && rs <= 7 && cs >= 6 && n <= 32768 && (n <= 4096 || m >= 1024)) {
+      if (const char* t = std::getenv("DGPP_PIPE_TRACE"))
+        std::fprintf(stderr, "pipe m=%d n=%d k=%d out=%p\n", m, n, k, out);
       launch_scale_gemm_pipe<float>(act, act_row_stride_elems, w_payload, w_scales,
                                     out, m, n, k, stream, out_row_stride_elems, rs, cs);
       return;

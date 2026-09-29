@@ -287,7 +287,7 @@ DGPP_TEST(scale_gemm_large_m_route_is_bitwise_the_tile_kernel) {
 DGPP_TEST(scale_gemm_grid_decode_mma_prefill_m_takes_the_pipe) {
   // The decode_mma dispatch by row count: m <= 128 the streaming GEMV
   // groups (128 rows each), m > 128 the prefill pipe (the 128-row tile
-  // kernel is 1.3-12x slower than the streaming form at the 0731 shapes —
+  // is 1.3-12x faster than the streaming form at the 0731 shapes —
   // benchmarks/micro/dense_gemm_path_bench). Pin the dispatch shape:
   // exactly the expected kernel, exactly the expected count.
   for (const int m : {128, 300, 2000}) {
