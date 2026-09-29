@@ -6,22 +6,27 @@ meaningful step.
 
 ## Snapshot (2026-09-29)
 
-Serving: `e0d3f14` live (the prefill pipe, shape-routed over the
-streaming GEMV, + the bf16 mma row bound: wide-m bf16 matmuls take the
-Lt tile GEMM).
+Serving: `c511a51` live (the prefill pipe, shape-routed over the
+streaming GEMV, the bf16 mma row bound: wide-m bf16 matmuls take the
+Lt tile GEMM, and the prefill attention split = 1: the flash's grid
+fills the SMs at 128 blocks, so the 4-way split only bought c_main f32
+traffic — 8.4 MB per (split, tile) written by the flash, read by the
+finish — which the 1-split form drops 4x).
 
 | path | pp2000 t/s | tg64 t/s | parity |
 |------|-----------:|---------:|--------|
+| pipe + Lt dot + split 1 (c511a51, W4A4) | 1117.8 | ~17 | 1800 / 35 |
 | pipe + Lt dot (e0d3f14, W4A4) | 1032.1 | 16.57 | 1800 / 35 |
 | pipe (d0d93c5, W4A4) | 861.5 | 16.28 | 1800 / 35 |
 | GEMV (070b661, W4A4) | 748.5 | 17.0 | 1800 / 35 |
 | GEMV (070b661, W4A16) | 707.8 | 30.32 | 1800 / 35 |
 
 Cold-prefill GPU mix after both changes (nsys, ~2.28 s): w4a4 experts
-~471 ms (20.7 %, ~3.3 TF/launch at ~62 rows/expert — BM=128 half-empty
-tiles, next A/B: DGPP_W4A4_BM=64), attn_flash 337 ms (14.8 %), scale
-pipe 286 ms, fabric 165 ms, attn_finish 135 ms, mhc ~90 ms, the Lt dot
-GEMM (was the 343 ms mma storm).
+~471 ms (20.7 %, ~80 TF/launch — bandwidth-bound; the BM=64 A/B was
+neutral-to-worse), attn_flash ~250 ms (was 337; the c_ws write
+quartered by the split), scale pipe 286 ms, fabric 165 ms,
+attn_finish ~40 ms (was 135; the 1-split c_main), mhc ~90 ms, the Lt
+dot GEMM (was the 343 ms mma storm).
 
 | path | pp2000 t/s | tg64 t/s | parity |
 |------|-----------:|---------:|--------|
@@ -151,6 +156,19 @@ GEMM (was the 343 ms mma storm).
 
 ## Log
 
+### 2026-09-29 — the prefill attention split: 4 → 1 (c511a51)
+
+- attn_finish was ~130 ms (5.7 %) of the cold prefill, DRAM-bound on the
+  f32 `c_main` partials ([rows, n_split, lh, 512], 8.4 MB per
+  (split, 128-row tile)) — the flash writes it, the finish reads it.
+- Prefill used `kPrefillSplit=4`; the flash grid is already
+  `ceil(rows*lh/32) × n_split` = 128 blocks at n_split=1, plenty for 48
+  SMs, so the 4-way split only bought c_main traffic, not parallelism.
+  Decode is n=1 and untouched.
+- A/B (benchy pp2000/tg64): split 4 = 1032.1/16.57, split 2 =
+  1091.2/15.33, split 1 = 1117.8/~17. Monotonic. csa2_layer_test +
+  dsv41_engine_test green (the parity gate is n_split-agnostic).
+
 ### 2026-09-29 — the bf16 mma row bound: the 343 ms launch storm dies (e0d3f14)
 
 - Cold-prefill nsys (pipe live): w4a4 20.7 %, attn_flash 14.8 %, pipe
@@ -270,14 +288,17 @@ GEMM (was the 343 ms mma storm).
 
 ## Next steps
 
-1. Experts A/B: `DGPP_W4A4_BM=64` (at ~62 rows/expert the BM=128 tiles
-   are half-empty; w4a4 471 ms = 20.7 % of the cold prefill) — benchy
-   A/B, keep if it wins.
-2. attn_flash 337 ms (14.8 %): 240 us/launch × 1401; study the tiling
-   (kM=32 row×head, kTile=32 tokens, 8 warps).
-3. Fabric: bus_bulk_collective 165 ms (7.2 %) + attn_finish 130 ms.
+1. attn_flash: ~250 ms (was 337; the c_ws write quartered by the split).
+   240 us/launch × 1401 — latency-bound (per-slab random 128-B latent
+   gathers). Port the b12x CuTe/TMA reference
+   (`~/dev/sparkrun-ds4/b12x/attention/`): scope as a project.
+2. w4a4 experts ~471 ms (20.7 %): the BM=64 A/B was neutral-to-worse
+   (reverted) — ~80 TF/launch, bandwidth-bound. Profile one launch
+   (n_regs, occupancy, B-stream); the b12x `moe/` reference if the
+   port lands.
+3. Fabric: bus_bulk_collective 165 ms (7.2 %).
 4. Kill the decode regression: gate the MX quantize cost out of decode
    (or make the fallback free); verify with benchy tg64 ≥ 35 with
-   W4A4 on.
+   W4A4 on. (Decode window ~40 t/s today.)
 5. When parity holds: `serve_tools_check.sh` + `serve_agentic_streams.py`
    as the final gate; then criterion 1 (verify branch committed + pushed).
