@@ -15,6 +15,8 @@ finish — which the 1-split form drops 4x).
 
 | path | pp2000 t/s | tg64 t/s | parity |
 |------|-----------:|---------:|--------|
+| + flash DB, W4A16 site default (e4f4acb) | 1033.4 | 29.1 | 1800 / 35 |
+| + flash DB (1c1f0c9, W4A4) | 1127.7 / 1131.2 | 15.3 | 1800 / 35 |
 | pipe + Lt dot + split 1 (c511a51, W4A4) | 1117.8 | ~17 | 1800 / 35 |
 | pipe + Lt dot (e0d3f14, W4A4) | 1032.1 | 16.57 | 1800 / 35 |
 | pipe (d0d93c5, W4A4) | 861.5 | 16.28 | 1800 / 35 |
@@ -41,21 +43,37 @@ dot GEMM (was the 343 ms mma storm).
   wq_b 3.8 ms, wq_a 1.6 ms, wkv 1.6 ms; lm_head 62 ms). Real target: a
   fast fp8 GEMM for m > 128 (MoE-class 128-row tiles; wq_a/wkv at
   5–10 TF and wo/lm_head at 28–34 TF in the stream).
-- Decode: W4A4-MX **halves** tg (15.15/17.0 vs 30.32). The MX path is a
-  prefill-only design, yet something it enables costs every decode step
-  (activation-quantize launch/overhead and/or the `N fallbacks` on
-  sampled decode steps — see open issue 1).
+- Decode: W4A4-MX **halves** tg (15.15/17.0 vs 30.32). **Solved
+  2026-09-29 (evening):** the per-step decode cost is IDENTICAL in both
+  modes (nsys per-step breakdown, 77.4 vs 80.0 ms/step, same kernel
+  mix — decode rows < 256 take the W4A16 dequant GEMV in both worlds).
+  What collapses is the **MTP draft acceptance**: the W4A4 prefill
+  (block-scale fp4 experts) leaves the hidden states numerically
+  shifted, and at temp 1.0 over the 129k vocab the draft's top-1 flips
+  — accept p1 13–46 % (1.17–2.1 tok/step) W4A4 vs 58–92 % (2.1–4.1
+  tok/step) W4A16. vllm-prod's MXFP4 path is numerically consistent
+  across prefill/decode, so it never pays the split. Shipped:
+  `DGPP_MOE_W4A4=0` as the live site default (site-env plumbing:
+  SITE_KEYS/NODE_KEYS + the serve-side node_env allowlist + unit test,
+  e4f4acb). Revisit when the W4A4 prefill and decode numerics are made
+  consistent (or the acceptance is made robust).
 
 ## Open issues (ordered)
 
-1. **tg regression with W4A4-MX on** (15.15 vs 30.32 t/s). Suspect the
-   fused swiglu+MX-quantize kernel running on decode batches too (extra
-   launch per layer per step, latency-bound), or the decode fallback
-   path paying for quantized activations it doesn't use. `serve_r0.log`
-   logs `slot closed: N sampled decode steps, M fallbacks` with M rising
-   per slot — understand what a fallback is.
-2. **pp 2.4× below parity on W4A16** (748.5 vs 1800). The dense fp8
-   projections at prefill m are the target: ~1.17 s of 2.67 s e2e
+1. **Decode step cost: the experts are 53 % of a 78 ms step at 1.9× the
+   DRAM floor.** Per-step nsys (W4A16, 0731): moe_slot_gate_up_swiglu_fp4
+   28.2 ms (46 chains × 611 us) + moe_slot_down_fp4 13.2 ms (285 us) =
+   41.4 ms/step; the floor for 7 experts × 43 layers is ~22 ms @273 GB/s.
+   mma_gemv 12.9 ms, bus_allreduce 3.4 ms, mhc 2.1 ms, attention the rest.
+   At the 29 t/s acceptance (2.1 tok/step) hitting 35 needs ~65 ms/step.
+2. **W4A4 prefill ↔ decode numerics split** (the tg 16-vs-29 cause, solved
+   as a config for now, e4f4acb): make the block-scale fp4 prefill and the
+   W4A16 dequant decode agree closely enough that the MTP acceptance
+   survives (or a robust acceptance test). Until then the site default is
+   W4A16 (pp 1033 vs 1131).
+3. **pp 2.4× below parity on W4A16** (748.5 vs 1800; 1033.4 after the
+   pipe/Lt/split-1/flash-DB work). The dense fp8 projections at prefill m
+   are the target: ~1.17 s of 2.67 s e2e
    (measured per shape in `dense_gemm_path_bench`, m=2000). The
    streaming GEMV is the right form (1.3–12× over the tile kernel), so
    the lever is a fast fp8 GEMM for m > 128 — MoE-class 128-row tiles
