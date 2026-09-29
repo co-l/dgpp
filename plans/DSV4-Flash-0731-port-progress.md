@@ -6,18 +6,40 @@ meaningful step.
 
 ## Snapshot (2026-09-29)
 
-Live: W4A16 site default + flash DB + the wo_b decode ws fix.
-Parity 58 % on pp, ~88 % on tg.
+Live: W4A16 site default + flash DB + wo_b ws + the per-group scale
+prefetch (mma_gemv fp8 decode forms). Parity 58 % on pp, ~88 % on tg.
 
 | path | pp2000 t/s | tg64 t/s | parity |
 |------|-----------:|---------:|--------|
-| W4A16 site default + wo_b ws (2026-09-29 night) | 1031.9 | ~30 | 1800 / 35 |
+| + per-group scale prefetch (2026-09-29 late night) | 1032.4 | ~30 (54.86 step-chunks/s fixed-bench) | 1800 / 35 |
+| W4A16 site default + wo_b ws (2026-09-29 night) | 1031.9 | ~30 (54.79) | 1800 / 35 |
 | + flash DB, W4A16 site default (e4f4acb) | 1033.4 | 29.1 | 1800 / 35 |
+
+**Part memory ground truth (2026-09-29 late night, corrects the
+"155 GB/s = the practical ceiling" story):** DRAM streaming peak =
+**830 GB/s** (512MB–1GB plain reads), L2 = **24 MB** (not 126), L2 read
+~1.9 TB/s. A 24 MB+ flush of the 16.8 MB wq_b-class slab reads at
+580–600 GB/s — the honest per-slab cold number. The earlier
+155 GB/s "ceiling" (experts + dense GEMVs) was 3.7–5× BELOW that
+ceiling: the kernels have real headroom, the part does not. The old
+273 GB/s spec peak was wrong for this part, and the 64 MB-flush
+micro-benches were L2-poisoned (256 MB flushes leave a dirty-writeback
+storm that starves reads to 12–24 GB/s; a 64 MB flush only half-evicts
+the 24 MB L2). Benchy's tg numbers are not comparable across runs
+(either: random corpus start per prompt, no seed) — the deterministic
+driver (fixed 2000-token prompt, temp 0, min_tokens 512, ignore_eos)
+reproduces 514 step-chunks in 9.4–9.5 s at ±0.04 %.
 
 **Decode step fully mapped (2026-09-29 night, nsys 187 steps, wall
 77.4 ms, 98.2 % GPU busy):**
 
-- MoE experts = **at the practical DRAM ceiling, lever exhausted.**
+- MoE experts — **revised (late night): NOT at the ceiling.** At the
+  true 830 GB/s DRAM peak (and 580–600 GB/s practical slab cold) the
+  experts' 155 GB/s is 3.7× off — real kernel headroom, same as the
+  dense GEMVs. (Originally read "at the ceiling" against the wrong
+  273 GB/s peak; the unique-traffic proof below stands: the bytes are
+  the routing-set, but the streaming rate is not.)
+- MoE experts — the traffic proof:
   The unique-expert trace (new env-gated `DGPP_MOE_UNIQUE_TRACE`,
   device-side, in the graph decode path): n = 30/36 ids/layer (5–6 MTP
   rows × top-6), unique = 8..36, mean **21.2** (random would be ~29 —
@@ -50,7 +72,12 @@ Parity 58 % on pp, ~88 % on tg.
      96 blocks re-read 32 KB stream rows 24× per token; the bitwise
      token-tiled form exists for prefill and is gated off for decode
      (`!decode_rows`) because the fused finish (tickets + deferred
-     side-stream comb) is decode-specific. ~1 ms at best.
+     side-stream comb) is decode-specific. **A/B'd 2026-09-29 (night)
+     and REJECTED** (`DGPP_MHC_TILE_DECODE`, unit-tested in the fused
+     finish's tolerance class): tg256 24.4 tiled vs 27.6 fused — at
+     decode row counts the per-coefficient form's 96-block parallelism
+     beats the tiled one-block-per-4-tokens; the tiling's L2-traffic
+     win only pays at prefill scale. Keep the fused form.
   3. attn_flash 1.15 ms, lm_head 0.2 ms, smalls ~1.5 ms.
   Structure ceiling: ~73.5 ms/step ≈ 33 t/s. **Parity (35 t/s ≈
   70 ms/step) needs a structural change**: the fold pipeline (1),
@@ -251,7 +278,70 @@ dot GEMM (was the 343 ms mma storm).
 
 ## Log
 
+### 2026-09-29 (late night) — the memory ground truth: 830 GB/s DRAM, 24 MB L2; scale prefetch landed
+
+- **The part numbers everyone was quoting were wrong.** Plain-stream
+  micro-benches (fixed `blockIdx` offset — an earlier version of the
+  probe had every block read the whole array): DRAM 512MB–1GB reads =
+  **830 GB/s**; L2 = **24 MB** (`cudaDeviceProp`), L2 reads ~1.9 TB/s.
+  A slab the size of wq_b (16.8 MB) after a 24 MB+ flush: **580–600
+  GB/s**. Consequences: (a) the experts' and dense GEMVs' 155 GB/s is
+  3.7× below the practical ceiling — kernel headroom, not a floor;
+  (b) the 273 GB/s "spec peak" in the earlier entries was wrong for
+  this part; (c) flush-based "cold" benches are treacherous here — a
+  256 MB flush leaves a dirty-writeback storm that starves the next
+  read to 12–24 GB/s, and 64 MB only half-evicts the 24 MB L2.
+- **Benchy is not A/B-grade** (two independent non-determinisms: the
+  corpus start position is `np.random.randint` per request — the
+  prompt differs every run, no seed flag; and at the site's temp 1.0
+  default the MTP acceptance varies the token stream). The fixed
+  driver (`/tmp/fixed_bench.py` pattern: fixed 2000-token prompt,
+  temp 0, min_tokens 512, ignore_eos, stream) is deterministic to
+  ±0.04 % (514 step-chunks / 9.4–9.5 s). All decode A/Bs below use it.
+- **mma_gemv ncu (wq_b 16384×1024, m=6, ncu-flushed):** 87.2 us,
+  Memory 11.2 %, Compute 29.8 %, warp CPI 13.7 — 35.8 % L1TEX
+  scoreboard (the per-use `scale_row` global load inside the
+  dequant→mma chain) + 32.5 % CTA barrier.
+- **Scale prefetch, v1 (the whole window's 8 scale values into
+  registers at window start):** isolated cold 111.3 → 100.8 us; ncu
+  87.2 → 82.6 us, the barrier stall gone, CPI 13.7 → 97.5 (L1TEX now
+  66 %). But **live it LOST** (54.38 vs 54.79 step-chunks/s): at
+  cs=5 the window spans 8 scale blocks while each lane consumes 2 —
+  an 8× overfetch of 4-byte loads on an issue-constrained inner loop.
+  (Register counts identical to HEAD: ptxas reuses the 8 slots.)
+- **Direct-LDG (ring off, `WarpLoads::kOn = false`) A/B:** the
+  2-stage cp.async ring looked like the wall in isolation (ncu 82.6
+  vs 21.6 us) but **loses live** (54.38 vs 54.79): the ring's second
+  in-flight window hides the DRAM round trip better in the graph
+  context than a warp's back-to-back LDG.128s. Kept the ring.
+- **Landed: the per-group scale prefetch (v2).** Each lane loads only
+  the scales its groups consume (`sc[kGroups]`, ≤ 4 guarded 4-byte
+  loads at window start, issued before the weight smem reads; the
+  ragged past-k value zeroed like the per-use guard). Bitwise the
+  old arithmetic (`mma_gemv_test` 10/10, incl. the bitwise
+  single-launch contracts). **Live: 54.86 vs 54.79 — best of the
+  four, non-overlapping ranges; pp2000 flat (1032.4).** ~0.13 % —
+  small, but the stall ncu flagged is gone from the critical path
+  and nothing regressed.
+- The decode kernel family is NOT "at the floor" (155 of 580+ GB/s).
+  Next up: attack the mma_gemv streaming rate itself (window width /
+  in-flight bytes / the per-window barrier cadence) toward the 580
+  GB/s slab ceiling — the same headroom now applies to the fp4
+  expert GEMVs (41.4 ms/step at 155 GB/s).
+
 ### 2026-09-29 (night) — decode step mapped to the floor; wo_b ws; expert ceiling proven
+
+- **mhc tiled decode A/B: rejected.** `DGPP_MHC_TILE_DECODE` extends
+  the prefill token-tiled dots form to the decode rows (in-block
+  finish, comb included; the launcher reports finished and the
+  caller's side-stream comb is skipped). Unit-green in the fused
+  finish's tolerance class (the tiled dots carry a ~tens-of-fp32-ulps
+  dots jitter vs the per-coefficient register form — the prefill
+  tiled form's standing contract is the bf16 output's). Live tg256:
+  24.4 tiled vs 27.6 fused — the per-coefficient form's 96-block
+  parallelism wins at decode row counts; the tiling's L2-traffic win
+  only pays at prefill scale. Default stays off; the gate + test stay
+  as the evidence.
 
 - **Unique-expert trace shipped** (env-gated, device-side, inside the
   graph decode path): `DGPP_MOE_UNIQUE_TRACE` — one 32-thread kernel

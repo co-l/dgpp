@@ -453,6 +453,88 @@ DGPP_TEST(mhc_deferred_comb_is_bitwise_the_fused_finish) {
   }
 }
 
+// The token-tiled dots form at the decode row counts against the fused
+// per-coefficient finish on the same inputs: collapsed, post, comb and the
+// normed output within the decode tolerance class. The tiled form runs the
+// finish in-block (comb included), whatever the deferred-comb flag says, so
+// the decode caller's side-stream comb launch must be skipped when the
+// tiled form took the site (the launcher's return) — and the counters stay
+// zeroed. The tiled dots carry a ~tens-of-fp32-ulps dots jitter versus the
+// per-coefficient register form (the prefill tiled form's standing contract
+// is the bf16 output's, where it is normally invisible), so the outputs are
+// compared in bf16 ulps with the gemm form's budget, not bit-for-bit.
+DGPP_TEST(mhc_tiled_form_at_decode_rows_within_tolerance_of_the_fused_finish) {
+  dgpp::mhc_set_tile_decode(false);
+  dgpp::mhc_set_tile_min_tokens(1);  // serve's setting (model construction)
+  for (int T : {1, 4, 8}) {
+    Case c = make_case(real_config(), T, 0x7C4D + T);
+    c.alloc();
+    const int n = c.cfg.hc_mult, D = c.cfg.hidden;
+    std::vector<uint16_t> ln(D);
+    for (int i = 0; i < D; ++i) ln[i] = float_to_bf16_bits(0.5f + 0.001f * float(i % 97));
+    uint16_t* d_ln = nullptr;
+    uint16_t* d_normed = nullptr;
+    int* d_counters = nullptr;
+    DGPP_CUDA_OK(cudaMallocManaged(&d_ln, D * 2));
+    DGPP_CUDA_OK(cudaMallocManaged(&d_normed, size_t(T) * D * 2));
+    DGPP_CUDA_OK(cudaMallocManaged(&d_counters, size_t(T) * sizeof(int)));
+    std::memcpy(d_ln, ln.data(), D * 2);
+    std::memset(d_counters, 0, size_t(T) * sizeof(int));
+    std::vector<uint16_t> col_a(size_t(T) * D), post_a(size_t(T) * n), comb_a(size_t(T) * n * n),
+        normed_a(size_t(T) * D);
+    const auto require = [](bool ok, const char* what) {
+      if (!ok) throw std::runtime_error(what);
+    };
+    DGPP_CUDA_OK(cudaMemset(c.d_collapsed, 0xA5, size_t(T) * D * 2));
+    DGPP_CUDA_OK(cudaMemset(c.d_post, 0xA5, size_t(T) * n * 2));
+    DGPP_CUDA_OK(cudaMemset(c.d_comb, 0xA5, size_t(T) * n * n * 2));
+    DGPP_CUDA_OK(cudaMemset(d_normed, 0xA5, size_t(T) * D * 2));
+    const bool finished = dgpp::launch_mhc_compute_normed(c.d_streams, c.dev_w, c.cfg, c.d_collapsed,
+                                                          c.d_post, c.d_comb, c.d_logits, d_ln,
+                                                          d_normed, 1e-5f, T, nullptr, d_counters,
+                                                          true, nullptr, true);
+    require(finished, "the fused decode form defers the comb to the side stream");
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    for (size_t i = 0; i < size_t(T) * n * n; ++i)
+      require(c.d_comb[i] == 0xA5A5, "the deferred finish must not write comb");
+    dgpp::launch_mhc_comb(c.d_logits, c.dev_w, c.cfg, c.d_comb, T, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::memcpy(col_a.data(), c.d_collapsed, col_a.size() * 2);
+    std::memcpy(post_a.data(), c.d_post, post_a.size() * 2);
+    std::memcpy(comb_a.data(), c.d_comb, comb_a.size() * 2);
+    std::memcpy(normed_a.data(), d_normed, normed_a.size() * 2);
+    // The tiled form at the same decode rows: the launcher reports the
+    // finish in-block (no deferred comb) and writes comb itself.
+    DGPP_CUDA_OK(cudaMemset(c.d_collapsed, 0xA5, size_t(T) * D * 2));
+    DGPP_CUDA_OK(cudaMemset(c.d_post, 0xA5, size_t(T) * n * 2));
+    DGPP_CUDA_OK(cudaMemset(c.d_comb, 0xA5, size_t(T) * n * n * 2));
+    DGPP_CUDA_OK(cudaMemset(d_normed, 0xA5, size_t(T) * D * 2));
+    dgpp::mhc_set_tile_decode(true);
+    const bool finished_tiled = dgpp::launch_mhc_compute_normed(c.d_streams, c.dev_w, c.cfg,
+                                                                c.d_collapsed, c.d_post, c.d_comb,
+                                                                c.d_logits, d_ln, d_normed, 1e-5f,
+                                                                T, nullptr, d_counters, true,
+                                                                nullptr, true);
+    require(!finished_tiled, "the tiled decode form finishes in-block (no side-stream comb)");
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    require_ulp(compare(read_back(c.d_collapsed, col_a.size()), col_a, 2, 4), 0.005, 0,
+                "tiled decode mhc collapsed within the fused finish's class");
+    require_ulp(compare(read_back(c.d_post, post_a.size()), post_a, 2, 4), 0.005, 0,
+                "tiled decode mhc post within the fused finish's class");
+    require_ulp(compare(read_back(c.d_comb, comb_a.size()), comb_a, 2, 4), 0.005, 0,
+                "tiled decode mhc comb within the fused finish's class");
+    require_ulp(compare(read_back(d_normed, normed_a.size()), normed_a, 2, 4), 0.005, 0,
+                "tiled decode mhc normed within the fused finish's class");
+    for (int i = 0; i < T; ++i)
+      require(d_counters[i] == 0, "the tiled decode form leaves the counters zeroed");
+    dgpp::mhc_set_tile_decode(false);
+    std::printf("[ OK ] mhc tiled form at decode rows: %d tokens within the fused finish's class\n", T);
+    cudaFree(d_ln); cudaFree(d_normed); cudaFree(d_counters);
+    c.free_all();
+  }
+  dgpp::mhc_set_tile_min_tokens(16);  // restore the default
+}
+
 DGPP_TEST(mhc_end_to_end_pipeline_is_deterministic) {
   // Real pipeline wiring: kernel's own post/comb feed its own update; two
   // full invocations must be bitwise identical (graph-capture premise).

@@ -1,6 +1,7 @@
 #include "kernels/glm_mhc_launch.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 #include "common/cuda_check.hpp"
@@ -988,6 +989,13 @@ void launch_dots(const uint16_t* streams, const GlmMhcWeights& w,
 // same chain whatever rows share the launch, so a prompt prefilled with
 // others is bitwise the prompt alone (DeepSeek-V4.1-Flash, 2026-09-14).
 int g_mhc_tile_min_tokens = 16;
+// The token-tiled form at the decode rows (the DGPP_MHC_TILE_DECODE A/B):
+// off by default — the fused per-coefficient finish (tickets + the
+// side-stream deferred comb) is the decode's graph-captured form.
+bool g_mhc_tile_decode = [] {
+  const char* v = std::getenv("DGPP_MHC_TILE_DECODE");
+  return v && v[0] == '1';
+}();
 
 template <int kPerThread>
 void launch_dots_tiled(const uint16_t* streams, const GlmMhcWeights& w,
@@ -1100,14 +1108,18 @@ bool launch_mhc_compute_normed(const uint16_t* streams, const GlmMhcWeights& w,
   }
   // The tiled prefill form runs the finish in-block with comb included,
   // whatever defer_comb says: only the fused per-coefficient form defers.
-  const bool tiled = vec && !decode_rows && tokens >= g_mhc_tile_min_tokens && g_mhc_tiled_enabled;
+  // The A/B gate (DGPP_MHC_TILE_DECODE / mhc_set_tile_decode) extends the
+  // tiled form to the decode rows: same bitwise contract, the finish's
+  // tickets and deferred comb simply never run.
+  const bool tiled = vec && (!decode_rows || g_mhc_tile_decode) &&
+                     tokens >= g_mhc_tile_min_tokens && g_mhc_tiled_enabled;
   if (tiled) fin.defer_comb = 0;
   if (vec)
     launch_dots_by_width<true>(streams, w, cfg, logits_scratch, fin, fused,
-                               tokens, stream, /*allow_tiled=*/!decode_rows);
+                               tokens, stream, /*allow_tiled=*/!decode_rows || g_mhc_tile_decode);
   else
     launch_dots_by_width<false>(streams, w, cfg, logits_scratch, fin, fused,
-                                tokens, stream, /*allow_tiled=*/!decode_rows);
+                                tokens, stream, /*allow_tiled=*/!decode_rows || g_mhc_tile_decode);
   if (fused) return fin.defer_comb != 0;
   if (tiled) return false;  // finished in-block
   // The per-thread register slice must cover hidden / kThreads elements.
@@ -1124,6 +1136,7 @@ bool launch_mhc_compute_normed(const uint16_t* streams, const GlmMhcWeights& w,
 }
 
 void mhc_set_tiled_form(bool on) { g_mhc_tiled_enabled = on; }
+void mhc_set_tile_decode(bool on) { g_mhc_tile_decode = on; }
 void mhc_set_tile_min_tokens(int tokens) { g_mhc_tile_min_tokens = tokens < 1 ? 1 : tokens; }
 int mhc_tile_min_tokens() { return g_mhc_tile_min_tokens; }
 void mhc_set_prefill_gemm(bool on) { g_mhc_prefill_gemm = on; }

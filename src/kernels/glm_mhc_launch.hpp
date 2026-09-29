@@ -23,6 +23,11 @@ namespace dgpp {
 // the token-tiled form (default; bitwise the per-coefficient form) and the
 // per-coefficient form.
 void mhc_set_tiled_form(bool on);
+// Extend the token-tiled dots form to the decode rows (off by default): the
+// fused per-coefficient finish (tickets + side-stream deferred comb) is the
+// decode's graph-captured form; the tiled form's in-block finish is bitwise
+// the fused finish (glm_mhc_test) and skips the caller's comb launch.
+void mhc_set_tile_decode(bool on);
 // The prefill row count at or above which the mHC dots take the tiled
 // form (16 by default; a family with a group prefill sets 1 so a row's
 // coefficients never depend on the rows sharing the launch).

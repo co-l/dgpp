@@ -332,6 +332,21 @@ __device__ __forceinline__ void mma_gemv_block_body(const uint16_t* __restrict__
     stage_a<kTiles, kFp8, F::kLaneUnits, kW>(act, act_stride, m, k, base + W::kK, sA[buf ^ 1]);
     }
     const uint16_t* sAc = sA[buf];
+    // The lane's per-group scales, prefetched off the dequant->mma critical
+    // path (the per-use global load was 35.8 % of the warp's L1TEX stalls:
+    // ncu 2026-09-29). One 4-byte load per group, issued before the weight
+    // smem reads (the warp's rows share one scale row, rs >= 7); a ragged
+    // last window's past-k value is zeroed like the per-use guard's. The
+    // wider whole-window prefetch (all 2^cs blocks) overfetched 8x and cost
+    // ~1 ms/step live (2026-09-29 A/B), so only the consumed groups load.
+    float sc[4];
+    if constexpr (kFp8) {
+#pragma unroll
+      for (int g = 0; g < kGroups; ++g) {
+        const int c0 = base + g * F::kQuadSpan + t * F::kLaneK;
+        sc[g] = (row_live && c0 < k) ? scale_row[c0 >> cs] : 0.f;
+      }
+    }
 #pragma unroll
     for (int g = 0; g < kGroups; ++g) {
       if (base + g * F::kQuadSpan >= k) break;
@@ -344,7 +359,7 @@ __device__ __forceinline__ void mma_gemv_block_body(const uint16_t* __restrict__
         // and r+8: one 16-byte unit per 8 k.
         uint32_t w[8];
         if (kFp8) {
-          const float s = (row_live && c0 < k) ? scale_row[(c0 + v * F::kPerVec) >> cs] : 0.f;
+          const float s = sc[g];
           chunk_to_bf16x8(wv4[g][v], s, w);
         } else {
           w[0] = wv4[g][v].x; w[1] = wv4[g][v].y; w[2] = wv4[g][v].z; w[3] = wv4[g][v].w;
