@@ -339,7 +339,7 @@ __device__ __forceinline__ void mma_gemv_block_body(const uint16_t* __restrict__
     // last window's past-k value is zeroed like the per-use guard's. The
     // wider whole-window prefetch (all 2^cs blocks) overfetched 8x and cost
     // ~1 ms/step live (2026-09-29 A/B), so only the consumed groups load.
-    float sc[4];
+    float sc[W::kK / F::kQuadSpan];
     if constexpr (kFp8) {
 #pragma unroll
       for (int g = 0; g < kGroups; ++g) {

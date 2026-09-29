@@ -27,6 +27,7 @@
 
 #include "common/cuda_check.hpp"
 #include "kernels/fp4_gemv.hpp"
+#include "kernels/fp4_gemv.cuh"
 #include "kernels/packq_gemv.hpp"
 #include "kernels/glm_moe_launch.hpp"
 #include "kernels/latent_format.hpp"
@@ -1623,10 +1624,124 @@ DGPP_TEST(moe_nvfp4_shared_expert_matches_oracle_and_every_path_is_bitwise) {
   }
 }
 
-int main() {
+// ---- slot-kernel micro-bench (DGPP_MOE_SLOT_BENCH) -------------------------
+// The DSV4-0731 decode geometry at real scale: 256 experts, H 4096, I 2048,
+// top-6, 6 MTP rows (36 slots), MXFP4, the live unique-expert traffic (~20
+// unique of 36: the MTP rows share routing heavily, live mean 21.2/36).
+// Times the gate_up and down slot launches; the rate is the unique payload
+// (scales excluded, a few %).
+void moe_slot_bench() {
+  using namespace dgpp;
+  using dgpp::fp4_gemv::kMxGroup;
+  constexpr int E = 256, K = 6, ROWS = 6;
+  int H = 4096, I = 2048;
+  if (const char* geo = std::getenv("DGPP_MOE_SLOT_BENCH_GEO")) {
+    int h2, i2;
+    if (std::sscanf(geo, "%d,%d", &h2, &i2) == 2 && h2 > 0 && i2 > 0) {
+      H = h2;
+      I = i2;
+    }
+  }
+  constexpr int slots = ROWS * K;
+  const int32_t ids[slots] = {
+      10, 20, 30, 40, 50, 60,
+      10, 20, 30, 41, 51, 61,
+      11, 21, 32, 41, 51, 62,
+      11, 21, 31, 41, 51, 62,
+      12, 21, 31, 43, 52, 62,
+      12, 22, 31, 43, 53, 62};
+  bool seen[256] = {false};
+  int uniq = 0;
+  for (const int32_t e : ids)
+    if (!seen[e]) { seen[e] = true; ++uniq; }
+  const size_t gate_bytes = static_cast<size_t>(I) * (H / 2);  // per matrix
+  const size_t down_bytes = static_cast<size_t>(H) * (I / 2);
+  const size_t gate_scales = static_cast<size_t>(I) * (H / 32);
+  const size_t down_scales = static_cast<size_t>(H) * (I / 32);
+  uint8_t* payload = nullptr;
+  uint8_t* scales = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&payload, static_cast<size_t>(E) * (2 * gate_bytes + down_bytes)));
+  DGPP_CUDA_OK(cudaMalloc(&scales, static_cast<size_t>(E) * (2 * gate_scales + down_scales)));
+  DGPP_CUDA_OK(cudaMemset(payload, 0x5A, static_cast<size_t>(E) * (2 * gate_bytes + down_bytes)));
+  DGPP_CUDA_OK(cudaMemset(scales, 0x7F, static_cast<size_t>(E) * (2 * gate_scales + down_scales)));
+  MoeExpertView* views = nullptr;
+  DGPP_CUDA_OK(cudaMallocManaged(&views, static_cast<size_t>(E) * 3 * sizeof(MoeExpertView)));
+  for (int m = 0; m < E; ++m) {
+    uint8_t* p = payload + static_cast<size_t>(m) * (2 * gate_bytes + down_bytes);
+    uint8_t* s = scales + static_cast<size_t>(m) * (2 * gate_scales + down_scales);
+    views[3 * m + 0] = MoeExpertView{p, nullptr, s, nullptr, 7, 7, kMxGroup};
+    views[3 * m + 1] = MoeExpertView{p + gate_bytes, nullptr, s + gate_scales, nullptr, 7, 7, kMxGroup};
+    views[3 * m + 2] = MoeExpertView{p + 2 * gate_bytes, nullptr, s + 2 * gate_scales, nullptr, 7, 7, kMxGroup};
+  }
+  int32_t* d_ids = nullptr;
+  int32_t* order = nullptr;
+  DGPP_CUDA_OK(cudaMallocManaged(&d_ids, slots * sizeof(int32_t)));
+  std::memcpy(d_ids, ids, slots * sizeof(int32_t));
+  DGPP_CUDA_OK(cudaMallocManaged(&order, slots * sizeof(int32_t)));
+  for (int i = 0; i < slots; ++i) order[i] = i;
+  uint16_t* x = nullptr;
+  uint16_t* act = nullptr;
+  float* out = nullptr;
+  DGPP_CUDA_OK(cudaMalloc(&x, static_cast<size_t>(ROWS) * H * 2));
+  DGPP_CUDA_OK(cudaMemset(x, 0x3C, static_cast<size_t>(ROWS) * H * 2));
+  DGPP_CUDA_OK(cudaMalloc(&act, static_cast<size_t>(slots) * I * 2));
+  DGPP_CUDA_OK(cudaMalloc(&out, static_cast<size_t>(slots) * H * 4));
+  // Warm, then time: the launches' own traffic (>> the 24 MB L2) keeps the
+  // weights cold, no flush needed.
+  auto run_pair = [&]() {
+    launch_moe_slot_gate_up_swiglu_fp4(x, H, d_ids, order, views, I, H, 0, 0, nullptr, nullptr,
+                                       nullptr, nullptr, act, I, slots, K, 3.0f, nullptr,
+                                       -1, kMxGroup, 7, 7);
+    launch_moe_slot_down_fp4(act, I, d_ids, order, views, H, I, 0, 0, nullptr, nullptr,
+                             out, H, slots, K, nullptr, -1, kMxGroup, 7, 7);
+  };
+  auto run_gate = [&]() {
+    launch_moe_slot_gate_up_swiglu_fp4(x, H, d_ids, order, views, I, H, 0, 0, nullptr, nullptr,
+                                       nullptr, nullptr, act, I, slots, K, 3.0f, nullptr,
+                                       -1, kMxGroup, 7, 7);
+  };
+  auto run_down = [&]() {
+    launch_moe_slot_down_fp4(act, I, d_ids, order, views, H, I, 0, 0, nullptr, nullptr,
+                             out, H, slots, K, nullptr, -1, kMxGroup, 7, 7);
+  };
+  run_pair();
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  cudaEvent_t ea, eb;
+  cudaEventCreate(&ea);
+  cudaEventCreate(&eb);
+  const int iters = 30;
+  auto time_of = [&](auto fn) {
+    float ms;
+    cudaEventRecord(ea);
+    for (int i = 0; i < iters; ++i) fn();
+    cudaEventRecord(eb);
+    cudaEventSynchronize(eb);
+    cudaEventElapsedTime(&ms, ea, eb);
+    return ms * 1000.0 / iters;
+  };
+  const float pair_us = time_of(run_pair);
+  const float gate_us = time_of(run_gate);
+  const float down_us = time_of(run_down);
+  const size_t gu = static_cast<size_t>(uniq) * 2 * gate_bytes;
+  const size_t dn = static_cast<size_t>(uniq) * down_bytes;
+  std::printf("moe_slot bench: %d experts x 36 slots, %d unique\n", E, uniq);
+  std::printf("  pair:    %7.1f us/iter\n", pair_us);
+  std::printf("  gate_up: %7.1f us/launch  %8.1f MB unique  %6.0f GB/s\n", gate_us,
+              gu / 1e6, gu / (gate_us * 1e-6) / 1e9);
+  std::printf("  down:    %7.1f us/launch  %8.1f MB unique  %6.0f GB/s\n", down_us,
+              dn / 1e6, dn / (down_us * 1e-6) / 1e9);
+}
+
+int main(int argc, char** argv) {
+  (void)argc;
+  (void)argv;
   int devices = 0;
   const cudaError_t err = cudaGetDeviceCount(&devices);
   if (err != cudaSuccess || devices < 1) return 2;  // ctest: skip, no GPU
+  if (std::getenv("DGPP_MOE_SLOT_BENCH")) {
+    moe_slot_bench();
+    return 0;
+  }
   return dgpp::test::run_all();
 }
 

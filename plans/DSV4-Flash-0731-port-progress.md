@@ -168,6 +168,15 @@ dot GEMM (was the 343 ms mma storm).
 
 ## Verified facts (don't re-derive)
 
+- **The two-step (2 rows/warp) slot gate_up is bitwise-identical to the
+  one-step form but perf-neutral to negative at every bench geometry**
+  (2026-09-29 probe, mechanism reverted — not in the tree): gate_up
+  1104 vs 1103 us @ 4096/2048, 196 vs 199 @ 2048/1024, 31 vs 35 @
+  1024/512. At the live K=4096 the one-step per-row pipeline is already
+  saturated (rps=1, 8 chunks/lane in flight); rows-per-warp is NOT the
+  expert-kernel lever. The slot kernels sit at ~144–155 GB/s vs the
+  580–600 GB/s practical slab-cold: the lever is the memory pattern
+  (vllm 0731 reference at ~/dev/sparkrun-ds4/).
 - **Post-split-1 cold-prefill mix (nsys `spark:/tmp/pp2000split1.nsys-rep`,
   one 2000-token burst, GPU busy 1792 / wall 1835 ms, 97.7 %):**
   moe_grouped_w4a4_mx bf16-out 301.5 (16.8 %) + f32-out 165.0 (9.2 %) =
@@ -277,6 +286,34 @@ dot GEMM (was the 343 ms mma storm).
   cap. No config change needed for 500K.
 
 ## Log
+
+### 2026-09-29 (late night 2) — two-step slot gate_up: bitwise, perf-neutral, reverted
+
+- **The kSteps=2 (two rows/warp) slot gate_up was probed** (pair2 path
+  in fp4_gemv.cuh, kernel2 in glm_moe.cu, `DGPP_MOE_SLOT_STEPS2` gate).
+  First bug found by the bitwise pins (4 tests red): kernel2's fp8
+  shared branch kept the one-step warp stride (`n0 + warp*rps + i`) on
+  the doubled grid stride — of a block's 2·rpb rows only 9·rps were
+  covered (the first 8·rps written twice, the last 7·rps never written
+  → 0x7F poison in the shared expert's act; routed slots fine). Fixed
+  with the two-step warp stride (`n0 + 2*warp*rps + i`).
+- **Bitwise verified two ways:** all 33 unit tests green in both modes
+  (the nvfp4/mxfp4 slot-path + sliced-fold pins), and a buffer-safe
+  per-slot XOR hash of (accs + written act) per launch — the CUDA
+  printf buffer (~1 MB) drops per-row lines past ~768/launch, so the
+  hash replaced them; every slot hashes identical 1-step vs 2-step.
+- **Perf: no win anywhere** (bench with per-launch events, 19 unique
+  experts × 36 slots): gate_up 1104 vs 1103 us @ H/I=4096/2048, 196 vs
+  199 @ 2048/1024, 31 vs 35 @ 1024/512 (worse). The bench also now
+  times gate and down separately (the old split assumed equality) and
+  takes `DGPP_MOE_SLOT_BENCH_GEO=H,I`.
+- **The mechanism is reverted** (no dead code in the tree); the tree
+  keeps the mma `sc[]` size fix (`sc[4]` overflowed wide windows —
+  `sc[W::kK/F::kQuadSpan]`) and the bench improvements.
+- **Lesson:** rows-per-warp is not the expert lever — both slot
+  kernels sit at ~144–155 GB/s against 580–600 GB/s practical
+  slab-cold (3.7–4× headroom). Next: the memory pattern, with the
+  vllm 0731 fast-support reference at ~/dev/sparkrun-ds4/.
 
 ### 2026-09-29 (late night) — the memory ground truth: 830 GB/s DRAM, 24 MB L2; scale prefetch landed
 
