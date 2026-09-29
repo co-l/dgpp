@@ -152,7 +152,10 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
             "DGPP_LOG_LEVEL", "DGPP_MLOCK",
             "DGPP_L2_PREFETCH", "DGPP_L2_PREFETCH_MB", "DGPP_L2_PREFETCH_BOUNDARY", "DGPP_L2_PREFETCH_LAYER",
             // The bus timeline switch and the dense-lowering A/B switches: every rank the same.
-            "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD"};
+            "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD",
+            // The MX-experts' W4A4 prefill path (models/glm/moe_layer.cpp): the
+            // numerics must match on every rank.
+            "DGPP_MOE_W4A4", "DGPP_MOE_W4A4_DYNAMIC", "DGPP_MOE_W4A4_MIN_ROWS"};
         for (const Member& setting : node.members()) {
           bool known = false;
           for (const char* key : kNodeKeys) known = known || setting.key == key;

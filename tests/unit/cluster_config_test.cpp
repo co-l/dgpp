@@ -222,6 +222,19 @@ DGPP_TEST(cluster_config_accepts_per_rank_registration_diagnostics) {
           "both diagnostic settings retain per-rank values");
 }
 
+DGPP_TEST(cluster_config_accepts_the_moe_w4a4_numerics_knobs) {
+  const auto c = dgpp::serve::parse_cluster_config(
+      R"({"model":"m","nodes":["h","w"],"node_env":[
+        {"DGPP_MOE_W4A4":"0","DGPP_MOE_W4A4_DYNAMIC":"1"},
+        {"DGPP_MOE_W4A4_MIN_ROWS":"512"}]})", "t");
+  require(c.node_env.at(0).at("DGPP_MOE_W4A4") == "0" &&
+              c.node_env.at(0).at("DGPP_MOE_W4A4_DYNAMIC") == "1" &&
+              c.node_env.at(1).at("DGPP_MOE_W4A4_MIN_ROWS") == "512",
+          "the W4A4 numerics knobs reach every rank");
+  require(!refusal(R"({"model":"m","nodes":["h"],"node_env":[{"DGPP_MOE_W4A":"0"}]})").empty(),
+          "a typo stays disallowed");
+}
+
 DGPP_TEST(cluster_config_fileInputLimitsAndPaths) {
   const auto c = dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"],"engine":{
     "file_inputs":{"directory":"~/dgpp/input-files","pdf_command":"/usr/bin/pdftotext",
