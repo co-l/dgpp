@@ -19,7 +19,7 @@
     "admission_window": 256,
     "sampling_candidates": 128,
     "stats_interval_s": 10,
-    "model_alias": "deepseek-v4-flash-0731"
+    "model_alias": "deepseek-v4-flash"
   },
   "paths": {
     "resident_cache": ""

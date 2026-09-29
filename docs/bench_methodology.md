@@ -10,13 +10,13 @@ The reference command runs the [llama-benchy](https://pypi.org/project/llama-ben
 uvx llama-benchy --base-url http://192.168.1.223:8000/v1 \
   --pp 2000 --tg 64 --c 1 \
   --model deepseek-ai/DeepSeek-V4-Flash-0731 \
-  --served-model-name deepseek-v4-flash-0731
+  --served-model-name deepseek-v4-flash
 ```
 
 - `--pp 2000` — each prompt is sliced from a cached book corpus to exactly 2000 tokens (the tokenizer is loaded from the HF model `deepseek-ai/DeepSeek-V4-Flash-0731` and must match the checkpoint's tokenizer).
 - `--tg 64` — 64 output tokens per prompt.
 - `--c 1` — single stream, one request in flight.
-- `--model` names the tokenizer; `--served-model-name` is the `model` field sent in API calls (the engine serves `deepseek-v4-flash-0731`).
+- `--model` names the tokenizer; `--served-model-name` is the `model` field sent in API calls (the engine serves `deepseek-v4-flash`).
 - Defaults apply: 3 runs per test, a warmup request first, an `api`-mode latency baseline (a `GET /models` round trip subtracted from every time-to-first-token), and a coherence check on the generated text.
 
 A **pass** is defined as: warmup plus all three runs complete, the engine is still alive afterwards, and the `pp2000` and `tg64` rows exist with usable values. Any `graph walk STALLED` line in `serve_r0.log` followed by `serve: ENGINE FAILURE … exiting with status 2` is a crash, not a slow run.
