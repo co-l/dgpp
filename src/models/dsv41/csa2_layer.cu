@@ -470,7 +470,8 @@ void Csa2Layer::project_out(int tokens, void* out, cudaStream_t stream) {
     }
   }
   launch_scale_gemm_grid_bf16(oa_, size_t(lg) * cfg_.o_lora, w_.wo_b.payload, w_.wo_b.scales,
-                              static_cast<uint16_t*>(out), tokens, cfg_.hidden, lg * cfg_.o_lora, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(), cfg_.dense_mma);
+                              static_cast<uint16_t*>(out), tokens, cfg_.hidden, lg * cfg_.o_lora, stream, 0, cfg_.scale_shift(), cfg_.scale_shift(), cfg_.dense_mma,
+                              gemm_ws_, gemm_ws_bytes_);
 }
 
 // ---- decode ---------------------------------------------------------------------------------------

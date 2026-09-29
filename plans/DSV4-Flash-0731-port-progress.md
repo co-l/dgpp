@@ -6,6 +6,58 @@ meaningful step.
 
 ## Snapshot (2026-09-29)
 
+Live: W4A16 site default + flash DB + the wo_b decode ws fix.
+Parity 58 % on pp, ~88 % on tg.
+
+| path | pp2000 t/s | tg64 t/s | parity |
+|------|-----------:|---------:|--------|
+| W4A16 site default + wo_b ws (2026-09-29 night) | 1031.9 | ~30 | 1800 / 35 |
+| + flash DB, W4A16 site default (e4f4acb) | 1033.4 | 29.1 | 1800 / 35 |
+
+**Decode step fully mapped (2026-09-29 night, nsys 187 steps, wall
+77.4 ms, 98.2 % GPU busy):**
+
+- MoE experts = **at the practical DRAM ceiling, lever exhausted.**
+  The unique-expert trace (new env-gated `DGPP_MOE_UNIQUE_TRACE`,
+  device-side, in the graph decode path): n = 30/36 ids/layer (5–6 MTP
+  rows × top-6), unique = 8..36, mean **21.2** (random would be ~29 —
+  the MTP rows share routing heavily). Per layer that is 94.5 MB
+  (gate_up) + 47.2 MB (down) of unique-weight traffic at 611/286 us
+  = **~155 GB/s — the same practical ceiling the dense GEMVs hit**
+  (147–171 GB/s cold-L2 single-kernel streaming; 273 GB/s is the
+  part's peak). Experts and dense GEMVs all sit at 1.6–1.7× the
+  DRAM floor; the SPLITK_FILL A/B (96→192) is flat on tg — it is a
+  bandwidth ceiling, not a parallelism deficit.
+- **wo_b decode was missing the GEMM workspace** (every other
+  `launch_scale_gemm_grid_*` call passes it) — the split-K never
+  fired (64 blocks on 48 SMs). Fixed (harmless-to-small: wo_b is
+  n=k=4096 = 16 MB, 1.68× floor before, streaming ceiling after).
+  The earlier "wo_b 7–13× floor" micro-bench reading was a k=1024
+  misread (wo_b's k is lg×o_lora = 4096).
+- **The dense GEMV family (21.5 ms/step) is the whole step's
+  streaming tail: every site at ~155–170 GB/s.** wq_b 16.8 MB/98 us,
+  wo_b 16 MB/99 us, lm_head 265 MB/1091 us (1.12×, at the floor),
+  the bf16 compressor sites 1.3×. Nothing under-filled remains
+  (split-K covers every small-n site; 124 split-reduces + 92
+  multi-reduces per step confirm).
+- **Remaining structural levers (ranked):**
+  1. Fabric fold latency: 37.2 us × 92.2/step = **3.43 ms** — the
+     recorded bus node (post + peer doorbell + fold) is
+     single-outstanding by the v1 contract; polling is 32 ns
+     (already tight). Pipelining the next boundary's send under the
+     current fold = a bus-protocol project; worth ~1.5–2.5 ms/step.
+  2. mhc decode per-coefficient form: 22.2 us × 92.2 = **2.05 ms** —
+     96 blocks re-read 32 KB stream rows 24× per token; the bitwise
+     token-tiled form exists for prefill and is gated off for decode
+     (`!decode_rows`) because the fused finish (tickets + deferred
+     side-stream comb) is decode-specific. ~1 ms at best.
+  3. attn_flash 1.15 ms, lm_head 0.2 ms, smalls ~1.5 ms.
+  Structure ceiling: ~73.5 ms/step ≈ 33 t/s. **Parity (35 t/s ≈
+  70 ms/step) needs a structural change**: the fold pipeline (1),
+  a TP topology without the per-layer dense boundary (dense
+  replicated / MoE split — a code project), or a higher MTP
+  acceptance (2.2 tok/step now).
+
 Serving: `c511a51` live (the prefill pipe, shape-routed over the
 streaming GEMV, the bf16 mma row bound: wide-m bf16 matmuls take the
 Lt tile GEMM, and the prefill attention split = 1: the flash's grid
@@ -198,6 +250,43 @@ dot GEMM (was the 343 ms mma storm).
   cap. No config change needed for 500K.
 
 ## Log
+
+### 2026-09-29 (night) — decode step mapped to the floor; wo_b ws; expert ceiling proven
+
+- **Unique-expert trace shipped** (env-gated, device-side, inside the
+  graph decode path): `DGPP_MOE_UNIQUE_TRACE` — one 32-thread kernel
+  per MoE layer per step, a 256-expert mask, `atomicOr` + one device
+  printf (`[MOE] n=… unique=…`). Readings on the live world:
+  n = 30/36 (5–6 MTP rows × top-6; 5031 steps at 6 rows, 402 at 5),
+  unique min 8 / p50 21 / p90 27 / max 36, **mean 21.2** vs ~29 for
+  random — the MTP rows route to mostly the same experts.
+- **Expert DRAM floor proven**: 21.2 × 6.68 MB/rank = 142 MB/layer;
+  at the ~155 GB/s practical streaming ceiling (same rate the dense
+  GEMV micro-benches hit cold-L2) the floor is ~946 us/layer vs
+  897 us measured — **the expert kernels are AT the ceiling**. Bytes
+  are routing-set; the expert lever is exhausted. (The 273 GB/s peak
+  is unreachable for this pattern; 155 GB/s is the part's practical
+  GEMV streaming rate.)
+- **wo_b decode missing the GEMM workspace**: every
+  `launch_scale_gemm_grid_*` call in csa2 passes
+  `gemm_ws_, gemm_ws_bytes_` except wo_b — split-K dead there (64
+  blocks on 48 SMs). Fixed. The `DGPP_MMA_TRACE` env (new, in
+  mma_gemv) gave the ground-truth per-launch shapes: the 8-warp
+  bf16 class (72.3 × 98 us/step) is wq_b (n=16384 k=1024) + wo_b
+  (n=k=4096 = 16 MB, now splits=2) + main_proj (n=4096 k=12288) —
+  ALL at ~1.6–1.7× the DRAM floor (155–170 GB/s). Earlier "wo_b
+  7–13× floor" was a k=1024 misread (its k is lg×o_lora = 4096).
+- **SPLITK_FILL A/B (96 → 192): flat** (tg64 29.9 vs 30.0) — the
+  dense sites are bandwidth-limited at the streaming ceiling, not
+  under-filled. The fill knob stays at its default.
+- **Fabric fold = 3.43 ms/step of pure RoCE latency** (37.2 us ×
+  92.2 recorded bus nodes: two boundaries/layer, each a
+  single-outstanding post→doorbell→fold; poll granularity 32 ns,
+  already tight). Pipelining = a bus-protocol change.
+- Live numbers: pp2000 1031.9, tg64 ~30 (W4A16 site default + the
+  wo_b ws). Parity math: structure ceiling ~73.5 ms/step ≈ 33 t/s;
+  35 t/s needs the fold pipeline, a boundary-free TP topology, or a
+  higher MTP acceptance (2.2 tok/step now).
 
 ### 2026-09-29 — attn_flash double buffer + spark1 clock wedge
 

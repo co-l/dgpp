@@ -684,6 +684,28 @@ bool aligned16(const void* p) {
 
 }  // namespace
 
+// The unique-expert trace (the decode-step DRAM floor probe): the distinct
+// ids a step's routing draws, one printf per routed layer. One block, one
+// warp, a 256-expert mask.
+__global__ void moe_unique_trace_kernel(const int32_t* __restrict__ ids, int n) {
+  __shared__ unsigned mask[8];  // 256 experts
+  if (threadIdx.x < 8) mask[threadIdx.x] = 0u;
+  __syncthreads();
+  for (int i = threadIdx.x; i < n; i += 32)
+    atomicOr(&mask[ids[i] >> 5], 1u << (ids[i] & 31));
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int uniq = 0;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) uniq += __popc(mask[w]);
+    printf("[MOE] n=%d unique=%d\n", n, uniq);
+  }
+}
+void launch_moe_unique_trace(const int32_t* ids, int n, cudaStream_t stream) {
+  if (n <= 0) return;
+  moe_unique_trace_kernel<<<1, 32, 0, stream>>>(ids, n);
+}
+
 namespace {
 
 // The prefill router's dots: the warp-per-(token, expert) form

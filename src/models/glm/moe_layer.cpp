@@ -969,6 +969,11 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
                     d_weights_, d_scores_, d_biased_, cfg_, tokens, stream,
                     d_router_counters_, /*allow_tiled=*/true, w_.tid2eid,
                     input_ids);
+  {
+    static const bool unique_trace = std::getenv("DGPP_MOE_UNIQUE_TRACE") != nullptr;
+    if (unique_trace)
+      launch_moe_unique_trace(d_ids_, tokens * cfg_.top_k, stream);
+  }
   // 2. Route traces ride ASYNC copies into the caller's pinned staging;
   //    the caller materializes them after its next stream sync (the
   //    decode step's final sync). No round-trip on the hot path.

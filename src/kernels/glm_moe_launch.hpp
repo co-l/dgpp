@@ -364,5 +364,8 @@ void launch_moe_slot_down_packq(const uint16_t* act, size_t act_stride,
                                 int routed_bits, int n_shared, int shared_bits,
                                 float* out, int out_stride, int slots, int top_k,
                                 cudaStream_t stream, int shared_view_base);
+// The diagnostic unique-expert trace (DGPP_MOE_UNIQUE_TRACE): one printf per
+// routed layer, the distinct experts the ids draw.
+void launch_moe_unique_trace(const int32_t* ids, int n, cudaStream_t stream);
 
 }  // namespace dgpp

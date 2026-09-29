@@ -2,7 +2,9 @@
 #include "kernels/mma_gemv.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
+#include <unordered_set>
 #include <cuda_fp8.h>
 #include <cuda_fp16.h>
 #include <stdexcept>
@@ -588,6 +590,17 @@ void launch_mma_gemv_multi(const MmaGemvMultiProblem* probs, int np, int m, int 
     }
     mp.p[i].wper = (nwin + mp.p[i].splits - 1) / mp.p[i].splits;
   }
+  if (const char* t = std::getenv("DGPP_MMA_TRACE")) {
+    (void)t;
+    static std::unordered_set<long long> seenm;
+    long long key = static_cast<long long>(np) << 40 | static_cast<long long>(k) << 24;
+    for (int i = 0; i < np; ++i) key = key * 131 + probs[i].n;
+    if (seenm.insert(key).second) {
+      for (int i = 0; i < np; ++i)
+        std::fprintf(stderr, "[MMA-M] m=%d k=%d prob%d n=%d blocks=%d splits=%d\n", m, k, i, probs[i].n,
+                     mp.p[i].blocks, mp.p[i].splits);
+    }
+  }
   int total_blocks = 0;
   for (int i = 0; i < np; ++i) {
     total_blocks += mp.p[i].blocks * mp.p[i].splits;
@@ -686,6 +699,14 @@ void launch_decode_form(const uint16_t* a, size_t act_stride, const void* w, con
   }
   const int blocks = (n + kW * kRowsPerWarp - 1) / (kW * kRowsPerWarp);
   const int splits = split_k_for(blocks, n, k, Win<kTiles, kFp8>::kK, ws, ws_bytes);
+  if (const char* t = std::getenv("DGPP_MMA_TRACE")) {
+    (void)t;
+    static std::unordered_set<long long> seen;
+    const long long key = (static_cast<long long>(n) << 24) | (static_cast<long long>(k) << 8) | (kW << 4) | splits;
+    if (seen.insert(key).second)
+      std::fprintf(stderr, "[MMA] m=%d n=%d k=%d w=%d blocks=%d splits=%d ws=%p ws_bytes=%zu\n", rows, n, k, kW,
+                   blocks, splits, static_cast<const void*>(ws), ws_bytes);
+  }
   if (splits > 1) {
     float* part = static_cast<float*>(ws);
     mma_gemv_kernel<kTiles, kFp8, kW, OutT><<<dim3(blocks, splits), kW * 32, L::kSmemBytes, stream>>>(
