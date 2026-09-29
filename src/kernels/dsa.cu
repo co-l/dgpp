@@ -1964,7 +1964,7 @@ __global__ __launch_bounds__(dense::kThreads, 2) void attn_flash_kernel(
     const int32_t* __restrict__ topk, int topk_stride,
     const int32_t* __restrict__ counts, int rows, int n_split, int local_heads,
     int block_tokens, const int32_t* __restrict__ block_tables,
-    int blocks_per_request, float scale, float* __restrict__ m_ws,
+    int blocks_per_request, int pool_blocks, float scale, float* __restrict__ m_ws,
     float* __restrict__ l_ws, float* __restrict__ c_ws) {
   using G = dense::Geo<KV, SD>;
   constexpr int SQ = G::SQ, CW = G::CW, NT = G::NT, KW = G::KW, KS = G::KS;
@@ -2070,7 +2070,7 @@ __global__ __launch_bounds__(dense::kThreads, 2) void attn_flash_kernel(
           const int64_t tok = list[t0 + tt];
           const int64_t bidx = tok >= 0 ? tok / block_tokens : -1;
           const int32_t blk = (bidx >= 0 && bidx < blocks_per_request) ? bt[bidx] : -1;
-          if (blk >= 0 && blk < blocks_per_request) {
+          if (blk >= 0 && blk < pool_blocks) {
             const int64_t phys = int64_t(blk) * block_tokens + (tok % block_tokens);
             val = LatentTile<F>::load8(latent, latent_scale, phys, kRowBytes, KV, c8 * 8);
           } else if (c8 == 0) {
@@ -3248,14 +3248,14 @@ void launch_attn_flash_variant(dim3 grid, const void* q_tilde,
                                const int32_t* counts, int rows, int n_split,
                                int local_heads, int block_tokens,
                                const int32_t* block_tables, int blocks_per_request,
-                               float scale, float* m_ws, float* l_ws, float* c_ws,
-                               cudaStream_t stream) {
+                               int pool_blocks, float scale, float* m_ws, float* l_ws,
+                               float* c_ws, cudaStream_t stream) {
   attn_flash_kernel<KV, SD, kListed, F><<<grid, dense::kThreads,
                                           dense::Geo<KV, SD>::smem_bytes, stream>>>(
       static_cast<const uint16_t*>(q_tilde),
       static_cast<const uint8_t*>(latent_cache), latent_scale, req_ids, pos, topk,
       topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
-      blocks_per_request, scale, m_ws, l_ws, c_ws);
+      blocks_per_request, pool_blocks, scale, m_ws, l_ws, c_ws);
 }
 
 template <int KV, int SD, bool kListed>
@@ -3266,38 +3266,38 @@ void launch_attn_flash_format(LatentFormat format, dim3 grid, const void* q_tild
                               const int32_t* counts, int rows, int n_split,
                               int local_heads, int block_tokens,
                               const int32_t* block_tables, int blocks_per_request,
-                              float scale, float* m_ws, float* l_ws, float* c_ws,
-                              cudaStream_t stream) {
+                              int pool_blocks, float scale, float* m_ws, float* l_ws,
+                              float* c_ws, cudaStream_t stream) {
   switch (format) {
     case LatentFormat::kBf16:
       launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kBf16>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+          blocks_per_request, pool_blocks, scale, m_ws, l_ws, c_ws, stream);
       break;
     case LatentFormat::kFp8:
       launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp8>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+          blocks_per_request, pool_blocks, scale, m_ws, l_ws, c_ws, stream);
       break;
     case LatentFormat::kFp4:
       launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp4>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+          blocks_per_request, pool_blocks, scale, m_ws, l_ws, c_ws, stream);
       break;
     case LatentFormat::kFp8Block:
       launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp8Block>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+          blocks_per_request, pool_blocks, scale, m_ws, l_ws, c_ws, stream);
       break;
     case LatentFormat::kFp4Block:
       launch_attn_flash_variant<KV, SD, kListed, LatentFormat::kFp4Block>(
           grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk, topk_stride,
           counts, rows, n_split, local_heads, block_tokens, block_tables,
-          blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+          blocks_per_request, pool_blocks, scale, m_ws, l_ws, c_ws, stream);
       break;
   }
 }
@@ -3308,8 +3308,8 @@ bool launch_attn_flash(const void* q_tilde, const void* latent_cache,
                        const int32_t* topk, int topk_stride, const int32_t* counts,
                        int rows, int n_split, int local_heads, int kv_lora,
                        int block_tokens, const int32_t* block_tables,
-                       int blocks_per_request, float scale, float* m_ws,
-                       float* l_ws, float* c_ws, cudaStream_t stream,
+                       int blocks_per_request, int pool_blocks, float scale,
+                       float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
                        LatentFormat format, const float* latent_scale, int rope) {
   if (rows <= 0) return true;
   // The compiled geometries: 512 and 256 without a tail, 512 + 64 with one.
@@ -3327,17 +3327,17 @@ bool launch_attn_flash(const void* q_tilde, const void* latent_cache,
     launch_attn_flash_format<512, 576, kListed>(
         format, grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk,
         topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
-        blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+        blocks_per_request, pool_blocks, scale, m_ws, l_ws, c_ws, stream);
   } else if (kv_lora == 512) {
     launch_attn_flash_format<512, 512, kListed>(
         format, grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk,
         topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
-        blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+        blocks_per_request, pool_blocks, scale, m_ws, l_ws, c_ws, stream);
   } else {
     launch_attn_flash_format<256, 256, kListed>(
         format, grid, q_tilde, latent_cache, latent_scale, req_ids, pos, topk,
         topk_stride, counts, rows, n_split, local_heads, block_tokens, block_tables,
-        blocks_per_request, scale, m_ws, l_ws, c_ws, stream);
+        blocks_per_request, pool_blocks, scale, m_ws, l_ws, c_ws, stream);
   }
   DGPP_CUDA_OK(cudaGetLastError());
   return true;
@@ -3354,22 +3354,22 @@ bool dsa_attn_dense(const void* q_tilde, const void* latent_cache,
   return launch_attn_flash<false>(q_tilde, latent_cache, req_ids, pos, nullptr, 0,
                                   nullptr, rows, n_split, local_heads, kv_lora,
                                   block_tokens, block_tables, blocks_per_request,
-                                  scale, m_ws, l_ws, c_ws, stream, format,
-                                  latent_scale, rope);
+                                  blocks_per_request, scale, m_ws, l_ws, c_ws, stream,
+                                  format, latent_scale, rope);
 }
 
 bool dsa_attn_listed(const void* q_tilde, const void* latent_cache,
                      const int32_t* req_ids, const int32_t* topk, int topk_stride,
                      const int32_t* counts, int rows, int n_split, int local_heads,
                      int kv_lora, int block_tokens, const int32_t* block_tables,
-                     int blocks_per_request, float scale, float* m_ws, float* l_ws,
-                     float* c_ws, cudaStream_t stream, LatentFormat format,
-                     const float* latent_scale, int rope) {
+                     int blocks_per_request, int pool_blocks, float scale,
+                     float* m_ws, float* l_ws, float* c_ws, cudaStream_t stream,
+                     LatentFormat format, const float* latent_scale, int rope) {
   return launch_attn_flash<true>(q_tilde, latent_cache, req_ids, nullptr, topk,
                                  topk_stride, counts, rows, n_split, local_heads,
                                  kv_lora, block_tokens, block_tables,
-                                 blocks_per_request, scale, m_ws, l_ws, c_ws, stream,
-                                 format, latent_scale, rope);
+                                 blocks_per_request, pool_blocks, scale, m_ws, l_ws,
+                                 c_ws, stream, format, latent_scale, rope);
 }
 
 void dsa_attn_combine(const float* m_ws, const float* l_ws, const float* c_ws,

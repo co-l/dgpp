@@ -879,19 +879,25 @@ DGPP_TEST(csa2_attn_finish_merges_sources_with_the_sink_and_unrotates) {
 
 DGPP_TEST(csa2_window_attention_end_to_end_matches_sparse_attn) {
   // Four heads over a 160-slot ring of fp8_block rows (dsa_attn_partial
-  // mis-partitions 1-2 heads; DsaLayer refuses them). Two ring states: the
-  // first four positions appended (a query at 3 sees a short window), and
-  // positions 0..315 appended in chunks of 16 (the ring holds 156..315;
-  // queries at 283, 300 and 315 see full, wrapped windows).
-  const int lh = 4, window = 128, ring = 160;
+  // mis-partitions 1-2 heads; DsaLayer refuses them), plus sixteen: the
+  // window the layer runs on the flash's listed (tensor-core) form. Two
+  // ring states: the first four positions appended (a query at 3 sees a
+  // short window), and positions 0..315 appended in chunks of 16 (the ring
+  // holds 156..315; queries at 283, 300 and 315 see full, wrapped windows).
+  const int window = 128, ring = 160;
   const int64_t last = 315;
   auto kv = random_bf16_bits(0x77, (last + 1) * 512, -4, 2);  // every position's roped kv
-  std::vector<float> sink = {0.5f, -0.7f, 1.1f, -2.0f};
+  std::vector<float> sinkbase = {0.5f, -0.7f, 1.1f, -2.0f};
   std::vector<float> freq(32);
   dgpp::csa2_rope_inv_freq_host(64, 10000.0, 0, 16.0, 32.0, 1.0, freq.data());
   const float scale = 1.0f / std::sqrt(512.0f);
-  DevBuf dkv = upload(kv), dtab = upload(std::vector<int32_t>{0}), dsink = upload(sink), dfreq = upload(freq);
-  const auto run = [&](int64_t appended_upto, const std::vector<int64_t>& pos, const std::string& what) {
+  DevBuf dkv = upload(kv), dtab = upload(std::vector<int32_t>{0}), dfreq = upload(freq);
+  const auto run = [&](int lh, int64_t appended_upto, const std::vector<int64_t>& pos, const std::string& what) {
+    // The layer's per-head sink (the finish kernel's sink[h]); the base
+    // pattern repeated so the four-head and the wide runs share values.
+    std::vector<float> sink(lh);
+    for (int h = 0; h < lh; ++h) sink[h] = sinkbase[size_t(h) % sinkbase.size()];
+    DevBuf dsink = upload(sink);
     DevBuf dring(size_t(ring) * 528);
     DGPP_CUDA_OK(cudaMemset(dring.p, 0, size_t(ring) * 528));
     for (int64_t p0 = 0; p0 <= appended_upto; p0 += 16) {
@@ -912,9 +918,20 @@ DGPP_TEST(csa2_window_attention_end_to_end_matches_sparse_attn) {
         dc(size_t(rows) * lh * 512 * 4), dout(size_t(rows) * lh * 512 * 2);
     dgpp::csa2_window_slots_decode(static_cast<const int64_t*>(dpos.p), rows, window, ring, static_cast<int32_t*>(dlist.p),
                                    static_cast<int32_t*>(dcnt.p), 0);
-    dgpp::dsa_attn_partial(dq.p, dring.p, static_cast<const int32_t*>(dri.p), static_cast<const int32_t*>(dlist.p), window,
-                           static_cast<const int32_t*>(dcnt.p), rows, 1, lh, 512, ring, static_cast<const int32_t*>(dtab.p), 1, scale,
-                           static_cast<float*>(dm.p), static_cast<float*>(dl.p), static_cast<float*>(dc.p), 0, LatentFormat::kFp8Block);
+    // The window the layer's attend_rows runs: the flash's listed
+    // (tensor-core) form, the scalar partial as its fallback (the narrow
+    // heads).
+    const bool flash = dgpp::dsa_attn_listed(dq.p, dring.p, static_cast<const int32_t*>(dri.p),
+                                             static_cast<const int32_t*>(dlist.p), window,
+                                             static_cast<const int32_t*>(dcnt.p), rows, 1, lh, 512, ring,
+                                             static_cast<const int32_t*>(dtab.p), 1, 1, scale,
+                                             static_cast<float*>(dm.p), static_cast<float*>(dl.p),
+                                             static_cast<float*>(dc.p), 0, LatentFormat::kFp8Block, nullptr, 0);
+    if (!flash)
+      dgpp::dsa_attn_partial(dq.p, dring.p, static_cast<const int32_t*>(dri.p), static_cast<const int32_t*>(dlist.p), window,
+                             static_cast<const int32_t*>(dcnt.p), rows, 1, lh, 512, ring, static_cast<const int32_t*>(dtab.p), 1, scale,
+                             static_cast<float*>(dm.p), static_cast<float*>(dl.p), static_cast<float*>(dc.p), 0,
+                             LatentFormat::kFp8Block);
     dgpp::csa2_attn_finish(nullptr, nullptr, nullptr, 0, static_cast<const float*>(dm.p), static_cast<const float*>(dl.p),
                            static_cast<const float*>(dc.p), 1, static_cast<const float*>(dsink.p), rows, lh,
                            static_cast<const int64_t*>(dpos.p), static_cast<const float*>(dfreq.p), dout.p, 0);
@@ -960,8 +977,10 @@ DGPP_TEST(csa2_window_attention_end_to_end_matches_sparse_attn) {
     }
     require_bf16(what + ": window attention vs sparse_attn", compare_bf16(got, want, 8), 0.01, 0.01);
   };
-  run(3, {3, 0, 2}, "short ring");
-  run(last, {283, 300, 315}, "wrapped ring");
+  run(4, 3, {3, 0, 2}, "short ring");
+  run(4, last, {283, 300, 315}, "wrapped ring");
+  run(16, 3, {3, 0, 2}, "short ring, 16 heads");
+  run(16, last, {283, 300, 315}, "wrapped ring, 16 heads");
 }
 
 // ---- the 0731 activation roundings (quantize-dequantize, bf16 values) ------

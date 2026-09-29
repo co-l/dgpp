@@ -410,9 +410,18 @@ void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, con
   // combine order, the rounding class the decode audit certifies.
   // n_split_win <= n_split_main, so it fits ws_slots.
   const int n_split_win = split_window ? std::min(n_split_main, kWinDecodeSplit) : 1;
-  dsa_attn_partial(q, win_cache, req_ids_win, list + size_t(row0) * list_stride, list_stride, counts + row0, rows,
-                   n_split_win, lh, kCsa2Latent, win_block_tokens, win_table, 1, attn_scale_, m_win_, l_win_, c_win_,
-                   stream, pool.ring_format(), nullptr, 0);
+  // The window on the flash's listed form (the tensor-core mma's k tiles
+  // shared across the slab's heads): the row's list the window's slots
+  // (the scratch's rows at prefill, the ring's at decode), the cache one
+  // block per request (win_table, win_block_tokens). The scalar partial is
+  // the narrow-heads fallback; the listed form's fp32 combine order differs
+  // from the partial's (the audit's certified class).
+  if (!dsa_attn_listed(q, win_cache, req_ids_win, list + size_t(row0) * list_stride, list_stride, counts + row0, rows,
+                       n_split_win, lh, kCsa2Latent, win_block_tokens, win_table, 1, pool.shape().max_requests,
+                       attn_scale_, m_win_, l_win_, c_win_, stream, pool.ring_format(), nullptr, 0))
+    dsa_attn_partial(q, win_cache, req_ids_win, list + size_t(row0) * list_stride, list_stride, counts + row0, rows,
+                     n_split_win, lh, kCsa2Latent, win_block_tokens, win_table, 1, attn_scale_, m_win_, l_win_, c_win_,
+                     stream, pool.ring_format(), nullptr, 0);
   int n_main = 0;
   if (w_.ratio > 0) {
     const int ord = w_.cache_ord;
@@ -422,8 +431,8 @@ void Csa2Layer::attend_rows(Csa2StatePool& pool, const int32_t* req_ids_win, con
     n_main = n_split_main;
     if (!(lh >= 16 && lh % 16 == 0 &&
           dsa_attn_listed(q, pool.main(ord), req_ids_main, topk, sel_col_, counts, rows, n_main, lh, kCsa2Latent,
-                          epb, pool.block_tables(), int(pool.total_blocks()), attn_scale_, m_main_, l_main_, c_main_,
-                          stream, pool.main_format(), nullptr, 0)))
+                          epb, pool.block_tables(), int(pool.total_blocks()), int(pool.total_blocks()), attn_scale_,
+                          m_main_, l_main_, c_main_, stream, pool.main_format(), nullptr, 0)))
       dsa_attn_partial(q, pool.main(ord), req_ids_main, topk, sel_col_, counts, rows, n_main, lh, kCsa2Latent,
                        epb, pool.block_tables(), int(pool.total_blocks()), attn_scale_, m_main_, l_main_, c_main_,
                        stream, pool.main_format(), nullptr, 0);

@@ -1154,7 +1154,7 @@ DGPP_TEST(dsa_listed_attention_matches_split_kernel_and_reference) {
                                         static_cast<const int32_t*>(dtopk.p), max_selected,
                                         static_cast<const int32_t*>(dcnt.p), rows, n_split,
                                         local_heads, kv_lora, block_tokens,
-                                        static_cast<const int32_t*>(dbt.p), n_blocks, scale,
+                                        static_cast<const int32_t*>(dbt.p), n_blocks, n_blocks, scale,
                                         static_cast<float*>(dm.p), static_cast<float*>(dl.p),
                                         static_cast<float*>(dc.p), 0);
         if (!ok) throw std::runtime_error("listed kernel refused the geometry");
@@ -3795,7 +3795,7 @@ void attention_quantized_case(LatentFormat fmt, uint64_t seed) {
   if (!dsa_attn_listed(dqt.p, dcache.p, static_cast<const int32_t*>(dri.p),
                        static_cast<const int32_t*>(dtopk.p), max_selected,
                        static_cast<const int32_t*>(dcnt.p), rows, n_split, local_heads, kv_lora,
-                       block_tokens, static_cast<const int32_t*>(dbt.p), n_blocks, scale,
+                       block_tokens, static_cast<const int32_t*>(dbt.p), n_blocks, n_blocks, scale,
                        static_cast<float*>(dm.p), static_cast<float*>(dl.p),
                        static_cast<float*>(dc.p), 0, fmt, static_cast<const float*>(dscale.p)))
     throw std::runtime_error(what + ": the listed flash kernel declined the real geometry");

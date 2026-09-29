@@ -344,12 +344,16 @@ bool dsa_attn_dense(const void* q_tilde, const void* latent_cache,
 // dsa_attn_partial takes them, each 16-row slab (one query row) walking its
 // own list. Requires local_heads a multiple of 16 (returns false otherwise,
 // as for kv_lora outside 512/256); combine with dsa_attn_combine.
+// pool_blocks: the pool's physical block count — the gather's upper bound
+// for a block table entry. blocks_per_request is the table row stride only;
+// they coincide for a full pool table, and the ring (one block per request,
+// the identity table) passes the pool's max_requests.
 bool dsa_attn_listed(const void* q_tilde, const void* latent_cache,
                      const int32_t* req_ids, const int32_t* topk, int topk_stride,
                      const int32_t* counts, int rows, int n_split, int local_heads,
                      int kv_lora, int block_tokens, const int32_t* block_tables,
-                     int blocks_per_request, float scale, float* m_ws, float* l_ws,
-                     float* c_ws, cudaStream_t stream,
+                     int blocks_per_request, int pool_blocks, float scale, float* m_ws,
+                     float* l_ws, float* c_ws, cudaStream_t stream,
                      LatentFormat format = LatentFormat::kBf16,
                      const float* latent_scale = nullptr, int rope = 0);
 
