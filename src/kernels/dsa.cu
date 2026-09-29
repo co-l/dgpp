@@ -1932,6 +1932,19 @@ __device__ __forceinline__ void mma_bf16_16816(float (&c)[4], uint32_t a0,
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+// The flash kernel's async gather (the bf16 listed double buffer).
+__device__ __forceinline__ void dsa_cp_async16(void* dst, const void* src) {
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+               ::"r"((unsigned)__cvta_generic_to_shared(dst)), "l"(src));
+}
+__device__ __forceinline__ void dsa_cp_async_commit() {
+  asm volatile("cp.async.commit_group;\n" ::);
+}
+template <int kWait>
+__device__ __forceinline__ void dsa_cp_async_wait() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(kWait));
+}
+
 // kListed (2026-09-05, the sparse regime): instead of the causal range,
 // each 16-row SLAB — one query row at local_heads >= 16 — walks its own
 // selected-token list (topk[row], counts[row], the split kernel's inputs)
@@ -1973,10 +1986,26 @@ __global__ __launch_bounds__(dense::kThreads, 2) void attn_flash_kernel(
   constexpr int NTOK = kListed ? 16 : dense::kTile;  // tokens per tile (per slab when listed)
   constexpr int JT = NTOK / 8;    // n8 tiles of tokens in S
   constexpr int KK = NTOK / 16;   // k16 steps of tokens in P.L
+  // The S exchange stride: the listed JT's (a warp's partial is JT x 4 x 32
+  // floats); the dense JT=4's is dense::kExchangeFloats.
+  constexpr int kEx = JT * 4 * 32;
   extern __shared__ __align__(16) uint8_t dsmem[];
-  uint16_t* sQ = reinterpret_cast<uint16_t*>(dsmem);          // [M][SQ]
-  uint16_t* sLall = sQ + M * SQ;                               // dense: [32][SQ]; listed: [2][16][SQ]
-  float* sX = reinterpret_cast<float*>(sLall + dense::kTile * SQ);  // [8][16*32]
+  // The bf16 listed path pipelines the gather: Q~ lives in registers (the
+  // smem copy's tail columns SD..SQ are never written), the latent tile is
+  // double-buffered (cp.async), the S exchange buffer is the listed JT's —
+  // 64 latent rows + 8 KB, under the dense 91 KB.
+  constexpr bool kListedDb = kListed && F == LatentFormat::kBf16;
+  uint16_t* sQ, *sLall;
+  float* sX;
+  if constexpr (kListedDb) {
+    sLall = reinterpret_cast<uint16_t*>(dsmem);  // [2 slabs][2 bufs][NTOK][SQ]
+    sX = reinterpret_cast<float*>(sLall + 4 * NTOK * SQ);
+    sQ = nullptr;
+  } else {
+    sQ = reinterpret_cast<uint16_t*>(dsmem);  // [M][SQ]
+    sLall = sQ + M * SQ;  // dense: [32][SQ]; listed: [2][16][SQ]
+    sX = reinterpret_cast<float*>(sLall + dense::kTile * SQ);
+  }
 
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int slab = warp / 4, quarter = warp % 4;
@@ -1984,7 +2013,8 @@ __global__ __launch_bounds__(dense::kThreads, 2) void attn_flash_kernel(
   const int total_m = rows * local_heads;
   const int m0 = blockIdx.x * M;
   const int s = blockIdx.y;
-  uint16_t* sL = kListed ? sLall + slab * NTOK * SQ : sLall;
+  uint16_t* sL =
+      kListedDb ? nullptr : (kListed ? sLall + slab * NTOK * SQ : sLall);
 
   // The lane's two M-rows (slab rows r and r+8): validity and positions.
   const int m_lo = m0 + slab * 16 + r;
@@ -2034,14 +2064,40 @@ __global__ __launch_bounds__(dense::kThreads, 2) void attn_flash_kernel(
     n_tiles = max(s_tiles[0], s_tiles[1]);
   }
 
-  // Q~ tile into shared memory (zero past the last M-row).
-  for (int idx = threadIdx.x; idx < M * (SD / 8); idx += dense::kThreads) {
-    const int mm = idx / (SD / 8), c8 = idx % (SD / 8);
-    uint4 val = make_uint4(0, 0, 0, 0);
-    if (m0 + mm < total_m)
-      val = *reinterpret_cast<const uint4*>(q_tilde + int64_t(m0 + mm) * SD +
-                                            c8 * 8);
-    *reinterpret_cast<uint4*>(sQ + mm * SQ + c8 * 8) = val;
+  // Q~ fragments: the bf16 listed path keeps them in registers (the smem
+  // tile's tail columns SD..SQ-1 were never written by the load below —
+  // zero here); the rest keeps the shared tile.
+  uint32_t qreg[KS][4] = {0, 0, 0, 0};
+  if constexpr (kListedDb) {
+    const int g_lo = m0 + slab * 16 + r;
+    const int g_hi = g_lo + 8;
+#pragma unroll
+    for (int ks = 0; ks < KS; ++ks) {
+      const int k0 = quarter * KW + ks * 16;
+      if (g_lo < total_m)
+        qreg[ks][0] = *reinterpret_cast<const uint32_t*>(
+            q_tilde + int64_t(g_lo) * SD + k0 + cc);
+      if (g_hi < total_m)
+        qreg[ks][1] = *reinterpret_cast<const uint32_t*>(
+            q_tilde + int64_t(g_hi) * SD + k0 + cc);
+      const int k2 = k0 + cc + 8;
+      if (g_lo < total_m && k2 + 1 < SD)
+        qreg[ks][2] =
+            *reinterpret_cast<const uint32_t*>(q_tilde + int64_t(g_lo) * SD + k2);
+      if (g_hi < total_m && k2 + 1 < SD)
+        qreg[ks][3] =
+            *reinterpret_cast<const uint32_t*>(q_tilde + int64_t(g_hi) * SD + k2);
+    }
+  } else {
+    // Q~ tile into shared memory (zero past the last M-row).
+    for (int idx = threadIdx.x; idx < M * (SD / 8); idx += dense::kThreads) {
+      const int mm = idx / (SD / 8), c8 = idx % (SD / 8);
+      uint4 val = make_uint4(0, 0, 0, 0);
+      if (m0 + mm < total_m)
+        val = *reinterpret_cast<const uint4*>(q_tilde + int64_t(m0 + mm) * SD +
+                                              c8 * 8);
+      *reinterpret_cast<uint4*>(sQ + mm * SQ + c8 * 8) = val;
+    }
   }
 
   float acc[NT][4];
@@ -2050,13 +2106,53 @@ __global__ __launch_bounds__(dense::kThreads, 2) void attn_flash_kernel(
   float m_lo_run = -INFINITY, m_hi_run = -INFINITY;
   float l_lo = 0.f, l_hi = 0.f;
 
+  // The bf16 listed gather: one slab's 128 threads cp.async their tile into
+  // the named buffer (the async engine overlaps it with the current tile's
+  // compute); an invalid token zero-fills in place (a 0-byte cp.async is a
+  // no-op) and records the first anomaly, as the in-place form did.
+  auto gather_async = [&](int tile, int buf) {
+    const int t0 = t_begin + tile * NTOK;
+    const int n = max(0, min(NTOK, t_end - t0));
+    uint8_t* dst = reinterpret_cast<uint8_t*>(sLall + (slab * 2 + buf) * NTOK * SQ);
+    const int tid = threadIdx.x % 128;
+    for (int idx = tid; idx < NTOK * (SD / 8); idx += 128) {
+      const int tt = idx / (SD / 8), c8 = idx % (SD / 8);
+      uint8_t* dp = dst + (size_t)tt * SQ * 2 + c8 * 16;
+      if (tt < n) {
+        const int64_t tok = list[t0 + tt];
+        const int64_t bidx = tok >= 0 ? tok / block_tokens : -1;
+        const int32_t blk = (bidx >= 0 && bidx < blocks_per_request) ? bt[bidx] : -1;
+        if (blk >= 0 && blk < pool_blocks) {
+          const int64_t phys = int64_t(blk) * block_tokens + (tok % block_tokens);
+          dsa_cp_async16(dp, latent + phys * int64_t(kRowBytes) + c8 * 16);
+        } else {
+          if (c8 == 0) attn_anomaly_record(tok, blk, qrow_first, s, t0 + tt, n);
+          *reinterpret_cast<uint4*>(dp) = make_uint4(0, 0, 0, 0);
+        }
+      } else {
+        *reinterpret_cast<uint4*>(dp) = make_uint4(0, 0, 0, 0);
+      }
+    }
+    dsa_cp_async_commit();
+  };
+  if constexpr (kListedDb) {
+    if (n_tiles > 0) gather_async(0, 0);
+  }
+
   for (int tile = 0; tile < n_tiles; ++tile) {
     const int t0 = t_begin + tile * NTOK;
     const int n = max(0, min(NTOK, t_end - t0));  // this slab's live tokens
     __syncthreads();  // the previous tile's readers are done (and sQ landed)
-    // Latent tile gather (zero-filled past n). Dense: the whole block fills
-    // the shared tile; listed: each slab's 128 threads fill their own.
-    if constexpr (kListed) {
+    if constexpr (kListedDb) {
+      // Issue the next tile's gather into the other buffer, then wait for
+      // this tile's group (one group may stay outstanding).
+      if (tile + 1 < n_tiles) gather_async(tile + 1, (tile + 1) & 1);
+      if (tile + 1 < n_tiles)
+        dsa_cp_async_wait<1>();
+      else
+        dsa_cp_async_wait<0>();
+      sL = sLall + (slab * 2 + (tile & 1)) * NTOK * SQ;
+    } else if constexpr (kListed) {
       const int tid = threadIdx.x % 128;
       for (int idx = tid; idx < NTOK * (SD / 8); idx += 128) {
         const int tt = idx / (SD / 8), c8 = idx % (SD / 8);
@@ -2102,10 +2198,22 @@ __global__ __launch_bounds__(dense::kThreads, 2) void attn_flash_kernel(
 #pragma unroll
     for (int ks = 0; ks < KS; ++ks) {
       const int k0 = quarter * KW + ks * 16;
-      const uint32_t a0 = *reinterpret_cast<const uint32_t*>(&sQ[arow_lo * SQ + k0 + cc]);
-      const uint32_t a1 = *reinterpret_cast<const uint32_t*>(&sQ[(arow_lo + 8) * SQ + k0 + cc]);
-      const uint32_t a2 = *reinterpret_cast<const uint32_t*>(&sQ[arow_lo * SQ + k0 + cc + 8]);
-      const uint32_t a3 = *reinterpret_cast<const uint32_t*>(&sQ[(arow_lo + 8) * SQ + k0 + cc + 8]);
+      const uint32_t a0 = kListedDb
+                              ? qreg[ks][0]
+                              : *reinterpret_cast<const uint32_t*>(
+                                    &sQ[arow_lo * SQ + k0 + cc]);
+      const uint32_t a1 = kListedDb
+                              ? qreg[ks][1]
+                              : *reinterpret_cast<const uint32_t*>(
+                                    &sQ[(arow_lo + 8) * SQ + k0 + cc]);
+      const uint32_t a2 = kListedDb
+                              ? qreg[ks][2]
+                              : *reinterpret_cast<const uint32_t*>(
+                                    &sQ[arow_lo * SQ + k0 + cc + 8]);
+      const uint32_t a3 = kListedDb
+                              ? qreg[ks][3]
+                              : *reinterpret_cast<const uint32_t*>(
+                                    &sQ[(arow_lo + 8) * SQ + k0 + cc + 8]);
 #pragma unroll
       for (int j = 0; j < JT; ++j) {
         const int tn = j * 8 + r;  // token within the tile (the n index)
@@ -2116,7 +2224,7 @@ __global__ __launch_bounds__(dense::kThreads, 2) void attn_flash_kernel(
     }
     // Exchange: every warp of the slab sums the four quarters in the same
     // order, so the slab's warps hold bitwise-identical S.
-    float* mine = sX + warp * dense::kExchangeFloats + lane * 16;
+    float* mine = sX + warp * kEx + lane * (JT * 4);
 #pragma unroll
     for (int j = 0; j < JT; ++j) {
       mine[j * 4 + 0] = sp[j][0];
@@ -2130,11 +2238,11 @@ __global__ __launch_bounds__(dense::kThreads, 2) void attn_flash_kernel(
     for (int j = 0; j < JT; ++j) {
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        const float* q0 = sX + (slab * 4 + 0) * dense::kExchangeFloats + lane * 16 + j * 4 + i;
+        const float* q0 = sX + (slab * 4 + 0) * kEx + lane * (JT * 4) + j * 4 + i;
         float v = q0[0];
-        v += q0[1 * dense::kExchangeFloats];
-        v += q0[2 * dense::kExchangeFloats];
-        v += q0[3 * dense::kExchangeFloats];
+        v += q0[1 * kEx];
+        v += q0[2 * kEx];
+        v += q0[3 * kEx];
         sc[j][i] = v;
       }
     }

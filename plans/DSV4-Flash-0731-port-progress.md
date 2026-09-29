@@ -71,6 +71,31 @@ dot GEMM (was the 343 ms mma storm).
 
 ## Verified facts (don't re-derive)
 
+- **Post-split-1 cold-prefill mix (nsys `spark:/tmp/pp2000split1.nsys-rep`,
+  one 2000-token burst, GPU busy 1792 / wall 1835 ms, 97.7 %):**
+  moe_grouped_w4a4_mx bf16-out 301.5 (16.8 %) + f32-out 165.0 (9.2 %) =
+  **466 ms (26 %)**; scale_gemm_pipe 291.8 (16.3 %, 356 launches);
+  attn_flash 275.6 (15.4 %, 1401 × 196.7 us); bus_bulk_collective 173.8
+  (9.7 %); mhc ~118 ms (6.5 %); attn_finish **37.6 (2.1 %, was 135 — the
+  split-1 c_main cut)**; moe_grouped_mma_fp8_ldm 78; moe_accum 48;
+  mma_gemv<4> 39.5.
+- **The pipe's exact 0731 shapes (m=2048, via DGPP_PIPE_TRACE × nsys grid
+  decode):** 1024×4096 wq_a 109.3 ms/210, 16384×1024 wq_b 78.8/42,
+  4096×4096 71.3/42, 8192×1024 18.2/20, 512×4096 wkv 14.1/42 — all
+  25–40 TF, none bandwidth-bound (the 1024×4096 floor is ~62 us at 273
+  GB/s vs 520 us measured). wo does NOT take the pipe (the grouped
+  multi-problem mma path, 369 launches).
+- **Pipe kernel is latency-bound (ncu, wq_a m=2000):** occupancy 16.7 %
+  (one block per SM, the 92 KB smem limit; 8/64 warps), warp cycles per
+  issued instruction ~8.4, SM active ~49 %, memory ~24 %. 512 threads
+  (16 warps, 4×4 warp layout) → 33 % occupancy, 3–6 % faster on every
+  pipe shape (wq_a 455→426, wo 14090→13663), lm_head flat. The
+  BM=64/BK=32/4-stage two-blocks-per-SM variant loses 2.2–2.5× on wide
+  n (B DRAM traffic doubles: 2× the m-tile blocks re-fetch each B tile).
+- **w4a4 experts hit the DRAM ceiling:** ~478 MB of weight traffic per
+  launch / 1.75 ms ≈ 273 GB/s = the GB10 peak. Bandwidth-bound; no
+  kernel-level win (the BM/NT knobs were neutral).
+
 - Prefill profile (nsys 2025.3.2, `spark:/tmp/pp2000.nsys-rep`, W4A4 on,
   one pp2000 burst = 1696 ms GPU): mma_gemv 722.8 ms (42.6 %) — the
   streaming GEMV form, correct by design; w4a4_mx 247.6 (14.6 %, 93
@@ -155,6 +180,52 @@ dot GEMM (was the 343 ms mma storm).
   cap. No config change needed for 500K.
 
 ## Log
+
+### 2026-09-29 — attn_flash double buffer + spark1 clock wedge
+
+- attn_flash is latency-bound: per tile the random latent gather (~16 KB
+  of 1024 B rows from the paged pool) is fully exposed — 196.7 us/launch
+  / 8 tiles ≈ 24.6 us/tile. ncu (via the pipe, same class): no pipe >35 %,
+  IPC ~1.
+- Change (parity-first): the bf16 listed path now (a) keeps Q~ in
+  registers (the smem copy's columns SD..SQ-1 are never read — cc max is
+  6, not 14 — so reading zero there is exact), (b) double-buffers the
+  latent tile with cp.async (gather of tile t+1 overlaps tile t's
+  S/softmax/PV), (c) shrinks the S-exchange buffer to the listed JT's
+  (8 floats/lane stride — a first cut with a 16-float stride clobbered
+  the buffer and failed parity 93 %). 78.8 KB smem, one block per SM.
+  csa2_layer_test 4/4, dsv41_engine_test 5/5, 126 regs, 0 spills.
+- **spark1 clock wedge:** between the pipe bench (1122 t/s) and the flash
+  bench, spark1's SM clock got pinned at 507 MHz (0 % boost at 96 % SM
+  util, 10 W; app clock 2418). Every kernel ran 2.4–4.6× slow — the
+  flash A/B (447 t/s) was contaminated, NOT a flash regression. A
+  `nvidia-smi --gpu-reset` did not clear it; rebooted spark1 (~14:02
+  local) — the wedge survived the reboot (still 507 MHz under load,
+  dmesg clean of XIDs). Workaround in place: forced lock
+  `sudo nvidia-smi -lgc 2150,2150` (min=max, no room to wedge) —
+  idle clock now ~1600 MHz (was 208/507). Acceptance test pending:
+  pipe micro-bench (wq_a m=2048 ≈ 426 us at healthy clocks) + dmon
+  under load. Note: /tmp is tmpfs — the reboot wiped the scratch
+  bench binaries; a fresh standalone `pipe_bench` (nvcc,
+  scale_gemm+mma_gemv+glm_moe) is being rebuilt to verify.
+- **Resolved as a spark1 hardware/firmware fault (user is fixing).**
+  Evidence: the micro-bench runs 445 us on spark2 (2138 MHz under
+  load) vs 1690 us on spark1 (507 MHz under load, same binary). The
+  `tune-spark.sh --bench` gate (fp16 8192^3, threshold 50 TFLOPS):
+  spark1 **23.8 — FAIL**, spark2 59.0 — PASS. Nothing software-side
+  clears it: reboot, `--gpu-reset`, persistence-mode cycle, lock
+  re-apply all fail; P0 reported, no active throttling reasons,
+  temps 44-46C, no XIDs except my own OOB bench faults (since fixed).
+  Bench infra on spark1 was broken independently: `~/.venv` a
+  broken symlink (rebuilt: python3.12 + torch 2.14.0+cu130 at
+  `~/models/.venv`), `~/benchmark.py` missing its imports (synced
+  from the spark repo's scripts/), `~/comfy-ui` removed (6.1G).
+  `tune-spark.sh` now locks `$MAX,$MAX` (the 200/$MAX range lock was
+  the wedged mode). Until spark1 passes its bench: world stays down,
+  no spark1 numbers trusted.
+- ncu needs `sudo` (ERR_NVGPUCTRPERM) and `env HOME=/home/conrad` (the
+  model cache is under ~conrad); a full serve boot under ncu takes >15 min
+  — background it.
 
 ### 2026-09-29 — the prefill attention split: 4 → 1 (c511a51)
 
@@ -286,19 +357,31 @@ dot GEMM (was the 343 ms mma storm).
   fold, 0731 head collapse read — see git log (`8c081b4`, `4a04db7`,
   `fa88a7b`, `31547bf`).
 
+## Decode floor (2026-09-29, from the model config)
+
+- 0731: 43 layers, hidden 4096, 256 routed + 1 shared, top-6, moe_inter
+  2048, head_dim 512. Per decode step the experts alone stream 7 experts ×
+  43 layers × 3 × 4096 × 2048 fp4 ≈ 4.7 GB ≈ 17 ms at the 273 GB/s DRAM
+  ceiling → ~58 t/s theoretical. Measured 17 t/s (59 ms/step) leaves ~42 ms
+  of overhead: fabric (bus_bulk on the decode critical path), MLA attention
+  over the growing context, and the 43-layer launch/latency chain
+  (single-token, latency-bound). Decode attack = fabric + latency, not
+  expert kernels (those are the DRAM floor).
+
 ## Next steps
 
-1. attn_flash: ~250 ms (was 337; the c_ws write quartered by the split).
-   240 us/launch × 1401 — latency-bound (per-slab random 128-B latent
-   gathers). Port the b12x CuTe/TMA reference
-   (`~/dev/sparkrun-ds4/b12x/attention/`): scope as a project.
-2. w4a4 experts ~471 ms (20.7 %): the BM=64 A/B was neutral-to-worse
-   (reverted) — ~80 TF/launch, bandwidth-bound. Profile one launch
-   (n_regs, occupancy, B-stream); the b12x `moe/` reference if the
-   port lands.
-3. Fabric: bus_bulk_collective 165 ms (7.2 %).
-4. Kill the decode regression: gate the MX quantize cost out of decode
-   (or make the fallback free); verify with benchy tg64 ≥ 35 with
-   W4A4 on. (Decode window ~40 t/s today.)
+1. **Done (2026-09-29 evening):** spark1 fixed (user; 91.4 TFLOPS on the
+   bench — the 59.4 vs 91.4 gap vs spark2 is the torch 2.14 vs 2.9.1
+   bench-side delta, a bonus). Flash double-buffer A/B re-run:
+   pp2000 1127.7 / 1131.2 t/s (vs 1122.3 baseline, +0.7 %), tg64
+   16.0 / 16.2 (neutral) — KEPT. Clocks verified 2125-2132 MHz under
+   load at 84 W (was 507 MHz at 10 W).
+2. attn_flash (bigger lever): the double buffer only hides the gather
+   latency; the b12x CuTe/TMA port
+   (`~/dev/sparkrun-ds4/b12x/attention/`) is the real fix — scope as a
+   project.
+3. w4a4 experts ~466 ms (26 %): at the DRAM ceiling (~273 GB/s, the GB10
+   peak) — no kernel-level win; the lever is traffic (weight reuse / L2).
+4. Fabric: bus_bulk_collective 173.8 ms (9.7 %).
 5. When parity holds: `serve_tools_check.sh` + `serve_agentic_streams.py`
    as the final gate; then criterion 1 (verify branch committed + pushed).
