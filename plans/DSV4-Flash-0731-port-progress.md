@@ -57,8 +57,30 @@ passes.
 - Kernels: BN=128, BK=128, 256 threads, kRowBytes=80, 2-slot smem ring
   (43008 B), `DGPP_W4A4_STAGES=3` / `DGPP_W4A4_BM=64|128` /
   `DGPP_W4A4_NT` knobs exist (measured neutral at BM128/NT1).
+- YaRN: the checkpoint declares it itself
+  (`text_config.rope_scaling: yarn, factor 16, original 65536 → 1M,
+  beta_fast 32, beta_slow 1`) — the model's 1M context **is** the YaRN
+  range; native RoPE (θ 10000) covers 64K. dgpp reads that block
+  (`dsv41/config.cpp`, accepts the 0731 `type` key as well as V4.1's
+  `rope_type`) and applies it bit-exact vs vLLM's `yarn_scaling_rope.py`
+  (`kernels/rope_scaling.{hpp,cpp}`). Not an ad-hoc extension.
+- 500K context: already fits — `kv_capacity` 1,048,576 tokens,
+  `admission: full` (a request is admitted only if its whole context
+  fits), YaRN defined to 1M positions. `default_max_tokens` (32768) is
+  the completion default when `max_tokens` is omitted, not a context
+  cap. No config change needed for 500K.
 
 ## Log
+
+### 2026-09-29 — YaRN question settled; 500K context confirmed, no change
+
+- "Why YaRN when the model allows 1M by default?" — the 1M **is** the
+  YaRN: `max_position_embeddings` 1M, `rope_scaling` yarn factor 16 from
+  a 64K native range, all in the checkpoint's own config. vllm/sglang
+  read the same block; dgpp matches it bit for bit.
+- 500K target: `kv_capacity` 1M + `admission: full` already cover it.
+  Documented in the goal doc (replacing the stray "YaRN 512K" label,
+  which came from the Qwen config).
 
 ### 2026-09-29 — parity bench A/B, decode regression found, docs formalized
 
@@ -111,4 +133,4 @@ passes.
    non-MoE share of the 1800 t/s gap.
 3. Decode profile for the remaining ~5 t/s on tg.
 4. When parity holds: `serve_tools_check.sh` + `serve_agentic_streams.py`
-   as the final gate, then Good Night.
+   as the final gate

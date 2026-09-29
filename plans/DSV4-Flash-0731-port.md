@@ -35,7 +35,7 @@ A change lands only when, in order:
 3. `scripts/serve_tools_check.sh` (tools/reasoning gate).
 4. `scripts/serve_agentic_streams.py` (agentic loops) when a full run is
    feasible.
-5. benchy coherence test passes (it runs before the measurement).
+5. llama-benchy coherence test passes (it runs before the measurement).
 
 ## Scope
 
@@ -61,7 +61,7 @@ Git: commit in the workspace, push `fork` (github.com/co-l/dgpp) and
 
 ```bash
 # 1. tune (from conrad-mini, ~/dev/spark): drops page caches, pins clocks
-./tune-spark.sh
+~/dev/spark/tune-spark.sh
 
 # 2. build on spark1
 ssh spark 'cd ~/dgpp && cmake --preset release && cmake --build --preset release -j 20'
@@ -82,7 +82,12 @@ ssh spark 'cd ~/dgpp && python3 scripts/dgpp-cluster down --config deploy/cluste
 ```
 
 - Active config: `deploy/cluster_deepseek-v4-flash-0731_mxfp4-fp8_w2.json`
-  (world 2, YaRN 512K, `model_alias: deepseek-v4-flash-0731`).
+  (world 2, `kv_capacity` 1M tokens, `max_concurrency` 4,
+  `admission: full`, `model_alias: deepseek-v4-flash-0731`).
+- Context: the checkpoint's own YaRN (factor 16, native 64K → 1M, applied
+  bit-exact vs vLLM) defines positions up to 1M; a 500K context fits the
+  KV pool as-is (`default_max_tokens` is the completion default, not a
+  context cap).
 - API: `http://192.168.1.223:8000/v1` (admin IP bind, not 0.0.0.0).
 - Logs: `spark:~/dgpp/log/deployments/<hash>/serve_r0.log`.
 - Any `DGPP_*` env var set for the launcher reaches every rank
