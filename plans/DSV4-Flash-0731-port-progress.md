@@ -6,22 +6,23 @@ meaningful step.
 
 ## Snapshot (2026-09-29)
 
-Serving: `18c88f8` live; `c9b4c93` (prefill GEMV-gate bound) built,
-unit tests green, redeploy + benchy A/B pending.
+Serving: `070b661` live (dense GEMV form kept at prefill m — the
+"tile-GEMM fix" was measured a regression and reverted).
 
 | path | pp2000 t/s | tg64 t/s | parity |
 |------|-----------:|---------:|--------|
-| W4A4-MX prefill **on** | 746.9 | 15.15 | 1800 / 35 |
+| W4A4-MX prefill **on** | 748.5 | 17.0 | 1800 / 35 |
 | W4A4-MX prefill **off** (W4A16) | 707.8 | 30.32 | 1800 / 35 |
 
-- Prefill: W4A4-MX is +5.5% over W4A16, but parity is 2.4× away even on
-  W4A16 — the gap is not (only) the experts. **Root cause found**
-  (nsys): the dense fp8 GEMMs (CSA2 q/k/v/o + LM head) ran the
-  bandwidth GEMV form for ALL m — the grid launcher's decode_mma gate
-  had no upper m bound — so a 2000-row prefill was 16 GEMV groups
-  re-reading the fp8 weights 16 times (722.8 ms / 42.6 % of the
-  prefill burst; tile GEMM at **0 ms**). Fixed in `c9b4c93`.
-- Decode: W4A4-MX **halves** tg (15.15 vs 30.32). The MX path is a
+- Prefill: the nsys "mma_gemv 42.6 %" is the streaming GEMV form doing
+  its job — at the 0731 dense projections it beats the 16-row tile
+  GEMM (2.4–4.1 TF on sm_121a) 1.3–12× for every m (bounding the gate
+  to 256 rows dropped pp2000 to 450.8). The dense projections are
+  **~1.17 s of the 2.67 s e2e** (bench: per layer at m=2000 wo 18.8 ms,
+  wq_b 3.8 ms, wq_a 1.6 ms, wkv 1.6 ms; lm_head 62 ms). Real target: a
+  fast fp8 GEMM for m > 128 (MoE-class 128-row tiles; wq_a/wkv at
+  5–10 TF and wo/lm_head at 28–34 TF in the stream).
+- Decode: W4A4-MX **halves** tg (15.15/17.0 vs 30.32). The MX path is a
   prefill-only design, yet something it enables costs every decode step
   (activation-quantize launch/overhead and/or the `N fallbacks` on
   sampled decode steps — see open issue 1).
@@ -34,15 +35,18 @@ unit tests green, redeploy + benchy A/B pending.
    path paying for quantized activations it doesn't use. `serve_r0.log`
    logs `slot closed: N sampled decode steps, M fallbacks` with M rising
    per slot — understand what a fallback is.
-2. **pp 2.4× below parity on W4A16** (707.8 vs 1800). Root cause: the
-   dense fp8 GEMMs took the mma GEMV path at prefill m (grid-launcher
-   gate unbounded, `c9b4c93` bounds it to `kScaleGemmMmaMaxRows`).
-   Remaining prefill attribution (nsys, W4A4 on, one burst of 1696 ms):
-   mma_gemv 722.8 (42.6 %, the bug), w4a4_mx experts 247.6 (14.6 %;
-   small M per expert — ~47 rows vs 81920 in the 91.7 TF unit — a
-   secondary target, `DGPP_W4A4_BM=64` exists), attn_flash 219.9
-   (13.0 %), attn_finish/fabric ~7 %, mhc 4.5 %, router/norms the rest.
-   Re-measure after `c9b4c93`.
+2. **pp 2.4× below parity on W4A16** (748.5 vs 1800). The dense fp8
+   projections at prefill m are the target: ~1.17 s of 2.67 s e2e
+   (measured per shape in `dense_gemm_path_bench`, m=2000). The
+   streaming GEMV is the right form (1.3–12× over the tile kernel), so
+   the lever is a fast fp8 GEMM for m > 128 — MoE-class 128-row tiles
+   (the w4a4 kernel does 91.7 TF at large M; the fp8 tile kernel does
+   2.9 TF). Parity math: e2e 1111 ms budget vs GPU-only
+   dense 1174 + experts 248 + attn 220 + other ~480 ms — dense AND
+   experts both need ~2× to even fit the budget at zero host overhead.
+   (nsys burst attribution for reference: mma_gemv 722.8 ms / 42.6 %,
+   w4a4_mx 247.6 / 14.6 %, attn_flash 219.9 / 13.0 %, attn_finish +
+   fabric ~7 %, mhc 4.5 %.)
 3. **tg on W4A16 is 87% of parity** (30.32 vs 35). Decode path:
    mma_gemv multi-problem groups are already merged; profile the rest.
 
@@ -50,18 +54,22 @@ unit tests green, redeploy + benchy A/B pending.
 
 - Prefill profile (nsys 2025.3.2, `spark:/tmp/pp2000.nsys-rep`, W4A4 on,
   one pp2000 burst = 1696 ms GPU): mma_gemv 722.8 ms (42.6 %) — the
-  dense projections on the GEMV path, `c9b4c93` fixes; w4a4_mx 247.6
-  (14.6 %, 93 launches, small-M per expert); attn_flash 219.9 (13.0 %);
-  attn_finish + fabric ~7 %; mhc 4.5 %; tile GEMM 0 ms (it was never
-  reached at prefill m). Dense FLOPs at 2.7 s → ~5.7 TF effective vs
-  50–90 TF a tile GEMM gives.
+  streaming GEMV form, correct by design; w4a4_mx 247.6 (14.6 %, 93
+  launches, small-M per expert); attn_flash 219.9 (13.0 %);
+  attn_finish + fabric ~7 %; mhc 4.5 %; tile GEMM 0 ms.
+- Dense projection bench (`dense_gemm_path_bench`, m=2000, e2e per
+  layer ≈ 25.9 ms): wq_a 1.64 ms / 10.3 TF, wq_b 3.83 ms / 35.0 TF,
+  wkv 1.58 ms / 5.3 TF, wo 18.82 ms / 28.5 TF, lm_head 61.7 ms / 34.3 TF
+  (streaming GEMV); the tile kernel is 2.4–4.1 TF on the same shapes —
+  GEMV wins 1.3–12×. m=300 same verdict. Total dense ≈ 1.17 s of the
+  2.67 s e2e pp2000.
 - Prefill is not chunked (scheduler `prefill_chunk_limit()` default 0):
-  a 2000-token prefill is one pass, m=2000.
-- `dense_mma` default ON (`DGPP_DSV41_DENSE_GEMV` env disables;
-  `dsv41/model.cpp:193`); the routed `launch_scale_gemm` already bounded
-  the mma form to `kScaleGemmMmaMaxRows`=256 — the grid launchers were
-  the only unbounded callers (csa2 projections, LM head, MTP main
-  proj, engram).
+  a 2000-token prefill is one pass, m=2000. `dense_mma` default ON
+  (`DGPP_DSV41_DENSE_GEMV` env disables; `dsv41/model.cpp:193`); grid
+  callers: csa2 projections, LM head, MTP main proj, engram.
+- Bounding the grid launchers' decode_mma gate to
+  `kScaleGemmMmaMaxRows` (c9b4c93) dropped pp2000 746.9 → 450.8 t/s —
+  reverted in 070b661; the hpp documents the bound as deliberate.
 - `csa2_select_bench` (micro bench target) does not compile on spark:
   pre-existing signature drift vs `csa2_select_rows_prefill` (file
   identical to its committed version) — not from `c9b4c93`.
@@ -99,19 +107,20 @@ unit tests green, redeploy + benchy A/B pending.
 
 ## Log
 
-### 2026-09-29 — prefill root cause: dense GEMMs on the GEMV path (c9b4c93)
+### 2026-09-29 — prefill hunt: the GEMV form was right; the real target is a fast fp8 GEMM (070b661)
 
-- nsys a pp2000 burst (rank 0 under `nsys launch`, rank 1 plain): the
-  prefill is dominated by `mma_gemv` (42.6 %), and the tile GEMM never
-  runs. The grid launchers' decode_mma gate had no upper m bound, so
-  m=2000 → 16 GEMV groups re-reading the fp8 weights (and the LM head
-  at 129K vocab × 2000 rows too). TDD: new `scale_gemm_test` cases
-  capture the dispatch in a CUDA graph and require the single tile
-  kernel — red at 3 nodes (m=300), green after bounding the gate to
-  `kScaleGemmMmaMaxRows` in both `launch_scale_gemm_grid_bf16/f32`
-  (the hpp doc said "every row count" — describing the bug).
-  scale_gemm_test 18/18, csa2_layer_test 4/4, dsv41_engine_test 5/5,
-  dsv41_forward smoke OK.
+- c9b4c93 bounded the grid launchers' decode_mma gate to
+  kScaleGemmMmaMaxRows (TDD: graph-capture dispatch assertion, red at 3
+  nodes for m=300, green after; both-oracle correctness at m=300/2000).
+  Redeploy + benchy: **pp2000 746.9 → 450.8** — the tile GEMM lost.
+- `dense_gemm_path_bench` (new) over the real 0731 shapes: GEMV wins
+  1.3–12× at every shape and both m (tile 2.4–4.1 TF vs stream 5–35 TF
+  on sm_121a). Reverted the bound; the test now pins the streaming
+  groups; benchy back to 748.5 / 17.0.
+- Consequence for the plan: the prefill gap is not a wrong-path bug —
+  it's that the fp8 dense GEMM is slow at prefill row counts (~1.17 s of
+  2.67 s e2e, bench-measured). The lever is a MoE-class 128-row fp8
+  tile kernel (the w4a4 kernel's geometry), not a dispatch change.
 
 ### 2026-09-29 — YaRN question settled; 500K context confirmed, no change
 
@@ -167,12 +176,14 @@ unit tests green, redeploy + benchy A/B pending.
 
 ## Next steps
 
-1. Redeploy `c9b4c93` (`up --replace`), benchy A/B: expect pp2000 to
-   jump (GEMV 42.6 % → tile GEMM); tg64 must stay ≥ 30. Then re-nsys if
-   the gap remains (experts small-M, attn_flash 13 %, fabric 7 %).
+1. Fast fp8 dense GEMM for m > 128 (MoE-class 128-row tiles on the
+   scale-aware path): target ≥ 20–30 TF effective at the 0731 shapes —
+   dense 1.17 s → ~400 ms. Gate it behind the existing dispatch; keep
+   the streaming GEMV for m ≤ 128.
 2. Kill the decode regression: gate the MX quantize cost out of decode
    (or make the fallback free); verify with benchy tg64 ≥ 35 with
    W4A4 on.
-3. Decode profile for the remaining ~5 t/s on tg (W4A16).
-4. When parity holds: `serve_tools_check.sh` + `serve_agentic_streams.py`
+3. Experts at prefill M (247.6 ms, small-M per expert) — after 1.
+4. Decode profile for the remaining ~5 t/s on tg (W4A16).
+5. When parity holds: `serve_tools_check.sh` + `serve_agentic_streams.py`
    as the final gate
