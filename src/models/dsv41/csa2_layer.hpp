@@ -186,7 +186,7 @@ class Csa2Layer {
   int64_t debug_logits_entries() const { return dbg_logits_entries_; }
 
   static constexpr int kPrefillAttnRows = 128;
-  static constexpr int kPrefillSplit = 4;
+  static constexpr int kPrefillSplit = 1;
   // The decode window attention splits its 128 keys this many ways so a
   // one-row window is not a single latency-bound block (the 2026-09-14
   // profile). A FIXED count, independent of the row count, so a token's
