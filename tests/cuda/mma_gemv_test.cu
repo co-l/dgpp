@@ -202,6 +202,39 @@ DGPP_TEST(mma_gemv_bf16_matches_oracle_and_is_m_invariant) {
   std::printf("[ OK ] mma_gemv bf16: the 16-tile wide form is bitwise one chain\n");
 }
 
+// The wide-m row grouping (2026-09-29): a prefill-scale row count groups at
+// the widest form (256 rows, the 16-tile) instead of 128 — the 0731 indexer
+// select dot (m = 131072, n = 512, k = 128) at 128-row groups was 1024
+// launches per call, ~340 ms of the 2.3 s cold prefill. Pin the grouping:
+// one launch per 256-row group (graph-capture node count).
+DGPP_TEST(mma_gemv_wide_m_groups_at_256_rows_per_launch) {
+  const Problem p = make(512, 512, 128, 7, 7, 0x51505547ull);
+  Dev d(p);
+  cudaStream_t stream = nullptr;
+  DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  for (const int m : {128, 256, 300, 512}) {
+    cudaGraph_t graph = nullptr;
+    DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    dgpp::launch_mma_gemv_bf16_f32(d.act, p.k, d.w16, d.outf, m, p.n, p.k, 0, stream, nullptr, 0);
+    // End the capture even when the launch errored (a capturing stream
+    // poisons every later test's mallocs).
+    cudaGraph_t ended = nullptr;
+    cudaStreamEndCapture(stream, &ended);
+    graph = ended;
+    size_t count = 0;
+    if (graph) {
+      DGPP_CUDA_OK(cudaGraphGetNodes(graph, nullptr, &count));
+      DGPP_CUDA_OK(cudaGraphDestroy(graph));
+    }
+    const size_t wanted = (m + 255) / 256;
+    require(count == wanted,
+            "mma_gemv m=" + std::to_string(m) + " must be " + std::to_string(wanted) +
+                " 256-row launch(es), got " + std::to_string(count));
+  }
+  DGPP_CUDA_OK(cudaStreamDestroy(stream));
+  std::printf("[ OK ] mma_gemv wide m groups at 256 rows per launch\n");
+}
+
 // The small-n bf16 shapes the session-core heads run at one row: k under one
 // 256-k window (a single window's worth of k), the grid's last block at a
 // non-16-aligned n, the wide and the narrow decode widths. Against the

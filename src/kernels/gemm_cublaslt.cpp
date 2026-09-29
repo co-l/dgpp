@@ -498,8 +498,9 @@ void CublasLtGemm::matmul(const void* act, const void* weight, void* out,
       (impl_->decode_mma_max_rows == 0 || m <= impl_->decode_mma_max_rows) &&
       mma_gemv_shape_ok(static_cast<const uint16_t*>(weight), static_cast<const uint16_t*>(act),
                         act_row_stride, m, k)) {
-    if (std::getenv("DGPP_GEMM_DISPATCH") && m == 1 && n == 512 && k == 256)
-      std::fprintf(stderr, "[GEMM] mma path (w=%p act=%p)\n", weight, act);
+    if (const char* dbg = std::getenv("DGPP_GEMM_DISPATCH"))
+      std::fprintf(stderr, "[GEMM] mma path m=%d n=%d k=%d out=%s (w=%p act=%p)\n", m, n, k,
+                   out_dtype == GemmOut::F32 ? "f32" : "bf16", weight, act);
     const auto* x = static_cast<const uint16_t*>(act);
     const auto* w = static_cast<const uint16_t*>(weight);
     auto* y = static_cast<uint8_t*>(out);

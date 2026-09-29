@@ -6,11 +6,14 @@ meaningful step.
 
 ## Snapshot (2026-09-29)
 
-Serving: `070b661` live (dense GEMV form kept at prefill m — the
-"tile-GEMM fix" was measured a regression and reverted). The prefill
-pipe (128-row tiled fp8 GEMM) is **built and unit-green, not yet
-deployed**: shape-routed over the streaming GEMV (below), expected
-dense 1.17 s → ~0.89 s bench (A/B benchy pending).
+Serving: `d0d93c5` live (the prefill pipe, shape-routed over the
+streaming GEMV; `070b661` was the GEMV-only baseline).
+
+| path | pp2000 t/s | tg64 t/s | parity |
+|------|-----------:|---------:|--------|
+| pipe **on** (d0d93c5, W4A4) | 861.5 | 16.28 | 1800 / 35 |
+| GEMV (070b661, W4A4) | 748.5 | 17.0 | 1800 / 35 |
+| GEMV (070b661, W4A16) | 707.8 | 30.32 | 1800 / 35 |
 
 | path | pp2000 t/s | tg64 t/s | parity |
 |------|-----------:|---------:|--------|
@@ -149,8 +152,11 @@ dense 1.17 s → ~0.89 s bench (A/B benchy pending).
 - Bench: pipe beats the stream 1.3–5.6× at the 0731 prefill shapes
   (above); the stream keeps lm_head-class n and wq_b @ m=300. Dense
   bench m=2000: 1.17 s → ~0.89 s (−24 %).
-- Next: release build, `up --replace`, benchy A/B (expect pp2000 ~850–950,
-  far from 1800 — MoE 247 ms, attn 220 ms, fabric 190 ms are the rest).
+- Deployed `d0d93c5` (`up --replace`, 26 s warm), smoke OK. benchy A/B:
+  **pp2000 748.5 → 861.5 t/s** (ttft 2323 ms, −350 ms); tg64 16.28 (no
+  decode regression — the decode window ~40 t/s, prefill dominates both
+  metrics). Next levers: experts (w4a4_mx 247.6 ms), attn_flash 219.9 ms,
+  fabric ~190 ms.
 
 ### 2026-09-29 — prefill hunt: the GEMV form was right; the real target is a fast fp8 GEMM (070b661)
 

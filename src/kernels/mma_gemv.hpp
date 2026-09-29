@@ -43,12 +43,15 @@ constexpr int kMmaGemvMaxRows = 32;
 // splits, so the multi form's workspace is the sum over its problems of
 // kMmaGemvMaxSplit * kMmaGemvMaxRows * n * sizeof(float).
 constexpr int kMmaGemvMaxSplit = 16;
-// Rows per launch: the widest single form (8 tiles); m above it runs in
-// groups of this many rows, the weights read once per group. The 16-tile
-// (256-row) form is compiled but not selected: at the prefill's k = 4096
-// shapes its 64-accumulator register pressure costs more than the halved
-// weight re-reads (2026-09-28, the 0731 prefill 2829 -> 3029 ms ttfr).
-constexpr int kMmaGemvMaxRowsPerLaunch = 128;
+// Rows per launch: the widest single form (16 tiles, 256 rows); m above it
+// runs in groups of this many rows, the weights read once per group. At
+// 256 the 16-tile form's 64-accumulator pressure costs more than the halved
+// weight re-reads at wide k (the 2026-09-28 0731 prefill 2829 -> 3029 ms
+// ttfr, k = 4096 shapes) — those shapes now take the scale_gemm pipe
+// (m > 128), and the wide-m mma callers left are the small-k prefill sites
+// (the indexer select dot at k = 128, where the launch count dominates:
+// 256-row groups halve the launches and the weight re-reads).
+constexpr int kMmaGemvMaxRowsPerLaunch = 256;
 
 // fp8 weights with block scales; out bf16 or f32 (the epilogue store is the
 // only difference: bf16(out_f32) == out_bf16 bit for bit).
