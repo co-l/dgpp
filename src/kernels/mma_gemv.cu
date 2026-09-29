@@ -58,7 +58,11 @@ template <int kTiles, bool kFp8> struct Win {
   // (97 KB) 1453; 128-k windows at three blocks per SM 1470 (and the fp8
   // one-row form 133 against its 120). The format parameter stays for the
   // window's byte geometry (WarpLoads).
-  static constexpr int kBatchW = kTiles == 1 ? kBatch / 2 : kBatch / kTiles;  // vectors per lane per window
+  // The 16-tile (256-row) form (2026-09-28, the prefill's 256-row group)
+  // keeps the sixteenth-wide form's 64-k window (one batch vector per
+  // lane), so a row's k windows run in the same order as the 8-tile one:
+  // a row's result is bitwise the 8-tile form's.
+  static constexpr int kBatchW = kTiles == 1 ? kBatch / 2 : kTiles <= 8 ? kBatch / kTiles : 1;  // vectors per lane per window
   static constexpr int kK = 64 * kBatchW;                             // k per window: 256 / 256 / 128 / 64
   static constexpr int kStride = kK + 8;                              // staged row stride (rows shift 16 B: no bank conflicts)
   static constexpr int kRows = kTiles * 16;
@@ -67,7 +71,9 @@ template <int kTiles, bool kFp8> struct Win {
 };
 static_assert(Win<1, true>::kSmemBytes <= 48 * 1024 && Win<1, false>::kSmemBytes <= 48 * 1024 &&
               Win<2, true>::kSmemBytes <= 48 * 1024 && Win<4, true>::kSmemBytes <= 48 * 1024 &&
-              Win<8, true>::kSmemBytes <= 48 * 1024, "the A windows fit the default smem");
+              Win<8, true>::kSmemBytes <= 48 * 1024 &&
+              Win<16, true>::kSmemBytes <= 99 * 1024 && Win<16, false>::kSmemBytes <= 99 * 1024,
+              "the A windows fit the smem budgets");
 
 // The decode forms' weight loads are warp-contiguous and asynchronous
 // (2026-09-14): a warp reads one row's whole window slice per instruction
@@ -739,8 +745,19 @@ void launch(const uint16_t* act, size_t act_stride, const void* w, const float* 
       launch_decode<2, kFp8, OutT>(a, act_stride, w, scales, o, rows, n, k, out_stride, rs, cs, stream, ws, ws_bytes);
     else if (rows <= 64)
       mma_gemv_kernel<4, kFp8, kWideWarps, OutT><<<grid, kWideThreads, Win<4, kFp8>::kSmemBytes, stream>>>(a, act_stride, w, scales, o, rows, n, k, out_stride, rs, cs, nullptr);
-    else
+    else if (rows <= 128)
       mma_gemv_kernel<8, kFp8, kWideWarps, OutT><<<grid, kWideThreads, Win<8, kFp8>::kSmemBytes, stream>>>(a, act_stride, w, scales, o, rows, n, k, out_stride, rs, cs, nullptr);
+    else {
+      // The 16-tile (256-row) form's A windows exceed the default smem.
+      static bool opted_in = false;
+      if (!opted_in) {
+        DGPP_CUDA_OK(cudaFuncSetAttribute(mma_gemv_kernel<16, kFp8, kWideWarps, OutT>,
+                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                          static_cast<int>(Win<16, kFp8>::kSmemBytes)));
+        opted_in = true;
+      }
+      mma_gemv_kernel<16, kFp8, kWideWarps, OutT><<<grid, kWideThreads, Win<16, kFp8>::kSmemBytes, stream>>>(a, act_stride, w, scales, o, rows, n, k, out_stride, rs, cs, nullptr);
+    }
     DGPP_CUDA_OK(cudaGetLastError());
   }
 }

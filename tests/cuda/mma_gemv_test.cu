@@ -120,19 +120,19 @@ DGPP_TEST(mma_gemv_fp8_matches_oracle_and_is_m_invariant) {
   std::printf("[ OK ] mma_gemv fp8: bitwise m-invariant (m = 1, 7, 16 vs 30), bf16 == bf16(f32)\n");
 }
 
-// The wide forms (4 and 8 tiles) and the 128-row grouping above them: the
-// oracle at 200 rows, and every row bitwise its m = 1 result (the forms
-// share one chain).
+// The wide forms (4, 8 and 16 tiles) and the 256-row grouping above them:
+// the oracle at 300 rows (256 + 44), and every row bitwise its m = 1 result
+// (the forms share one chain).
 DGPP_TEST(mma_gemv_fp8_wide_forms_match_oracle_and_the_scalar_form) {
-  const Problem p = make(200, 512, 1024, 5, 5, 0x2545F4914F6CDD1Dull);
+  const Problem p = make(300, 512, 1024, 5, 5, 0x2545F4914F6CDD1Dull);
   Dev d(p);
   dgpp::launch_mma_gemv_fp8_f32(d.act, p.k, d.w8, d.scales, d.outf, p.m, p.n, p.k, 0, p.rs, p.cs, nullptr);
   DGPP_CUDA_OK(cudaDeviceSynchronize());
   const std::vector<float> full = fetch_f(d.outf, size_t(p.m) * p.n);
   const double err = max_rel_err(p, full, [&](int r, int c) { return wval8(p, r, c); });
-  std::printf("[ .. ] mma_gemv fp8 m=200 (128 + 72 rows) n=%d k=%d: max rel err %.3e\n", p.n, p.k, err);
+  std::printf("[ .. ] mma_gemv fp8 m=300 (256 + 44 rows) n=%d k=%d: max rel err %.3e\n", p.n, p.k, err);
   require(err < 2e-3, "fp8 wide: outside the oracle budget");
-  for (int m2 : {1, 40, 64, 100}) {
+  for (int m2 : {1, 40, 64, 100, 160, 256}) {
     for (int r0 = 0; r0 + m2 <= p.m; r0 += (m2 == 1 ? 37 : m2)) {
       dgpp::launch_mma_gemv_fp8_f32(d.act + size_t(r0) * p.k, p.k, d.w8, d.scales, d.outf, m2, p.n, p.k, 0, p.rs, p.cs, nullptr);
       DGPP_CUDA_OK(cudaDeviceSynchronize());
@@ -145,7 +145,7 @@ DGPP_TEST(mma_gemv_fp8_wide_forms_match_oracle_and_the_scalar_form) {
   std::printf("[ OK ] mma_gemv fp8: the 1/2/4/8-tile forms and the grouped launch are bitwise one chain\n");
   // The fixture-sized shapes (k under one 512-k window, small n) at every form.
   for (const auto [n2, k2] : {std::pair{64, 128}, std::pair{128, 256}, std::pair{256, 64}, std::pair{320, 448}}) {
-    for (int m2 : {1, 24, 40, 70, 100, 130}) {
+    for (int m2 : {1, 24, 40, 70, 100, 130, 200, 256, 300}) {
       const Problem q = make(m2, n2, k2, 5, 5, 0xA0761D6478BD642Full + m2 + n2);
       Dev e(q);
       dgpp::launch_mma_gemv_fp8_f32(e.act, q.k, e.w8, e.scales, e.outf, q.m, q.n, q.k, 0, q.rs, q.cs, nullptr);
@@ -179,6 +179,27 @@ DGPP_TEST(mma_gemv_bf16_matches_oracle_and_is_m_invariant) {
     }
   }
   std::printf("[ OK ] mma_gemv bf16: bitwise m-invariant\n");
+  // The 16-tile wide form (the 256-row group): the oracle at 300 rows and
+  // every row bitwise its m = 1 result, as the fp8 wide test above.
+  const Problem pw = make(300, 512, 1024, 7, 7, 0x6C22A4E13900B71Full);
+  Dev dw(pw);
+  dgpp::launch_mma_gemv_bf16_f32(dw.act, pw.k, dw.w16, dw.outf, pw.m, pw.n, pw.k, 0, nullptr);
+  DGPP_CUDA_OK(cudaDeviceSynchronize());
+  const std::vector<float> fullw = fetch_f(dw.outf, size_t(pw.m) * pw.n);
+  const double errw = max_rel_err(pw, fullw, [&](int r, int c) { return dgpp::bf16_bits_to_float(pw.w16[size_t(r) * pw.k + c]); });
+  std::printf("[ .. ] mma_gemv bf16 m=300 (256 + 44 rows) n=%d k=%d: max rel err %.3e\n", pw.n, pw.k, errw);
+  require(errw < 2e-3, "bf16 wide 16-tile: outside the oracle budget");
+  for (int m2 : {1, 160, 256}) {
+    for (int r0 = 0; r0 + m2 <= pw.m; r0 += (m2 == 1 ? 37 : m2)) {
+      dgpp::launch_mma_gemv_bf16_f32(dw.act + size_t(r0) * pw.k, pw.k, dw.w16, dw.outf, m2, pw.n, pw.k, 0, nullptr);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      const std::vector<float> partw = fetch_f(dw.outf, size_t(m2) * pw.n);
+      for (int i = 0; i < m2; ++i)
+        require(std::memcmp(partw.data() + size_t(i) * pw.n, fullw.data() + size_t(r0 + i) * pw.n, size_t(pw.n) * 4) == 0,
+                "bf16 wide: row " + std::to_string(r0 + i) + " differs at m=" + std::to_string(m2) + " from m=300");
+    }
+  }
+  std::printf("[ OK ] mma_gemv bf16: the 16-tile wide form is bitwise one chain\n");
 }
 
 // The small-n bf16 shapes the session-core heads run at one row: k under one
@@ -301,6 +322,29 @@ DGPP_TEST(mma_gemv_cold_timing_beside_the_gemv_cores) {
     }
     std::printf("[ .. ]   m=%4d  %8.1f us  %8.1f us  (%.1f TFLOP/s on the mma forms)\n", m, t[0], t[1], 2.0 * m * n * k / t[1] / 1e6);
   }
+  // The 0731 prefill's dense projections (m = 2048, k = 4096): the wq_a /
+  // wo_b / mhc site (n = 4096), the wq_b site (n = 32768), the indexer (n
+  // = 8192), and the wkv (n = 512). Against the double-precision FLOP
+  // budget so the mma form's efficiency on the real shapes is visible.
+  const int pm = 2048, pk = 4096;
+  const size_t pmaxb = size_t(32768 / 32) * (pk / 32) * 4;
+  std::vector<float> phs(pmaxb / 4, 0.5f);
+  uint16_t* pout; DGPP_CUDA_OK(cudaMalloc(&pout, size_t(pm) * 32768 * 2));
+  std::vector<uint8_t*> pw(4); std::vector<float*> ps(4);
+  for (auto [pn, pc] : std::vector<std::pair<int, int>>{{4096, 4096}, {32768, 4096}, {8192, 4096}, {512, 4096}}) {
+    const size_t pbs = size_t(pn / 32) * (pc / 32) * 4;
+    for (int i = 0; i < 4; ++i) { DGPP_CUDA_OK(cudaMalloc(&pw[i], size_t(pn) * pc)); DGPP_CUDA_OK(cudaMemset(pw[i], 0x38, size_t(pn) * pc)); DGPP_CUDA_OK(cudaMalloc(&ps[i], pbs)); DGPP_CUDA_OK(cudaMemcpy(ps[i], phs.data(), pbs, cudaMemcpyHostToDevice)); }
+    float t = 0;
+    for (int i = 0; i < 4; ++i) dgpp::launch_mma_gemv_fp8_bf16(act, pk, pw[i], ps[i], pout, pm, pn, pk, 0, 5, 5, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    DGPP_CUDA_OK(cudaEventRecord(e0));
+    for (int i = 0; i < 12; ++i) { const int c = i % 4; dgpp::launch_mma_gemv_fp8_bf16(act, pk, pw[c], ps[c], pout, pm, pn, pk, 0, 5, 5, nullptr); }
+    DGPP_CUDA_OK(cudaEventRecord(e1)); DGPP_CUDA_OK(cudaEventSynchronize(e1));
+    float ms = 0; DGPP_CUDA_OK(cudaEventElapsedTime(&ms, e0, e1)); t = ms * 1000.f / 12;
+    std::printf("[ .. ]   0731 dense m=%d n=%5d k=%d  %9.1f us  (%.1f TFLOP/s, %.0f GB/s of weights)\n", pm, pn, pk, t, 2.0 * pm * pn * pk / t / 1e6, double(pn) * pk / t / 1e3);
+    for (int i = 0; i < 4; ++i) { cudaFree(pw[i]); cudaFree(ps[i]); }
+  }
+  cudaFree(pout);
   for (int c = 0; c < copies; ++c) { cudaFree(w[c]); cudaFree(s[c]); }
   // The head.
   const int hn = 32320; const int hc = 3;

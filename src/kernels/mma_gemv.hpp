@@ -44,7 +44,10 @@ constexpr int kMmaGemvMaxRows = 32;
 // kMmaGemvMaxSplit * kMmaGemvMaxRows * n * sizeof(float).
 constexpr int kMmaGemvMaxSplit = 16;
 // Rows per launch: the widest single form (8 tiles); m above it runs in
-// groups of this many rows, the weights read once per group.
+// groups of this many rows, the weights read once per group. The 16-tile
+// (256-row) form is compiled but not selected: at the prefill's k = 4096
+// shapes its 64-accumulator register pressure costs more than the halved
+// weight re-reads (2026-09-28, the 0731 prefill 2829 -> 3029 ms ttfr).
 constexpr int kMmaGemvMaxRowsPerLaunch = 128;
 
 // fp8 weights with block scales; out bf16 or f32 (the epilogue store is the
