@@ -6,14 +6,22 @@ meaningful step.
 
 ## Snapshot (2026-09-29)
 
-Serving: `d0d93c5` live (the prefill pipe, shape-routed over the
-streaming GEMV; `070b661` was the GEMV-only baseline).
+Serving: `e0d3f14` live (the prefill pipe, shape-routed over the
+streaming GEMV, + the bf16 mma row bound: wide-m bf16 matmuls take the
+Lt tile GEMM).
 
 | path | pp2000 t/s | tg64 t/s | parity |
 |------|-----------:|---------:|--------|
-| pipe **on** (d0d93c5, W4A4) | 861.5 | 16.28 | 1800 / 35 |
+| pipe + Lt dot (e0d3f14, W4A4) | 1032.1 | 16.57 | 1800 / 35 |
+| pipe (d0d93c5, W4A4) | 861.5 | 16.28 | 1800 / 35 |
 | GEMV (070b661, W4A4) | 748.5 | 17.0 | 1800 / 35 |
 | GEMV (070b661, W4A16) | 707.8 | 30.32 | 1800 / 35 |
+
+Cold-prefill GPU mix after both changes (nsys, ~2.28 s): w4a4 experts
+~471 ms (20.7 %, ~3.3 TF/launch at ~62 rows/expert — BM=128 half-empty
+tiles, next A/B: DGPP_W4A4_BM=64), attn_flash 337 ms (14.8 %), scale
+pipe 286 ms, fabric 165 ms, attn_finish 135 ms, mhc ~90 ms, the Lt dot
+GEMM (was the 343 ms mma storm).
 
 | path | pp2000 t/s | tg64 t/s | parity |
 |------|-----------:|---------:|--------|
@@ -85,6 +93,20 @@ streaming GEMV; `070b661` was the GEMV-only baseline).
   16-byte chunks (8 data + 2 pad); the pad clamp covered only the last
   chunk — chunk 8 at the final k stage reads 16 B past the last row.
   Both pad chunks clamp to the row's data start.
+- Cold-prefill profile with the pipe (nsys burst, 2.28 s GPU):
+  w4a4_mx gate_up 305 ms + down 166 ms (20.7 %, ~3.3 TF/launch at ~62
+  rows/expert: BM=128 tiles half-empty), attn_flash 337 ms (14.8 %,
+  240 us/launch × 1401), scale_gemm_pipe 286 ms (12.4 %),
+  bus_bulk_collective 165 ms (7.2 %), attn_finish 130 ms, mhc ~90 ms.
+  The bf16 mma storm: the indexer select dot (m = 131072 = rows × 64,
+  n = 512, k = 128, f32; 20 calls) at 128-row mma groups = 21,184
+  launches, 343 ms (15.1 %). mma_gemv is the GEMV form — 8 blocks on 48
+  SMs, the 128-KB weight re-read per 128-row group; ~16 us/launch.
+  The 16-tile (256-row) grouping measured WORSE (31.3 us/launch,
+  362.6 ms: 64-accumulator pressure + one-block-per-SM smem). The Lt
+  tile GEMM takes it (set_decode_mma(true, 128) on the model's bf16
+  instance): pp2000 861.5 → 1032.1 t/s, ttft 2317 → 1939 ms.
+  csa2 selection: 0 flips after the change (near-tie certified).
 - Prefill is not chunked (scheduler `prefill_chunk_limit()` default 0):
   a 2000-token prefill is one pass, m=2000. `dense_mma` default ON
   (`DGPP_DSV41_DENSE_GEMV` env disables; `dsv41/model.cpp:193`); grid
@@ -128,6 +150,27 @@ streaming GEMV; `070b661` was the GEMV-only baseline).
   cap. No config change needed for 500K.
 
 ## Log
+
+### 2026-09-29 — the bf16 mma row bound: the 343 ms launch storm dies (e0d3f14)
+
+- Cold-prefill nsys (pipe live): w4a4 20.7 %, attn_flash 14.8 %, pipe
+  12.4 %, the bf16 mma storm 15.1 % (21,184 launches of
+  mma_gemv<8, bf16, f32>, gridX=8).
+- The storm = the indexer select dot (m=131072 n=512 k=128 f32, 20
+  calls) at 128-row mma groups (1024 launches/call). Identified via the
+  DGPP_GEMM_DISPATCH trace (now prints m/n/k, env-gated) + the sqlite
+  grid decode (gridX=8 = n=512) + the timeline (last 15 % = the
+  index-source layers, ~1 launch/token/layer).
+- First attempt: 256-row groups (16-tile form, kMmaGemvMaxRowsPerLaunch
+  128→256) — measured worse: 31.3 vs 16.2 us/launch, 362.6 vs 343.5 ms
+  (the form's 64 accumulators + 99 KB smem). Reverted; the dispatch is
+  pinned by graph-capture node counts (128-row groups).
+- Fix: `set_decode_mma(true, 128)` — wide-m bf16 matmuls fall to the Lt
+  tile GEMM (deterministic per row chain; decode rows keep the mma
+  chain). Tests: bf16_interface_mma_row_bound (m=128 mma / m=256 Lt,
+  kernel names via graph capture), the csa2 selection test (0 flips),
+  engine + forward smoke green. benchy: **pp2000 861.5 → 1032.1**
+  (ttft 2317 → 1939 ms), tg64 16.57 (unchanged, prefill-dominated).
 
 ### 2026-09-29 — the prefill pipe: built, unit-green, shape-routed
 
@@ -227,14 +270,14 @@ streaming GEMV; `070b661` was the GEMV-only baseline).
 
 ## Next steps
 
-1. Deploy the pipe (release build, `up --replace`, benchy A/B): expect
-   pp2000 ~850–950 (dense 1.17 → ~0.89 s bench; nsys dense 722.8 ms →
-   ~550 ms). Record the numbers.
-2. Experts at prefill M (w4a4_mx 247.6 ms, small-M per expert).
-3. attn_flash 219.9 ms (13 %) + fabric ~7 %.
+1. Experts A/B: `DGPP_W4A4_BM=64` (at ~62 rows/expert the BM=128 tiles
+   are half-empty; w4a4 471 ms = 20.7 % of the cold prefill) — benchy
+   A/B, keep if it wins.
+2. attn_flash 337 ms (14.8 %): 240 us/launch × 1401; study the tiling
+   (kM=32 row×head, kTile=32 tokens, 8 warps).
+3. Fabric: bus_bulk_collective 165 ms (7.2 %) + attn_finish 130 ms.
 4. Kill the decode regression: gate the MX quantize cost out of decode
    (or make the fallback free); verify with benchy tg64 ≥ 35 with
    W4A4 on.
-5. Decode profile for the remaining ~5 t/s on tg (W4A16).
-6. When parity holds: `serve_tools_check.sh` + `serve_agentic_streams.py`
-   as the final gate
+5. When parity holds: `serve_tools_check.sh` + `serve_agentic_streams.py`
+   as the final gate; then criterion 1 (verify branch committed + pushed).
