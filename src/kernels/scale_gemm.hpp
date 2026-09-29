@@ -108,14 +108,17 @@ void launch_scale_gemv_multi_bf16(const Fp8GemvProblem* problems, int n_problems
 // take them; small m runs the GEMV rows (the core reads any grid), larger
 // m the tile kernel. Each output row of the GEMV path is bitwise the
 // single-row launch; the two paths are tolerance-equal.
-// decode_mma: row counts up to kScaleGemmMmaMaxRows take the streaming
-// tensor-core GEMM (mma_gemv.hpp: the weights read once per 128 rows, each
-// row's chain the same whatever m) instead of the 4-row GEMV chunks
-// (m <= 128); above the bound the tile kernel serves the batch (the GEMV
-// form would re-read the weights per 128-row group). A per-call opt-in —
-// the forms are tolerance-equal, not bitwise — so a family switches every
-// site or none (its batched decode rows must stay bitwise its rows alone).
-// Shapes the mma form cannot take (k % 64, alignment) keep the older forms.
+// decode_mma: every row count takes the streaming tensor-core GEMM
+// (mma_gemv.hpp: the weights read once per 128 rows, each row's chain the
+// same whatever m) instead of the 4-row GEMV chunks (m <= 128) or the
+// 16-row tile kernel (above). The bound is deliberate, not an oversight:
+// on sm_121a the streaming form beats the tile kernel 1.3-12x at the 0731
+// dense projections for every m (benchmarks/micro/dense_gemm_path_bench:
+// the tile kernel is 2.4-4.1 TFLOPS, the stream 5-35 TFLOPS). A per-call
+// opt-in — the forms are tolerance-equal, not bitwise — so a family
+// switches every site or none (its batched decode rows must stay bitwise
+// its rows alone). Shapes the mma form cannot take (k % 64, alignment)
+// keep the older forms.
 // ws / ws_bytes ride the decode_mma branch onto the mma split-K contract
 // (2026-09-28): the small-n decode sites (wq_a / wkv at k = hidden) under-fill
 // the grid, and a workspace splits their k range across blocks.

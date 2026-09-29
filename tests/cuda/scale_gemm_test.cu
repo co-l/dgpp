@@ -284,12 +284,14 @@ DGPP_TEST(scale_gemm_large_m_route_is_bitwise_the_tile_kernel) {
   check_both_oracles(p, routed, "large-m M300xN200xK512");
 }
 
-DGPP_TEST(scale_gemm_grid_decode_mma_prefill_m_routes_to_the_tile_gemm) {
-  // The prefill batch (m far above the decode row counts) must not take the
-  // bandwidth GEMV path: the grid launcher's decode_mma gate must bound m,
-  // so a 2000-row prefill is one tile GEMM, not 16 GEMV groups re-reading
-  // the weights. Captured: exactly one kernel node, the tile GEMM.
+DGPP_TEST(scale_gemm_grid_decode_mma_prefill_m_takes_the_streaming_gemm) {
+  // Prefill batches (m far above the decode row counts) deliberately take
+  // the streaming GEMV groups, not the tile kernel: on sm_121a the stream
+  // is 1.3-12x faster than the tile kernel at the 0731 dense projections
+  // for every m (dense_gemm_path_bench). Pin the dispatch: exactly the
+  // 128-row groups, all the streaming kernel.
   for (const int m : {300, 2000}) {
+    const int groups = (m + 127) / 128;
     const Problem p = make_problem(m, 512, 1024, 0x5110 + m);
     for (const bool f32 : {false, true}) {
       uint16_t* act = nullptr;
@@ -320,18 +322,18 @@ DGPP_TEST(scale_gemm_grid_decode_mma_prefill_m_routes_to_the_tile_gemm) {
       DGPP_CUDA_OK(cudaGraphGetNodes(graph, nullptr, &count));
       std::vector<cudaGraphNode_t> nodes(count);
       DGPP_CUDA_OK(cudaGraphGetNodes(graph, nodes.data(), &count));
-      std::string kernel_name;
-      if (count == 1) {
+      bool all_streaming = count == static_cast<size_t>(groups);
+      for (size_t i = 0; all_streaming && i < count; ++i) {
         cudaKernelNodeParams params{};
-        DGPP_CUDA_OK(cudaGraphKernelNodeGetParams(nodes[0], &params));
+        DGPP_CUDA_OK(cudaGraphKernelNodeGetParams(nodes[i], &params));
         const char* name = nullptr;
         DGPP_CUDA_OK(cudaFuncGetName(&name, params.func));
-        kernel_name = name;
+        all_streaming = std::string(name).find("mma_gemv_kernel") != std::string::npos;
       }
       const std::string label = "prefill m=" + std::to_string(m) + (f32 ? " f32" : " bf16");
-      require(count == 1 && kernel_name.find("scale_gemm_kernel") != std::string::npos,
-              (label + " dispatch must be the single tile GEMM (got " + std::to_string(count) +
-               " kernel node(s))")
+      require(all_streaming,
+              (label + " dispatch must be the streaming GEMV groups (got " + std::to_string(count) +
+               " kernel node(s), wanted " + std::to_string(groups) + ")")
                   .c_str());
       DGPP_CUDA_OK(cudaGraphDestroy(graph));
       DGPP_CUDA_OK(cudaStreamDestroy(stream));
@@ -342,7 +344,7 @@ DGPP_TEST(scale_gemm_grid_decode_mma_prefill_m_routes_to_the_tile_gemm) {
       DGPP_CUDA_OK(cudaFree(outf32));
     }
   }
-  std::printf("[ OK ] prefill m routes to the tile GEMM under decode_mma\n");
+  std::printf("[ OK ] prefill m takes the streaming GEMV groups under decode_mma\n");
 }
 
 DGPP_TEST(scale_gemm_grid_decode_mma_prefill_m_matches_both_oracles) {

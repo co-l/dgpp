@@ -1520,6 +1520,10 @@ dgpp_set_common(scale_gemm_test)
 add_test(NAME scale_gemm_test COMMAND scale_gemm_test)
 set_tests_properties(scale_gemm_test PROPERTIES SKIP_RETURN_CODE 2)
 
+add_executable(dense_gemm_path_bench benchmarks/micro/dense_gemm_path_bench.cu src/common/log.cpp)
+target_link_libraries(dense_gemm_path_bench PRIVATE dgpp_kernels CUDA::cudart)
+dgpp_set_common(dense_gemm_path_bench)
+
 # mHC module parity (M4): compute/update/final-mean kernels vs the double
 # oracle; real geometry, edge cases, determinism.
 add_executable(glm_mhc_test tests/cuda/glm_mhc_test.cu)
