@@ -9,6 +9,7 @@
 #include <cstring>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -436,6 +437,68 @@ DGPP_TEST(bf16_interface_lt_vs_mma_timing) {
   }
   cudaFree(ws);
   cudaEventDestroy(e0); cudaEventDestroy(e1);
+}
+
+// The row bound (2026-09-29): an opted-in instance with a max_rows bound
+// hands wide-m rows back to the Lt algorithm. The 0731 indexer select dot
+// (m = 131072, n = 512, k = 128) at the mma form's 128-row groups is 1024
+// launches per call, ~343 ms of the 2.3 s cold prefill (the mma form's
+// weak shape: 8 blocks on 48 SMs, the 128-KB weight re-read per group);
+// the Lt tile GEMM takes it. Pin the split: m = 128 the mma form, m = 256
+// no mma node (graph-capture kernel names).
+DGPP_TEST(bf16_interface_mma_row_bound) {
+  const int n = 512, k = 128;
+  const size_t wbytes = static_cast<size_t>(n) * k * 2;
+  std::vector<uint16_t> host(static_cast<size_t>(n) * k);
+  std::mt19937_64 rng(78);
+  for (auto& v : host) v = static_cast<uint16_t>(0x3C00 + (rng() % 0x0400));
+  uint16_t* w; float* out; uint16_t* act;
+  DGPP_CUDA_OK(cudaMalloc(&w, wbytes));
+  DGPP_CUDA_OK(cudaMemcpy(w, host.data(), wbytes, cudaMemcpyHostToDevice));
+  DGPP_CUDA_OK(cudaMalloc(&act, static_cast<size_t>(256) * k * 2));
+  DGPP_CUDA_OK(cudaMemset(act, 0, static_cast<size_t>(256) * k * 2));
+  DGPP_CUDA_OK(cudaMalloc(&out, static_cast<size_t>(256) * n * 4));
+  const size_t ws_bytes = 1u << 20;
+  void* ws;
+  DGPP_CUDA_OK(cudaMalloc(&ws, ws_bytes));
+  cudaStream_t stream;
+  DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  for (const int m : {128, 256}) {
+    dgpp::CublasLtGemm gemm;
+    gemm.set_decode_mma(true, 128);
+    cudaGraph_t graph = nullptr;
+    DGPP_CUDA_OK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    gemm.matmul(act, w, out, m, n, k, dgpp::DType::BF16, dgpp::GemmOut::F32,
+                static_cast<size_t>(k), ws, ws_bytes, stream);
+    cudaGraph_t ended = nullptr;
+    cudaStreamEndCapture(stream, &ended);
+    graph = ended;
+    size_t count = 0;
+    bool has_mma = false;
+    if (graph) {
+      DGPP_CUDA_OK(cudaGraphGetNodes(graph, nullptr, &count));
+      std::vector<cudaGraphNode_t> nodes(count);
+      if (count) {
+        DGPP_CUDA_OK(cudaGraphGetNodes(graph, nodes.data(), &count));
+        for (size_t i = 0; i < count; ++i) {
+          cudaKernelNodeParams params{};
+          if (cudaGraphKernelNodeGetParams(nodes[i], &params) != cudaSuccess) continue;
+          const char* name = nullptr;
+          if (cudaFuncGetName(&name, params.func) == cudaSuccess && name &&
+              strstr(name, "mma_gemv_kernel"))
+            has_mma = true;
+        }
+      }
+      DGPP_CUDA_OK(cudaGraphDestroy(graph));
+    }
+    const bool want_mma = m <= 128;
+    require(has_mma == want_mma,
+            ("m=" + std::to_string(m) + (want_mma ? " must take the mma form" : " must not take the mma form"))
+                .c_str());
+  }
+  DGPP_CUDA_OK(cudaStreamDestroy(stream));
+  cudaFree(w); cudaFree(act); cudaFree(out); cudaFree(ws);
+  std::printf("[ OK ] bf16 interface: the mma row bound hands wide m to Lt\n");
 }
 
 int main() {

@@ -189,11 +189,18 @@ Dsv41Model::Dsv41Model(const Dsv41TextConfig& cfg, const std::string& checkpoint
   // engram wkv, the draft's main_proj, the lm head): the streaming
   // tensor-core GEMM unless the environment asks for the GEMV chunks (an
   // A/B switch: the two forms are tolerance-equal, not bitwise, and a
-  // request's rows must meet the same form batched and alone).
+  // request's rows must meet the same form batched and alone). The bf16
+  // instance's mma form is capped at 128 rows (2026-09-29): above it the
+  // wide-m bf16 sites (the csa2 indexer select dot at m = 131072 / n = 512 /
+  // k = 128, the compressor and index-key projections) hand back to the Lt
+  // tile GEMM — at 128-row groups the mma form is 1024 launches per dot
+  // call, ~343 ms of the 2.3 s cold prefill, its weak shape (8 blocks on 48
+  // SMs, the weight re-read per group). Decode rows (batched and alone,
+  // m <= 128) keep the mma chain, so the decode transcript is untouched.
   dense_mma_ = std::getenv("DGPP_DSV41_DENSE_GEMV") == nullptr;
   if (boundary_) boundary_->bind_stream(stream_);  // the stream-ordered reducer's stream (plan D9)
   csa2_cfg_.dense_mma = dense_mma_;
-  gemm_.set_decode_mma(dense_mma_);
+  gemm_.set_decode_mma(dense_mma_, 128);
   // The mHC dots take the tiled form at every prefill row count: a row's
   // collapse coefficients are then one chain whatever rows share the
   // launch, and a prompt prefilled in a group (session_prefill_group) is

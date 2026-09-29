@@ -203,11 +203,13 @@ DGPP_TEST(mma_gemv_bf16_matches_oracle_and_is_m_invariant) {
 }
 
 // The wide-m row grouping (2026-09-29): a prefill-scale row count groups at
-// the widest form (256 rows, the 16-tile) instead of 128 — the 0731 indexer
-// select dot (m = 131072, n = 512, k = 128) at 128-row groups was 1024
-// launches per call, ~340 ms of the 2.3 s cold prefill. Pin the grouping:
-// one launch per 256-row group (graph-capture node count).
-DGPP_TEST(mma_gemv_wide_m_groups_at_256_rows_per_launch) {
+// the 128-row form. The 0731 indexer select dot (m = 131072, n = 512,
+// k = 128) is 1024 launches per call (~343 ms of the 2.3 s cold prefill,
+// the mma form's weak shape: 8 blocks on 48 SMs, the 128-KB weight re-read
+// per group) — the 256-row (16-tile) grouping was measured worse (31.3 vs
+// 16.2 us per launch), so pin the 128-row grouping: one launch per 128-row
+// group (graph-capture node count).
+DGPP_TEST(mma_gemv_wide_m_groups_at_128_rows_per_launch) {
   const Problem p = make(512, 512, 128, 7, 7, 0x51505547ull);
   Dev d(p);
   cudaStream_t stream = nullptr;
@@ -226,13 +228,13 @@ DGPP_TEST(mma_gemv_wide_m_groups_at_256_rows_per_launch) {
       DGPP_CUDA_OK(cudaGraphGetNodes(graph, nullptr, &count));
       DGPP_CUDA_OK(cudaGraphDestroy(graph));
     }
-    const size_t wanted = (m + 255) / 256;
+    const size_t wanted = (m + 127) / 128;
     require(count == wanted,
             "mma_gemv m=" + std::to_string(m) + " must be " + std::to_string(wanted) +
-                " 256-row launch(es), got " + std::to_string(count));
+                " 128-row launch(es), got " + std::to_string(count));
   }
   DGPP_CUDA_OK(cudaStreamDestroy(stream));
-  std::printf("[ OK ] mma_gemv wide m groups at 256 rows per launch\n");
+  std::printf("[ OK ] mma_gemv wide m groups at 128 rows per launch\n");
 }
 
 // The small-n bf16 shapes the session-core heads run at one row: k under one
