@@ -1721,13 +1721,23 @@ void moe_slot_bench() {
     cudaEventElapsedTime(&ms, ea, eb);
     return ms * 1000.0 / iters;
   };
-  const float pair_us = time_of(run_pair);
+  auto time_pair = [&](int cpasync, int pipe) {
+    setenv("DGPP_MOE_SLOT_CPASYNC", cpasync ? "1" : "0", 1);
+    setenv("DGPP_MOE_SLOT_CPASYNC_PIPE", pipe ? "1" : "0", 1);
+    unsetenv("DGPP_MOE_SLOT_CPASYNC_FAKE");
+    return time_of(run_pair);
+  };
+  const float pair_us = time_pair(0, 0);
+  const float pair_cp_us = time_pair(1, 0);
+  const float pair_pipe_us = time_pair(1, 1);
   const float gate_us = time_of(run_gate);
   const float down_us = time_of(run_down);
   const size_t gu = static_cast<size_t>(uniq) * 2 * gate_bytes;
   const size_t dn = static_cast<size_t>(uniq) * down_bytes;
   std::printf("moe_slot bench: %d experts x 36 slots, %d unique\n", E, uniq);
   std::printf("  pair:    %7.1f us/iter\n", pair_us);
+  std::printf("  cpasync: %7.1f us/iter\n", pair_cp_us);
+  std::printf("  pipe:    %7.1f us/iter\n", pair_pipe_us);
   std::printf("  gate_up: %7.1f us/launch  %8.1f MB unique  %6.0f GB/s\n", gate_us,
               gu / 1e6, gu / (gate_us * 1e-6) / 1e9);
   std::printf("  down:    %7.1f us/launch  %8.1f MB unique  %6.0f GB/s\n", down_us,
@@ -2344,11 +2354,12 @@ DGPP_TEST(moe_decode_slot_path_is_bitwise_host_path_mxfp4) {
 }
 
 DGPP_TEST(moe_slot_cpasync_is_bitwise_the_register_pass) {
-  // The cp.async-staged slot kernels (DGPP_MOE_SLOT_CPASYNC=1) are
-  // bitwise-identical to the register-pass form, gate and down, at every
-  // shape the slot path instantiates — the small-K geometries (several
-  // lane groups per warp) first, where the staging's zero-fill and scale
-  // rows have the most tail to cover.
+  // The cp.async-staged slot kernels (DGPP_MOE_SLOT_CPASYNC=1, and its
+  // double-buffered grid-stride pipeline DGPP_MOE_SLOT_CPASYNC_PIPE=1 at
+  // the single-pass K's) are bitwise-identical to the register-pass form,
+  // gate and down, at every shape the slot path instantiates — the small-K
+  // geometries (several lane groups per warp) first, where the staging's
+  // zero-fill and scale rows have the most tail to cover.
   using namespace dgpp;
   struct Case {
     int H, I, group;
@@ -2472,6 +2483,7 @@ DGPP_TEST(moe_slot_cpasync_is_bitwise_the_register_pass) {
     for (int n : {1, 3, static_cast<int>(cs.I)}) {
       const auto run_n = [&](int cpasync) {
         setenv("DGPP_MOE_SLOT_CPASYNC", cpasync ? "1" : "0", 1);
+        setenv("DGPP_MOE_SLOT_CPASYNC_PIPE", cpasync ? "1" : "0", 1);
         unsetenv("DGPP_MOE_SLOT_CPASYNC_FAKE");
         launch_moe_slot_gate_up_swiglu_fp4(x, cs.H, d_ids, order, views, n, cs.H, cs.I,
                                            cs.H, sh_gate, sh_gs, sh_up, sh_us, act, cs.I,
@@ -2518,6 +2530,7 @@ DGPP_TEST(moe_slot_cpasync_is_bitwise_the_register_pass) {
     cudaFree(sh_ds);
   }
 }
+
 
 
 DGPP_TEST(moe_sliced_ranks_fold_matches_unsliced_oracle_mxfp4) {

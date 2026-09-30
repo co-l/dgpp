@@ -8,11 +8,12 @@ meaningful step.
 
 Live: W4A16 site default + flash DB + wo_b ws + the per-group scale
 prefetch (mma_gemv fp8 decode forms). Parity 58 % on pp, ~88 % on tg.
-The cp.async-staged slot kernels are merged (bitwise the register pass,
-incl. the multi-pass K geometries) but OFF by default — the single-tile
-form is ~39 % slower than the register pass at the live 4096/2048
-geometry; the double-buffered pipeline is the next step (env:
-DGPP_MOE_SLOT_CPASYNC=1).
+The register pass keeps the live slot seat: the cp.async-staged form
+(DGPP_MOE_SLOT_CPASYNC=1) and the double-buffered grid-stride pipe
+(+DGPP_MOE_SLOT_CPASYNC_PIPE=1) are both merged, bitwise the register
+pass, and OFF by default — at the live 4096/2048 geometry the
+single-tile form is ~39 % slower and the pipe ~9 % (FMA-bound at one
+block/SM; the 3-buffer ring does not fit the 101 KB opt-in smem).
 
 | path | pp2000 t/s | tg64 t/s | parity |
 |------|-----------:|---------:|--------|
@@ -295,6 +296,57 @@ dot GEMM (was the 343 ms mma storm).
   cap. No config change needed for 500K.
 
 ## Log
+
+### 2026-09-30 — the double-buffered grid-stride pipe landed (bitwise, env-gated); three bugs hunted in the ring; micro-bench: −21 % vs the single tile, +9 % vs the register pass → OFF by default
+
+- **The pipe is in** (`DGPP_MOE_SLOT_CPASYNC=1
+  DGPP_MOE_SLOT_CPASYNC_PIPE=1`, single-pass K only — the launcher
+  falls back to the single-tile form for the multi-pass geometries).
+  The block strides its slot's n-tiles (grid.x = min(tiles, SMs)),
+  cp.async'ing tile t+stride into the other ring buffer while tile t's
+  FMA runs off the resident one. Bitwise the register pass, A/B pin
+  green, 34/34 unit tests with the pipe on AND off.
+- **Three bugs, all in the ring mechanics, all found by the per-block
+  diag records (temporarily in-kernel, stripped after):**
+  1. The pre-loop staging went to buffer 0, but the first iteration
+     reads buffer `(blockIdx.x & 1)` — odd blocks consumed
+     uninitialized smem. Symptom: exactly-zero outputs in a
+     deterministic block-index pattern (the "zero tiles" that looked
+     data-dependent). Fix: stage into `(blockIdx.x & 1)`.
+  2. Even stride S = 48 SMs: tile t and t + S land in the SAME ring
+     buffer, so the in-flight cp.async overwrote the buffer the FMA was
+     consuming. The 2-buffer ring only alternates on an odd stride.
+     Fix: oddify the pipe grid.x (47 of 48 SMs — the cost is one SM).
+  3. The pipe kernels' shared-fp8 path processed only its own single
+     tile (`blockIdx.x * rpb`), but the pipe grid is CAPPED — rows
+     beyond `gx * rpb` were never written (stale slot data). A real
+     production bug, not a diag artifact: at the live decode
+     n_shared = I_s with grid.x ≤ 47, any I_s above 47 × rpb loses
+     rows. Fix: grid-stride the shared path over all tiles in BOTH
+     gate and down (no cp.async on that path → plain stride, no ring).
+     Root-caused via an A/B probe: the shared slot's rows 128+ looked
+     "equal" because the test's shared scales were a single broadcast
+     float (rows 128+ true zeros in both forms) — the down (n = H =
+     512, gx = 7 < 8 tiles) exposed it.
+- **Micro-bench (live 4096/2048 geometry, 256 experts / 36 slots / 19
+  unique, post-strip):** pair 1170.4 / cpasync 1611.4 / **pipe 1277.9
+  us/iter** (gate 195 GB/s, down 170 GB/s with the pipe). The pipe
+  beats the single tile by 21 % (the overlap is real) but trails the
+  register pass by 9 %. Why it can't close that gap at the live
+  geometry: the gate pipe is 76 KB smem → ONE block/SM, and the FMA
+  phase (8 rows × 8192-wide dots per tile) is the bottleneck at one
+  resident block — the register pass runs 3 blocks/SM. A 3-buffer ring
+  (112.6 KB at K=4096) does NOT fit the 101,376 B opt-in smem budget,
+  so there is no cheap smem path to the register pass's seat at the
+  live geometry. **Decision: OFF by default** (same pattern as the
+  single tile); the register pass keeps the live seat. The pipe stays
+  as the env-gated form — it IS the win at smaller K (the down is
+  21 KB double-buffered and fits 3 blocks/SM) and is the stepping
+  stone if a deeper ring lands.
+- **Debug stripped** (dbg records, all temp prints, the PIPE_GRID knob,
+  both TEMP diag tests) — the test binary is back to its 34-test
+  baseline. Verification: 34/34 with the pipe on and off on the
+  stripped build.
 
 ### 2026-09-30 — cp.async slot kernels landed (correct, env-gated); two NaN-hunt root causes; A/B says register-pass keeps the live seat
 
