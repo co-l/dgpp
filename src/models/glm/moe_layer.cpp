@@ -150,11 +150,19 @@ GlmMoeLayer::GlmMoeLayer(const GlmMoeWeights& weights, const GlmMoeConfig& cfg,
 
   // Decode-slot scratch: tokens*(top_k+1) rows — routed slots plus the
   // shared expert's, per token. Sized by the decode-row bound, not
-  // max_tokens: a short-prompt model still decodes full slots.
+  // max_tokens: a short-prompt model still decodes full slots. The shared
+  // slot's gate rows (its own inter) ride the same act stride, so the
+  // stride is the wider of the routed and the shared inter.
   if (decode_slots_ > 0) {
     const size_t rows =
         static_cast<size_t>(decode_slots_) * (cfg_.top_k + 1);
-    DGPP_CUDA_OK(cudaMalloc(&d_slot_act_, rows * I * 2));
+    const size_t I_s = has_shared()
+                           ? (w_.shared_nvfp4() ? w_.shared_fp4[0].rows
+                              : w_.shared_packq() ? w_.shared_packed[0].rows
+                                                  : w_.shared[0].rows)
+                           : 0;
+    const size_t slot_I = I > I_s ? I : I_s;
+    DGPP_CUDA_OK(cudaMalloc(&d_slot_act_, rows * slot_I * 2));
     DGPP_CUDA_OK(cudaMalloc(&d_slot_down_, rows * H * sizeof(float)));
     DGPP_CUDA_OK(cudaMalloc(&d_slot_order_, rows * sizeof(int32_t)));
     // The fused router selection's tickets: one per decode row, zero at
@@ -1018,7 +1026,6 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
     upload_expert_views(d_expert_views_, /*with_shared=*/w_.shared_nvfp4() || w_.shared_packq(),
                         stream);
   }
-
   const int slots = tokens * (K + 1);
   const bool fp4 = w_.nvfp4();
   const bool packq = w_.packq();
@@ -1065,6 +1072,9 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
   // find n == 0 and return).
   const int K_s = with_shared ? H : 0;
   const int N_s = with_shared ? H : 0;
+  // The act rows are indexed by the wider stride (the shared slot's inter
+  // can exceed the routed one); the buffer is sized to match.
+  const int act_stride = I_r > I_s ? I_r : I_s;
   if (packq) {
     // The packed table: the shared expert (int8) is view-table entry E,
     // read at the routed K; no launch-argument matrices.
@@ -1072,27 +1082,27 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
     const int sb = with_shared ? w_.shared_packed[0].bits : 0;
     const int sbase = with_shared ? E * 3 : -1;
     launch_moe_slot_gate_up_swiglu_packq(hidden, H, d_ids_, order, table, I_r, H, rb, I_s, sb,
-                                         d_slot_act_, I_r, slots, K, cfg_.swiglu_limit, stream,
-                                         sbase);
-    launch_moe_slot_down_packq(d_slot_act_, I_r, d_ids_, order, table, H, I_r, rb, N_s, sb,
-                               d_slot_down_, H, slots, K, stream, sbase);
+                                         d_slot_act_, act_stride, slots, K, cfg_.swiglu_limit,
+                                         stream, sbase);
+    launch_moe_slot_down_packq(d_slot_act_, act_stride, d_ids_, order, table, H, I_r, rb,
+                               N_s, sb, d_slot_down_, H, slots, K, stream, sbase);
   } else if (fp4) {
     const int fp4_group = w_.experts_fp4[0].scale_group;
     launch_moe_slot_gate_up_swiglu_fp4(
         hidden, H, d_ids_, order, table, I_r, H, I_s, K_s, sh_gate_p, sh_gate_s,
-        sh_up_p, sh_up_s, d_slot_act_, I_r, slots, K, cfg_.swiglu_limit, stream,
+        sh_up_p, sh_up_s, d_slot_act_, act_stride, slots, K, cfg_.swiglu_limit, stream,
         shared_view_base, fp4_group, sh_rs, sh_cs);
-    launch_moe_slot_down_fp4(d_slot_act_, I_r, d_ids_, order, table, H, I_r, N_s,
+    launch_moe_slot_down_fp4(d_slot_act_, act_stride, d_ids_, order, table, H, I_r, N_s,
                              I_s, sh_down_p, sh_down_s, d_slot_down_, H, slots, K,
                              stream, shared_view_base, fp4_group, sh_rs, sh_cs);
   } else {
     launch_moe_slot_gate_up_swiglu(
         hidden, H, d_ids_, order, table, I_r, H, I_s, K_s, sh_gate_p, sh_gate_s,
-        sh_up_p, sh_up_s, d_slot_act_, I_r, slots, K, cfg_.swiglu_limit, stream, sh_rs,
-        sh_cs);
-    launch_moe_slot_down(d_slot_act_, I_r, d_ids_, order, table, H, I_r, N_s,
-                         I_s, sh_down_p, sh_down_s, d_slot_down_, H, slots, K,
-                         stream, sh_rs, sh_cs);
+        sh_up_p, sh_up_s, d_slot_act_, act_stride, slots, K, cfg_.swiglu_limit, stream,
+        sh_rs, sh_cs);
+    launch_moe_slot_down(d_slot_act_, act_stride, d_ids_, order, table, H, I_r, N_s,
+                         I_s, sh_down_p, sh_down_s, d_slot_down_, H, slots, K, stream,
+                         sh_rs, sh_cs);
   }
   if (with_shared)
     launch_moe_slot_accum(out_bf16, d_slot_down_, d_weights_, tokens, H, K, stream);

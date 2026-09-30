@@ -2343,6 +2343,183 @@ DGPP_TEST(moe_decode_slot_path_is_bitwise_host_path_mxfp4) {
   }
 }
 
+DGPP_TEST(moe_slot_cpasync_is_bitwise_the_register_pass) {
+  // The cp.async-staged slot kernels (DGPP_MOE_SLOT_CPASYNC=1) are
+  // bitwise-identical to the register-pass form, gate and down, at every
+  // shape the slot path instantiates — the small-K geometries (several
+  // lane groups per warp) first, where the staging's zero-fill and scale
+  // rows have the most tail to cover.
+  using namespace dgpp;
+  struct Case {
+    int H, I, group;
+  };
+  const Case cases[] = {
+      {512, 256, 16},    // gate k=512 (4 lanes/row), down k=256 (2 lanes/row)
+      {512, 256, 32},
+      {1024, 512, 16},   // gate k=1024 (8 lanes/row), down k=512 (4 lanes/row)
+      {1024, 512, 32},
+      {1024, 576, 32},   // the mxfp4 576 down geometry (3 chunk passes)
+      {2048, 1024, 32},
+      {4096, 2048, 32},  // the live decode geometry
+  };
+  constexpr int E = 8, K = 2, ROWS = 1;
+  const int slots = ROWS * (K + 1);  // routed slots + the shared expert's
+  for (const Case& cs : cases) {
+    const size_t gate_bytes = static_cast<size_t>(cs.I) * (cs.H / 2);
+    const size_t down_bytes = static_cast<size_t>(cs.H) * (cs.I / 2);
+    const size_t gate_scales = static_cast<size_t>(cs.I) * (cs.H / cs.group);
+    const size_t down_scales = static_cast<size_t>(cs.H) * (cs.I / cs.group);
+    uint8_t* payload = nullptr;
+    uint8_t* scales = nullptr;
+    DGPP_CUDA_OK(cudaMalloc(&payload, static_cast<size_t>(E) * (2 * gate_bytes + down_bytes)));
+    DGPP_CUDA_OK(cudaMalloc(&scales, static_cast<size_t>(E) * (2 * gate_scales + down_scales)));
+    // Deterministic fill: the payload is arbitrary, the scales stay finite
+    // (e4m3 < 0x78, e8m0 <= 0xFE) so no dot can NaN out.
+    {
+      std::vector<uint8_t> p(static_cast<size_t>(E) * (2 * gate_bytes + down_bytes));
+      std::vector<uint8_t> s(static_cast<size_t>(E) * (2 * gate_scales + down_scales));
+      for (size_t i = 0; i < p.size(); ++i) p[i] = static_cast<uint8_t>(i * 7 + 3);
+      // e4m3 < 0x78 stays finite. e8m0 capped at 115 (2^-12): higher caps
+      // overflow the gate dots (a 1024-term dot at 2^73 reaches 2^90, where
+      // g * sigmoid(g) NaNs on the negative side), and 241+ saturate / 255
+      // NaNs the scales themselves — any of which makes the bitwise pin a
+      // NaN == NaN vacuity.
+      const int max_scale = cs.group == 16 ? 0x77 : 115;
+      for (size_t i = 0; i < s.size(); ++i)
+        s[i] = static_cast<uint8_t>((i * 13) % max_scale);
+      DGPP_CUDA_OK(cudaMemcpy(payload, p.data(), p.size(), cudaMemcpyHostToDevice));
+      DGPP_CUDA_OK(cudaMemcpy(scales, s.data(), s.size(), cudaMemcpyHostToDevice));
+    }
+    float* global = nullptr;
+    if (cs.group == 16) {
+      DGPP_CUDA_OK(cudaMalloc(&global, sizeof(float)));
+      const float g = 1.0f;
+      DGPP_CUDA_OK(cudaMemcpy(global, &g, sizeof(float), cudaMemcpyHostToDevice));
+    }
+    MoeExpertView* views = nullptr;
+    DGPP_CUDA_OK(cudaMallocManaged(
+        &views, static_cast<size_t>(E + 1) * 3 * sizeof(MoeExpertView)));
+    for (int m = 0; m < E; ++m) {
+      uint8_t* p = payload + static_cast<size_t>(m) * (2 * gate_bytes + down_bytes);
+      uint8_t* s = scales + static_cast<size_t>(m) * (2 * gate_scales + down_scales);
+      views[3 * m + 0] = MoeExpertView{p, nullptr, s, global, 7, 7, cs.group};
+      views[3 * m + 1] = MoeExpertView{p + gate_bytes, nullptr, s + gate_scales, global, 7, 7, cs.group};
+      views[3 * m + 2] = MoeExpertView{p + 2 * gate_bytes, nullptr, s + 2 * gate_scales, global, 7, 7, cs.group};
+    }
+    // The layer's shared expert: the FP8 triple (the NVFP4 test shape's
+    // shared format), gate/up [I, H], down [H, I], 128 x 128 scale grid.
+    const int s_gr = (cs.I + 127) / 128, s_gc = (cs.H + 127) / 128;
+    const int s_dr = (cs.H + 127) / 128, s_dc = (cs.I + 127) / 128;
+    uint8_t* sh_gate = nullptr;
+    uint8_t* sh_up = nullptr;
+    uint8_t* sh_down = nullptr;
+    float* sh_gs = nullptr;
+    float* sh_us = nullptr;
+    float* sh_ds = nullptr;
+    DGPP_CUDA_OK(cudaMalloc(&sh_gate, static_cast<size_t>(cs.I) * cs.H));
+    DGPP_CUDA_OK(cudaMalloc(&sh_up, static_cast<size_t>(cs.I) * cs.H));
+    DGPP_CUDA_OK(cudaMalloc(&sh_down, static_cast<size_t>(cs.H) * cs.I));
+    DGPP_CUDA_OK(cudaMalloc(&sh_gs, static_cast<size_t>(s_gr) * s_gc * sizeof(float)));
+    DGPP_CUDA_OK(cudaMalloc(&sh_us, static_cast<size_t>(s_gr) * s_gc * sizeof(float)));
+    DGPP_CUDA_OK(cudaMalloc(&sh_ds, static_cast<size_t>(s_dr) * s_dc * sizeof(float)));
+    {
+      // e4m3 < 0x78: the shared expert's payloads stay finite (0x7F / 0xFF
+      // would NaN the shared slot's dots).
+      std::vector<uint8_t> p(static_cast<size_t>(cs.I) * cs.H + static_cast<size_t>(cs.H) * cs.I);
+      for (size_t i = 0; i < p.size(); ++i) p[i] = static_cast<uint8_t>((i * 11 + 5) % 0x78);
+      DGPP_CUDA_OK(cudaMemcpy(sh_gate, p.data(), static_cast<size_t>(cs.I) * cs.H,
+                              cudaMemcpyHostToDevice));
+      DGPP_CUDA_OK(cudaMemcpy(sh_up, p.data() + static_cast<size_t>(cs.I) * cs.H,
+                              static_cast<size_t>(cs.I) * cs.H, cudaMemcpyHostToDevice));
+      DGPP_CUDA_OK(cudaMemcpy(sh_down, p.data(), static_cast<size_t>(cs.H) * cs.I,
+                              cudaMemcpyHostToDevice));
+      const float one = 1.0f;
+      DGPP_CUDA_OK(cudaMemcpy(sh_gs, &one, sizeof(float), cudaMemcpyHostToDevice));
+      DGPP_CUDA_OK(cudaMemcpy(sh_us, &one, sizeof(float), cudaMemcpyHostToDevice));
+      DGPP_CUDA_OK(cudaMemcpy(sh_ds, &one, sizeof(float), cudaMemcpyHostToDevice));
+    }
+    MoeExpertView shared_views[3] = {
+        {sh_gate, sh_gs, nullptr, nullptr, 7, 7, 16},
+        {sh_up, sh_us, nullptr, nullptr, 7, 7, 16},
+        {sh_down, sh_ds, nullptr, nullptr, 7, 7, 16}};
+    for (int m = 0; m < 3; ++m)
+      views[3 * E + m] = shared_views[m];
+    int32_t host_ids[slots] = {0, 1, 0};
+    int32_t* d_ids = nullptr;
+    int32_t* order = nullptr;
+    DGPP_CUDA_OK(cudaMallocManaged(&d_ids, slots * sizeof(int32_t)));
+    std::memcpy(d_ids, host_ids, slots * sizeof(int32_t));
+    DGPP_CUDA_OK(cudaMallocManaged(&order, slots * sizeof(int32_t)));
+    launch_moe_slot_order(d_ids, order, slots, K, E, nullptr);
+    uint16_t* x = nullptr;
+    DGPP_CUDA_OK(cudaMalloc(&x, static_cast<size_t>(ROWS) * cs.H * 2));
+    {
+      // Modest bf16 normals (0x3C80..0x3CFF ~ 0.015..0.023): the wide
+      // 0x3C00..0x7BFF fill tops out near 2^120, which overflows the gate
+      // dots (and NaNs g * sigmoid(g) on the negative side) at the e8m0
+      // caps above.
+      std::vector<uint16_t> hx(static_cast<size_t>(ROWS) * cs.H);
+      for (size_t i = 0; i < hx.size(); ++i)
+        hx[i] = static_cast<uint16_t>((i * 2654435761u) % 0x80 + 0x3C80);
+      DGPP_CUDA_OK(cudaMemcpy(x, hx.data(), hx.size() * 2, cudaMemcpyHostToDevice));
+    }
+    uint16_t* act = nullptr;
+    float* out = nullptr;
+    DGPP_CUDA_OK(cudaMalloc(&act, static_cast<size_t>(slots) * cs.I * 2));
+    DGPP_CUDA_OK(cudaMalloc(&out, static_cast<size_t>(slots) * cs.H * 4));
+    std::vector<uint16_t> act_a, act_b;
+    std::vector<float> out_a, out_b;
+    for (int n : {1, 3, static_cast<int>(cs.I)}) {
+      const auto run_n = [&](int cpasync) {
+        setenv("DGPP_MOE_SLOT_CPASYNC", cpasync ? "1" : "0", 1);
+        unsetenv("DGPP_MOE_SLOT_CPASYNC_FAKE");
+        launch_moe_slot_gate_up_swiglu_fp4(x, cs.H, d_ids, order, views, n, cs.H, cs.I,
+                                           cs.H, sh_gate, sh_gs, sh_up, sh_us, act, cs.I,
+                                           slots, K, 3.0f, nullptr, -1, cs.group, 7, 7);
+        launch_moe_slot_down_fp4(act, cs.I, d_ids, order, views, cs.H, cs.I, cs.H, cs.I,
+                                 sh_down, sh_ds, out, cs.H, slots, K, nullptr, -1,
+                                 cs.group, 7, 7);
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+      };
+      const auto copy_out = [&](std::vector<uint16_t>& act_h, std::vector<float>& out_h) {
+        act_h.resize(static_cast<size_t>(slots) * cs.I);
+        out_h.resize(static_cast<size_t>(slots) * cs.H);
+        for (int s = 0; s < slots; ++s)
+          DGPP_CUDA_OK(cudaMemcpy(&act_h[static_cast<size_t>(s) * cs.I],
+                                  act + static_cast<size_t>(s) * cs.I,
+                                  static_cast<size_t>(cs.I) * 2, cudaMemcpyDeviceToHost));
+        DGPP_CUDA_OK(cudaMemcpy(out_h.data(), out, out_h.size() * 4, cudaMemcpyDeviceToHost));
+      };
+      run_n(1);
+      copy_out(act_a, out_a);
+      run_n(0);
+      copy_out(act_b, out_b);
+      require(std::memcmp(act_a.data(), act_b.data(), act_a.size() * 2) == 0,
+              "cpasync gate_up must be bitwise-identical to the register-pass");
+      require(std::memcmp(out_a.data(), out_b.data(), out_a.size() * 4) == 0,
+              "cpasync down must be bitwise-identical to the register-pass");
+    }
+    std::printf("[ OK ] slot cpasync bitwise the register-pass H=%d I=%d group=%d\n",
+                cs.H, cs.I, cs.group);
+    cudaFree(payload);
+    cudaFree(scales);
+    if (global) cudaFree(global);
+    cudaFree(views);
+    cudaFree(d_ids);
+    cudaFree(order);
+    cudaFree(x);
+    cudaFree(act);
+    cudaFree(out);
+    cudaFree(sh_gate);
+    cudaFree(sh_up);
+    cudaFree(sh_down);
+    cudaFree(sh_gs);
+    cudaFree(sh_us);
+    cudaFree(sh_ds);
+  }
+}
+
+
 DGPP_TEST(moe_sliced_ranks_fold_matches_unsliced_oracle_mxfp4) {
   struct Case {
     int E, H, I, K, M, world;

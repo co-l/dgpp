@@ -4,10 +4,15 @@ State and dated log for the [goal](DSV4-Flash-0731-port.md). Newest first.
 Update the snapshot when the state changes; append log entries per
 meaningful step.
 
-## Snapshot (2026-09-29)
+## Snapshot (2026-09-30)
 
 Live: W4A16 site default + flash DB + wo_b ws + the per-group scale
 prefetch (mma_gemv fp8 decode forms). Parity 58 % on pp, ~88 % on tg.
+The cp.async-staged slot kernels are merged (bitwise the register pass,
+incl. the multi-pass K geometries) but OFF by default — the single-tile
+form is ~39 % slower than the register pass at the live 4096/2048
+geometry; the double-buffered pipeline is the next step (env:
+DGPP_MOE_SLOT_CPASYNC=1).
 
 | path | pp2000 t/s | tg64 t/s | parity |
 |------|-----------:|---------:|--------|
@@ -146,6 +151,9 @@ dot GEMM (was the 343 ms mma storm).
    41.4 ms/step; the floor for 7 experts × 43 layers is ~22 ms @273 GB/s.
    mma_gemv 12.9 ms, bus_allreduce 3.4 ms, mhc 2.1 ms, attention the rest.
    At the 29 t/s acceptance (2.1 tok/step) hitting 35 needs ~65 ms/step.
+   Identified next step (2026-09-30): the double-buffered cp.async
+   pipeline over the (now bitwise-correct, env-gated) staged slot
+   kernels — stage tile p+1 while computing tile p.
 2. **W4A4 prefill ↔ decode numerics split** (the tg 16-vs-29 cause, solved
    as a config for now, e4f4acb): make the block-scale fp4 prefill and the
    W4A16 dequant decode agree closely enough that the MTP acceptance
@@ -287,6 +295,53 @@ dot GEMM (was the 343 ms mma storm).
   cap. No config change needed for 500K.
 
 ## Log
+
+### 2026-09-30 — cp.async slot kernels landed (correct, env-gated); two NaN-hunt root causes; A/B says register-pass keeps the live seat
+
+- **The cp.async-staged slot kernels (gate_up + down) are in, unit-green
+  both modes, sanitizer clean.** `DGPP_MOE_SLOT_CPASYNC=1` switches the
+  fp4 slot kernels to the smem-staged form (weights + scales staged with
+  cp.async before the activations; the FMA chain runs off shared). The
+  bitwise pin (new A/B test `moe_slot_cpasync_is_bitwise_the_register_pass`)
+  holds at every shape the slot path instantiates, now including the
+  3-pass 576 geometry.
+- **Root cause 1 — the NaN hunt was an uninitialized accumulator.** The
+  cp.async kernels declared `float acc[1];` and passed it to
+  `consume_chunk`, whose first FMA READS the accumulator. The register
+  path is safe because `warp_row_dots`/`row_dots` zero their accumulators
+  internally; the cp.async twins broke that contract and read register
+  garbage (a deterministic 0x7fffffff / FLT_MAX on the live sequence —
+  the "FMA overflow" that looked data-dependent). Fixed: `= {0.f}`.
+  That was the whole 512/512-NaN on the 4 decode-bitwise tests.
+- **Root cause 2 — multi-pass K was half-implemented.** K in
+  {576, 1152, 2304, 160, 320, 640} needs >4 chunks/lane (up to 3 passes),
+  but the cp.async loop only ran `pass_chunks(0)` — a partial sum
+  (256 of 576 elements at the mxfp4 576 down). The live 4096/2048
+  geometry is single-pass, so A/B never caught it; the real mxfp4 576
+  test did (±2 % element diffs, not NaNs — finite scales, so the missing
+  terms are just missing). Fixed: both kernels now iterate
+  `p in 0..passes` with `C0 = p*kMaxChunksPerLane`, the exact
+  `warp_row_dots` pass structure, so the FMA order (and the bits) match.
+- **The A/B test's MXFP4 pin had been VACUOUS all along** (NaN == NaN):
+  its e8m0 fill `% 254` hits the 241–253 inf/NaN bytes (0 code × inf =
+  NaN), and the wide bf16 x-fill (up to ~2^120) overflows the gate dots
+  so `g*sigmoid(g)` NaNs the negative side. Capped the fills (e8m0 ≤ 115,
+  x in 0x3C80..0x3CFF, shared e4m3 < 0x78) and added the 576 case — the
+  mx pin now carries real weight.
+- **Micro-bench A/B (live 4096/2048 geometry, post-fix):** register-pass
+  gate 751 us (212 GB/s) / down 391 us (204 GB/s) vs cp.async single-tile
+  1086 us (147) / 485 us (164) — the staged form is ~39 % SLOWER. The
+  single-tile life is stage-everything → FMA: no DRAM/FMA overlap, and the
+  smem round-trip costs more than the register file saved. **Decision:
+  register-pass stays the live default; cp.async is env-gated and is the
+  stepping stone for the double-buffered grid-stride pipeline** (stage
+  tile p+1 while computing tile p — the ~2× headroom vs the 200 GB/s
+  register ceiling, per the late-night-3 occupancy analysis).
+- **Verification:** glm_moe_test 34/34 with CPASYNC=0 AND =1;
+  compute-sanitizer memcheck 0 errors on the 16 bitwise tests (=1);
+  full build links; ctest failures (mimo fixtures, dsv41 tp-bus) are
+  environmental (missing .mdump staging / no live cluster), not
+  MoE-related.
 
 ### 2026-09-29 (late night 3) — slot experts: occupancy is the wall; launch_bounds landed
 
