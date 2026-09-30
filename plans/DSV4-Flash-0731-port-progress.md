@@ -342,6 +342,19 @@ dot GEMM (was the 343 ms mma storm).
   full build links; ctest failures (mimo fixtures, dsv41 tp-bus) are
   environmental (missing .mdump staging / no live cluster), not
   MoE-related.
+- **The pipeline design (next step), sized for sm_121a** (opt-in smem
+  101376 B/block, 102400/SM): gate K=4096 double-buffered = x 8 KB +
+  2×(gate+up tiles 32 KB + scales 2 KB) = 76 KB → ONE block/SM,
+  68 KB/SM in flight ≈ 15× the register pass's 4.6 KB/SM (the register
+  pass is latency-bound at 4.6 KB in flight — that is the whole gap).
+  Shape: grid.x = min(ceil(n/rpb), SMs), grid-stride over row groups
+  (256 tiles of 8 rows at the live 2048); per tile: sync → issue(t+1
+  into buffer (t+1)%2) → cp.async.wait_group 1 → sync → FMA(t) off
+  buffer t%2 → sync. Activations staged ONCE per block (all row groups
+  share the token's x in decode). The A/B pin already covers this form
+  (it compares the cpasync env form vs register, launcher-agnostic); the
+  micro-bench measures it. Down K=2048: 21 KB double-buffered, fits the
+  default 48 KB (multiple blocks/SM, no opt-in needed).
 
 ### 2026-09-29 (late night 3) — slot experts: occupancy is the wall; launch_bounds landed
 
